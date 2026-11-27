@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests dco.sh and pr-title.sh: dco.sh on the commits of a repository made for the test, and
-# pr-title.sh on titles that pass and titles that fail.
+# Tests dco.sh, pr-title.sh and release-series.sh: dco.sh on the commits of a repository made for
+# the test, pr-title.sh on titles that pass and titles that fail, and release-series.sh on
+# release-please manifests and metadata.yaml files made for the test.
 set -euo pipefail
 
 scripts=$(cd "$(dirname "$0")" && pwd)
@@ -121,6 +122,40 @@ for title in \
   "feat!(chalkctl): add a kind"; do
   expect fail "the title '$title'" bash "$scripts/pr-title.sh" "$title"
 done
+
+# series MANIFEST_VERSION METADATA_SERIES...: a directory with a manifest of MANIFEST_VERSION, the
+# initial version 0.1.0 and a metadata.yaml that lists each METADATA_SERIES, written as
+# "major minor" or, with a third word, with minor before major.
+series() {
+  local dir version=$1
+  shift
+  dir=$(mktemp -d "$repo/series.XXXXXX")
+  printf '{".": "%s"}\n' "$version" >"$dir/.release-please-manifest.json"
+  printf '{"initial-version": "0.1.0"}\n' >"$dir/release-please-config.json"
+  {
+    echo 'apiVersion: clusterctl.cluster.x-k8s.io/v1alpha3'
+    echo 'releaseSeries:'
+    for entry in "$@"; do
+      read -r major minor swapped <<<"$entry"
+      if [ -n "$swapped" ]; then
+        printf -- '- minor: %s\n  contract: v1beta2\n  major: %s\n' "$minor" "$major"
+      else
+        printf -- '- major: %s\n  minor: %s\n  contract: v1beta2\n' "$major" "$minor"
+      fi
+    done
+    echo 'kind: Metadata'
+  } >"$dir/metadata.yaml"
+  echo "$dir"
+}
+
+expect pass "the initial version's series before the first release" bash "$scripts/release-series.sh" "$(series 0.0.0 "0 1")"
+expect fail "no series for the initial version" bash "$scripts/release-series.sh" "$(series 0.0.0 "0 2")"
+expect pass "the manifest's series among others" bash "$scripts/release-series.sh" "$(series 0.3.1 "0 1" "0 2" "0 3")"
+expect pass "a series that names its minor first" bash "$scripts/release-series.sh" "$(series 0.3.0 "0 1" "0 3 swapped")"
+expect fail "no series for the manifest's minor" bash "$scripts/release-series.sh" "$(series 0.4.0 "0 1" "0 3")"
+expect fail "a series of another major" bash "$scripts/release-series.sh" "$(series 1.1.0 "0 1")"
+expect fail "a minor that only starts like the manifest's" bash "$scripts/release-series.sh" "$(series 0.1.0 "0 10")"
+expect pass "the repository's metadata.yaml" bash "$scripts/release-series.sh" "$scripts/../.."
 
 if [ "$failures" != 0 ]; then
   echo "$failures cases failed" >&2

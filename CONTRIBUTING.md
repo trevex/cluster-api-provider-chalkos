@@ -28,6 +28,7 @@ Run the targets of the `Makefile` in the development shell:
 | `make fmt`, `make vet`, `make lint` | Run go fmt, go vet and golangci-lint. |
 | `make test` | Runs the unit tests and the envtest suites. |
 | `make build` | Builds both managers. |
+| `make release-manifests` | Builds `bootstrap-components.yaml`, `control-plane-components.yaml` and a copy of `metadata.yaml` into `out/`, with the managers at `IMG_BOOTSTRAP` and `IMG_CONTROLPLANE`. |
 | `make e2e` | Runs the end-to-end test against a running lab. |
 
 The generated files are committed. A change to an API type or a kubebuilder marker commits what
@@ -106,6 +107,56 @@ title, lint and workflow checks. Mark it ready for review to run the full CI. Ad
 when the change touches the controllers, the lab or the Cluster API contract: CI then runs the
 end-to-end test on the pull request, on a runner with `/dev/kvm`. A push to `main` does not run
 it; the nightly workflow runs it on `main` and opens an issue labelled `ci-failure` when it fails.
+
+## Release
+
+[release-please](https://github.com/googleapis/release-please) makes the releases, from
+`.github/workflows/release.yml`, as in chalkos's
+[Release chalkos](https://trevex.github.io/chalkos/contribute/releasing/). On every push to `main`
+it opens or rebuilds the release pull request, `chore(main): release <version>`, as a draft. The
+pull request adds the release's section to `CHANGELOG.md` and sets the version on every line that
+`release-please-config.json` lists in `extra-files`: lines that hold the marker
+`x-release-please-version` or lie between `x-release-please-start-version` and
+`x-release-please-end`, such as the install commands in the README, `VERSION` in the `Makefile`
+and `provider_version` in `lab/justfile`. Before 1.0, a `feat` commit or a breaking change raises
+the minor version and a `fix` the patch version.
+
+clusterctl installs a version only when `metadata.yaml` maps its major.minor to a Cluster API
+contract, and release-please cannot add that entry. The `release-series` check fails the release
+pull request of a new minor version until a pull request to `main` adds it to `releaseSeries`.
+release-please then rebuilds the release pull request.
+
+To release, mark the release pull request ready for review, wait for `result`, and squash-merge
+it. Never use "Update branch" on it: the `release-pr` check accepts only release-please's one
+commit on the current tip of `main`, so wait until release-please rebuilds it. The push of the
+merge runs the release workflow again: release-please tags `v<version>` and creates the GitHub
+release, and the same run publishes it.
+
+| Job | What it does |
+| --- | --- |
+| `plan` | Reads the version from `.release-please-manifest.json` and fails when it is not the tag release-please made or `metadata.yaml` lacks its series. |
+| `image <package>` | Builds a manager's image with buildx, pushes it as `ghcr.io/trevex/cluster-api-provider-chalkos-<package>:<tag>`, signs the digest with `cosign sign`, writes its SPDX SBOM with syft and attests its provenance and its SBOM in the registry. |
+| `assets` | Runs `make release-manifests` with both images by digest, adds `metadata.yaml` and the SBOMs, writes `SHA256SUMS`, signs every file with `cosign sign-blob`, attests their provenance and uploads them to the release. |
+| `notes` | Appends the images' digests and the commands that install and verify the release to the release's notes. |
+
+Signing is keyless: the certificate's identity is `release.yml` on `refs/heads/main`. When a job
+fails, "Re-run failed jobs" builds the same commit again and replaces the assets and the section
+of the notes.
+
+A dry run builds the images and the assets of a branch and publishes nothing; the run's summary
+lists the digests and checksums, and its artifact `release-assets` holds the files for seven
+days:
+
+```sh
+gh workflow run release.yml --repo trevex/cluster-api-provider-chalkos --ref <branch> -f dry-run=true
+```
+
+Before the first release a maintainer installs the release GitHub App, which needs Contents, Pull
+requests and Issues read and write, on the repository and sets the secrets `RELEASE_APP_ID`, its
+client ID, and `RELEASE_APP_PRIVATE_KEY`, a private key in PEM form. The GitHub Container Registry
+creates each image's package private on its first push, so after the first release the maintainer
+makes both packages public in their settings. `.release-please-manifest.json` holds `0.0.0` until
+then, and the first release is the `initial-version` of `release-please-config.json`, v0.1.0.
 
 ## Licence
 

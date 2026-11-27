@@ -15,6 +15,8 @@ export cdi_version := "v1.66.1"
 # tool, is of the same release.
 export capi_version := `go list -m sigs.k8s.io/cluster-api | cut -d" " -f2`
 export capk_version := "v0.11.2"
+# The latest release of the chalkos providers, which release-please sets with each release.
+export provider_version := "v0.1.0" # x-release-please-version
 
 lab := justfile_directory() / ".." / ".lab"
 
