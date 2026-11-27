@@ -143,7 +143,7 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(r.clusterToConfigs),
 			builder.WithPredicates(predicates.Any(mgr.GetScheme(), log,
 				predicates.ClusterPausedTransitions(mgr.GetScheme(), log),
-				predicates.ClusterControlPlaneInitialized(mgr.GetScheme(), log),
+				controlPlaneInitialized(),
 			))).
 		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToConfigs),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
@@ -260,7 +260,8 @@ func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl
 	}
 	if !installed && !util.IsControlPlaneMachine(s.machine) && !ptr.Deref(s.cluster.Status.Initialization.ControlPlaneInitialized, false) {
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForControlPlaneReason, "The Cluster's control plane is not initialized yet")
-		return ctrl.Result{}, nil
+		// The Cluster's watch reconciles again once it is initialized; the requeue covers a missed event.
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
 	switch {
@@ -714,5 +715,22 @@ func machineChanged() predicate.Funcs {
 				!ptr.Equal(old.Status.Initialization.InfrastructureProvisioned, cur.Status.Initialization.InfrastructureProvisioned) ||
 				!old.DeletionTimestamp.Equal(cur.DeletionTimestamp)
 		},
+	}
+}
+
+// controlPlaneInitialized passes the updates of a Cluster whose
+// status.initialization.controlPlaneInitialized turned true, which a worker's install waits for.
+// Cluster API's ClusterControlPlaneInitialized predicate watches the Cluster's condition instead,
+// which may turn true in an earlier update than the field the reconcile reads.
+func controlPlaneInitialized() predicate.Funcs {
+	initialized := func(o client.Object) bool {
+		c, ok := o.(*clusterv1.Cluster)
+		return ok && ptr.Deref(c.Status.Initialization.ControlPlaneInitialized, false)
+	}
+	return predicate.Funcs{
+		UpdateFunc:  func(e event.UpdateEvent) bool { return !initialized(e.ObjectOld) && initialized(e.ObjectNew) },
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
 }

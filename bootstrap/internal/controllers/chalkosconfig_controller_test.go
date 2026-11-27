@@ -858,3 +858,20 @@ func TestMachineChanged(t *testing.T) {
 		}
 	}
 }
+
+// The Cluster watch passes the update that turns status.initialization.controlPlaneInitialized
+// true, whatever the Cluster's conditions say.
+func TestControlPlaneInitialized(t *testing.T) {
+	before := &clusterv1.Cluster{Status: clusterv1.ClusterStatus{Conditions: []metav1.Condition{
+		{Type: clusterv1.ClusterControlPlaneInitializedCondition, Status: metav1.ConditionTrue},
+	}}}
+	after := before.DeepCopy()
+	after.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
+	p := controlPlaneInitialized()
+	if !p.Update(event.UpdateEvent{ObjectOld: before, ObjectNew: after}) {
+		t.Error("the update that initializes the control plane is dropped")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: after, ObjectNew: after.DeepCopy()}) {
+		t.Error("an update of an initialized Cluster passes")
+	}
+}
