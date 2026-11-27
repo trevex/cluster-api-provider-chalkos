@@ -1,0 +1,11 @@
+# KubeVirt with its defaults: hardware virtualization through the kind node's /dev/kvm. The
+# justfile turns on software emulation when the host has no /dev/kvm.
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates: []

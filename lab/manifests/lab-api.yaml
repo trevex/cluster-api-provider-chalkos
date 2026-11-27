@@ -1,0 +1,15 @@
+# The API server of the workload cluster lab on a port of the kind node, which the host reaches on
+# the kind network. It selects the control planes' VMs as CAPK's lab-lb does.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-api
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    cluster.x-k8s.io/cluster-name: lab
+    cluster.x-k8s.io/role: control-plane
+  ports:
+  - port: 6443
+    targetPort: 6443

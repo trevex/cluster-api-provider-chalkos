@@ -1,0 +1,10 @@
+# The lab's management cluster: one node, which runs Cluster API, KubeVirt and the VMs. containerd
+# reads registry hosts from /etc/containerd/certs.d, where the justfile's create recipe makes
+# localhost:5001 a mirror of the lab's registry, kind-registry:5000 on the kind network, so the
+# providers' images pushed to localhost:5001 pull inside the cluster under the same name.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.cri.v1.images".registry]
+    config_path = "/etc/containerd/certs.d"

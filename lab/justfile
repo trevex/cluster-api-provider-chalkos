@@ -1,0 +1,156 @@
+# The KubeVirt lab: a kind cluster that runs Cluster API, CAPK, KubeVirt, CDI and the chalkos
+# providers, and a workload cluster of chalkos VMs on it. Run the recipes in order from the
+# devshell (nix develop), from any directory:
+#
+#   just -f lab/justfile registry create kubevirt images providers cluster
+#
+# Every recipe can run again. All state lives in .lab/ of the repository, never in /tmp.
+
+set working-directory := ".."
+
+export kind_name := "chalkos-lab"
+export kubevirt_version := "v1.10.0"
+export cdi_version := "v1.66.1"
+export capi_version := "v1.14.4"
+export capk_version := "v0.11.2"
+
+lab := justfile_directory() / ".." / ".lab"
+
+# The kind cluster's kubeconfig and the builds' temporary files stay in .lab, off the tmpfs.
+export KUBECONFIG := lab / "kind.kubeconfig"
+export TMPDIR := lab / "tmp"
+
+default:
+    @just --list --justfile {{justfile()}}
+
+# The providers' images, the containerDisk and the chalkos image are pushed here.
+[doc("Run the lab's registry: localhost:5001 from the host, kind-registry:5000 inside kind.")]
+registry:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{lab}}/registry {{lab}}/tmp
+    if [ "$(docker inspect -f '{{{{.State.Running}}' kind-registry 2>/dev/null)" != true ]; then
+      docker rm -f kind-registry >/dev/null 2>&1 || true
+      docker run -d --restart=always --name kind-registry --user "$(id -u):$(id -g)" \
+        -p 127.0.0.1:5001:5000 -v {{lab}}/registry:/var/lib/registry registry:2
+    fi
+
+[doc("Create the kind cluster with the registry's mirror and join the registry to its network.")]
+create:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! kind get clusters | grep -qx "$kind_name"; then
+      kind create cluster --name "$kind_name" --config lab/kind.yaml --kubeconfig "$KUBECONFIG"
+    fi
+    for node in $(kind get nodes --name "$kind_name"); do
+      docker exec "$node" mkdir -p /etc/containerd/certs.d/localhost:5001
+      printf '[host."http://kind-registry:5000"]\n' | \
+        docker exec -i "$node" cp /dev/stdin /etc/containerd/certs.d/localhost:5001/hosts.toml
+      # A VM on the pod network takes its pod's /24 as on-link, so it reaches other pods, among
+      # them the providers and the other VMs, by ARP; the node answers for them.
+      docker exec "$node" sysctl -q -w net.ipv4.conf.all.proxy_arp=1
+    done
+    if [ "$(docker inspect -f '{{{{json .NetworkSettings.Networks.kind}}' kind-registry)" = null ]; then
+      docker network connect kind kind-registry
+    fi
+
+# Install KubeVirt and CDI, which imports the VMs' disks from the lab's registry.
+kubevirt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kubectl apply --server-side --force-conflicts -f "https://github.com/kubevirt/kubevirt/releases/download/$kubevirt_version/kubevirt-operator.yaml"
+    kubectl apply -f lab/manifests/kubevirt-cr.yaml
+    if [ ! -e /dev/kvm ]; then
+      kubectl -n kubevirt patch kubevirt kubevirt --type merge \
+        -p '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
+    fi
+    kubectl apply --server-side --force-conflicts -f "https://github.com/kubevirt/containerized-data-importer/releases/download/$cdi_version/cdi-operator.yaml"
+    kubectl apply -f lab/manifests/cdi-cr.yaml
+    kubectl -n kubevirt wait kubevirt kubevirt --for condition=Available --timeout 15m
+    kubectl wait cdi cdi --for condition=Available --timeout 15m
+
+[doc("Build and push the chalkos image and its containerDisk; keep the digest in .lab/image-digest.")]
+images:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{lab}}/tmp
+    nix build .#lab-image-oci -o {{lab}}/image-oci
+    nix build .#lab-disk -o {{lab}}/disk
+    crane push {{lab}}/disk localhost:5001/chalkos-kvm-disk:dev
+    ref=$(chalkbuild push {{lab}}/image-oci localhost:5001/chalkos/kubernetes-kvm:dev | tail -n1)
+    echo "${ref##*@}" > {{lab}}/image-digest
+    echo "$ref"
+
+# A second run rolls the providers out to the images it pushed.
+[doc("Build, push and install the chalkos providers with Cluster API, cert-manager and CAPK.")]
+providers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    make local-repo REGISTRY=localhost:5001
+    if kubectl get namespace bootstrap-chalkos-system >/dev/null 2>&1; then
+      for p in bootstrap:bootstrap-chalkos controlplane:control-plane-chalkos; do
+        image="localhost:5001/cluster-api-provider-chalkos-${p%%:*}"
+        kubectl -n "${p#*:}-system" set image "deployment/${p#*:}-controller-manager" \
+          "manager=$image@$(crane digest "$image:dev")"
+      done
+    else
+      clusterctl init --config out/clusterctl.yaml --wait-providers \
+        --core "cluster-api:$capi_version" \
+        --infrastructure "kubevirt:$capk_version" \
+        --bootstrap chalkos --control-plane chalkos
+    fi
+
+# The image's reference names the registry by its address on the kind network, which the
+# providers and the nodes reach over plain HTTP.
+[doc("Create the workload cluster lab from lab/cluster.yaml.tmpl and the pushed chalkos image.")]
+cluster:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    registry="$(docker inspect -f '{{{{.NetworkSettings.Networks.kind.IPAddress}}' kind-registry):5000"
+    image="$registry/chalkos/kubernetes-kvm@$(cat {{lab}}/image-digest)"
+    sed -e "s|@IMAGE@|$image|g" -e "s|@REGISTRY@|$registry|g" lab/cluster.yaml.tmpl > {{lab}}/cluster.yaml
+    # CAPK's webhook may refuse connections for a moment after clusterctl init returns.
+    for attempt in $(seq 12); do
+      kubectl apply -f {{lab}}/cluster.yaml && exit 0
+      sleep 5
+    done
+    exit 1
+
+# Show the workload cluster's state.
+describe:
+    clusterctl describe cluster lab --show-conditions all
+
+# The host reaches the API server through the NodePort Service lab-api on the kind node; its
+# certificate is still checked against the endpoint, lab-lb's ClusterIP.
+[doc("Write the workload cluster's kubeconfig to .lab/lab.kubeconfig, reachable from the host.")]
+kubeconfig:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kubectl apply -f lab/manifests/lab-api.yaml >/dev/null
+    port=$(kubectl get service lab-api -o jsonpath='{.spec.ports[0].nodePort}')
+    node=$(docker inspect -f '{{{{.NetworkSettings.Networks.kind.IPAddress}}' "$kind_name-control-plane")
+    clusterctl get kubeconfig lab > {{lab}}/lab.kubeconfig
+    server=$(kubectl --kubeconfig {{lab}}/lab.kubeconfig config view -o jsonpath='{.clusters[0].cluster.server}')
+    host=${server#https://}; host=${host%:*}
+    cluster=$(kubectl --kubeconfig {{lab}}/lab.kubeconfig config view -o jsonpath='{.clusters[0].name}')
+    kubectl --kubeconfig {{lab}}/lab.kubeconfig config set-cluster "$cluster" \
+      --server "https://$node:$port" --tls-server-name "$host" >/dev/null
+    # kube-proxy opens a new NodePort a moment after the Service exists.
+    for attempt in $(seq 30); do
+      kubectl --kubeconfig {{lab}}/lab.kubeconfig get --raw /readyz >/dev/null 2>&1 && exit 0
+      sleep 1
+    done
+    echo "the API server does not answer at https://$node:$port" >&2
+    exit 1
+
+# Run kubectl against the workload cluster.
+[positional-arguments]
+kt *args:
+    @[ -f {{lab}}/lab.kubeconfig ] || just --justfile {{justfile()}} kubeconfig
+    @kubectl --kubeconfig {{lab}}/lab.kubeconfig "$@"
+
+# Delete the workload cluster, the kind cluster and the registry with its storage.
+destroy:
+    -kind delete cluster --name "$kind_name" --kubeconfig "$KUBECONFIG"
+    -docker rm -f kind-registry
+    rm -rf {{lab}}/registry {{lab}}/image-digest {{lab}}/lab.kubeconfig {{lab}}/cluster.yaml

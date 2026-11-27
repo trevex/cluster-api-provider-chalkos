@@ -12,6 +12,7 @@
 
   outputs =
     {
+      chalkos,
       nixpkgs,
       go-overlay,
       ...
@@ -23,6 +24,9 @@
       go = (go-overlay.lib.mkGoBin pkgs).fromGoModStrict ./go.mod;
     in
     {
+      # The images of the KubeVirt lab in lab/: lab-image, lab-image-oci and lab-disk.
+      packages.${system} = import ./nix/lab-images.nix { inherit chalkos pkgs; };
+
       devShells.${system}.default = pkgs.mkShell {
         packages = [
           go
@@ -37,6 +41,8 @@
           pkgs.crane
           pkgs.qemu # qemu-img
           pkgs.golangci-lint
+          # Pushes the lab's chalkos image to the lab's registry.
+          chalkos.packages.${system}.chalkbuild
         ];
       };
     };
