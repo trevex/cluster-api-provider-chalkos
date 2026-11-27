@@ -1,0 +1,3 @@
+resources:
+- aggregated_role.yaml
+#+kubebuilder:scaffold:rbackustomizeresource

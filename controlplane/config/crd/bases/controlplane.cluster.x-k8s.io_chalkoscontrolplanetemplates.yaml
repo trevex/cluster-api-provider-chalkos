@@ -1,0 +1,206 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: chalkoscontrolplanetemplates.controlplane.cluster.x-k8s.io
+spec:
+  group: controlplane.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: ChalkosControlPlaneTemplate
+    listKind: ChalkosControlPlaneTemplateList
+    plural: chalkoscontrolplanetemplates
+    singular: chalkoscontrolplanetemplate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Time since creation of ChalkosControlPlaneTemplate
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ChalkosControlPlaneTemplate is the ChalkosControlPlane a ClusterClass's control plane is
+          instantiated from.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec is the desired state of ChalkosControlPlaneTemplate.
+            properties:
+              template:
+                description: Template is the ChalkosControlPlane a ClusterClass's
+                  control plane is instantiated from.
+                minProperties: 1
+                properties:
+                  metadata:
+                    description: ObjectMeta is the metadata the instantiated ChalkosControlPlane
+                      starts with.
+                    minProperties: 1
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          annotations is an unstructured key value map stored with a resource that may be
+                          set by external tools to store and retrieve arbitrary metadata. They are not
+                          queryable and should be preserved when modifying objects.
+                          More info: http://kubernetes.io/docs/user-guide/annotations
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          labels is a map of string keys and values that can be used to organize and categorize
+                          (scope and select) objects. May match selectors of replication controllers
+                          and services.
+                          More info: http://kubernetes.io/docs/user-guide/labels
+                        type: object
+                    type: object
+                  spec:
+                    description: Spec is the instantiated ChalkosControlPlane's spec.
+                    properties:
+                      files:
+                        description: |-
+                          Files are the cluster-wide chalkos config documents every node of the cluster gets (such as
+                          Flannel, Addon and Registry documents), together with the control planes' own Node fields.
+                          They must hold the Cluster document, which names the etcd, coredns, pause and flannel images;
+                          the controllers derive the API server's, controller-manager's, scheduler's and kube-proxy's
+                          from the version where it names none. Fields the controllers own are refused: the Node's type
+                          and providerID, the Cluster's endpoint, and its ipFamilies, podCIDRs and serviceCIDRs when the
+                          Cluster's clusterNetwork gives ranges.
+                        items:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                        type: array
+                        x-kubernetes-preserve-unknown-fields: true
+                      image:
+                        description: |-
+                          Image is the chalkos image the control planes install, by digest: repository@sha256:….
+                          A ClusterClass's topology may compute this for each Cluster that uses it, instead.
+                        pattern: ^.+@sha256:[a-f0-9]{64}$
+                        type: string
+                      imagePullSecretRef:
+                        description: |-
+                          ImagePullSecretRef names a Secret of type kubernetes.io/dockerconfigjson in the
+                          ChalkosControlPlane's namespace whose credentials the controller reads the image with. The
+                          node pulls with the Registry documents among Files.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      kubeconfig:
+                        default: {}
+                        description: Kubeconfig says how the cluster's kubeconfig
+                          Secret's certificate is issued.
+                        properties:
+                          ttlSeconds:
+                            default: 86400
+                            description: |-
+                              TTLSeconds is how long, in seconds, the kubeconfig Secret's client certificate is valid.
+                              The certificate is issued again once two thirds of the TTL have passed.
+                            format: int32
+                            minimum: 600
+                            type: integer
+                        type: object
+                      machineTemplate:
+                        description: |-
+                          MachineTemplate is what the control planes' Machines are made from, without the
+                          infrastructure reference that a ClusterClass's topology computes for each Cluster.
+                        minProperties: 1
+                        properties:
+                          metadata:
+                            description: ObjectMeta is the metadata the control planes'
+                              Machines start with.
+                            minProperties: 1
+                            properties:
+                              annotations:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  annotations is an unstructured key value map stored with a resource that may be
+                                  set by external tools to store and retrieve arbitrary metadata. They are not
+                                  queryable and should be preserved when modifying objects.
+                                  More info: http://kubernetes.io/docs/user-guide/annotations
+                                type: object
+                              labels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  labels is a map of string keys and values that can be used to organize and categorize
+                                  (scope and select) objects. May match selectors of replication controllers
+                                  and services.
+                                  More info: http://kubernetes.io/docs/user-guide/labels
+                                type: object
+                            type: object
+                          spec:
+                            description: Spec is the control planes' Machines' spec.
+                            minProperties: 1
+                            properties:
+                              deletion:
+                                description: Deletion contains configuration options
+                                  for a control plane's Machine's deletion.
+                                minProperties: 1
+                                properties:
+                                  nodeDeletionTimeoutSeconds:
+                                    description: |-
+                                      NodeDeletionTimeoutSeconds is how long the controller attempts to delete a control plane
+                                      Machine's Node, measured from when that deletion started. A value of 0 retries
+                                      indefinitely.
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  nodeDrainTimeoutSeconds:
+                                    description: |-
+                                      NodeDrainTimeoutSeconds is the total amount of time the controller spends draining a
+                                      control plane's node. Its default, 0, means the node is drained without a time limit.
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  nodeVolumeDetachTimeoutSeconds:
+                                    description: |-
+                                      NodeVolumeDetachTimeoutSeconds is the total amount of time the controller waits for all of
+                                      a control plane's volumes to detach. Its default, 0, means it waits without a time limit.
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                type: object
+                            type: object
+                        type: object
+                    type: object
+                type: object
+            required:
+            - template
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources: {}
