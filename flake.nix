@@ -5,7 +5,7 @@
   # builds is the one chalkos builds for itself, and both repositories move
   # together when chalkos's pin is bumped.
   inputs = {
-    chalkos.url = "github:trevex/chalkos/46f275276f65a3a5fb980487a429b2315ec47c60";
+    chalkos.url = "github:trevex/chalkos/v0.8.0";
     nixpkgs.follows = "chalkos/nixpkgs";
     go-overlay.follows = "chalkos/go-overlay";
   };
