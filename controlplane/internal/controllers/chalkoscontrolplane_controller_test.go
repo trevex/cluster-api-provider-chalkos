@@ -1108,3 +1108,51 @@ func TestStatusErrorRequeues(t *testing.T) {
 	}
 	wantReason(t, e.cp(), controlplanev1.NotInitializedReason, "connection refused")
 }
+
+// A deleted ChalkosControlPlane waits for the cluster's worker Machines and MachinePools to be
+// deleted before it deletes its own Machines.
+func TestDeletionWaitsForWorkers(t *testing.T) {
+	e := newEnv(t, 1, true)
+	e.mustReconcile()
+	e.wantMachines(1)
+	labels := map[string]string{clusterv1.ClusterNameLabel: clusterName}
+	infra := clusterv1.ContractVersionedObjectReference{APIGroup: builder.InfrastructureGroupVersion.Group, Kind: builder.GenericInfrastructureMachineKind, Name: "worker"}
+	bootstrap := clusterv1.Bootstrap{DataSecretName: ptr.To("worker")}
+	worker := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: "worker", Labels: labels},
+		Spec:       clusterv1.MachineSpec{ClusterName: clusterName, Bootstrap: bootstrap, InfrastructureRef: infra},
+	}
+	e.create(worker)
+	pool := &clusterv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: "pool", Labels: labels},
+		Spec: clusterv1.MachinePoolSpec{ClusterName: clusterName, Template: clusterv1.MachineTemplateSpec{
+			Spec: clusterv1.MachineSpec{ClusterName: clusterName, Bootstrap: bootstrap, InfrastructureRef: infra},
+		}},
+	}
+	e.create(pool)
+
+	if err := testClient.Delete(t.Context(), e.cp()); err != nil {
+		t.Fatal(err)
+	}
+	if res := e.mustReconcile(); res.RequeueAfter == 0 {
+		t.Error("a deletion that waits for workers is not reconciled again")
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.DeletingCondition, metav1.ConditionTrue, controlplanev1.DeletingWaitingForWorkersDeletionReason,
+		"Waiting for 1 worker Machine and 1 MachinePool to be deleted")
+	if m := e.wantMachines(1)[0]; !m.DeletionTimestamp.IsZero() {
+		t.Error("the control-plane Machine is deleted while a worker remains")
+	}
+
+	if err := testClient.Delete(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	wantConditionReason(t, e.cp(), controlplanev1.DeletingCondition, metav1.ConditionTrue, controlplanev1.DeletingWaitingForWorkersDeletionReason,
+		"Waiting for 1 worker Machine to be deleted")
+
+	if err := testClient.Delete(t.Context(), worker); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	e.wantMachines(0)
+}

@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
@@ -34,6 +36,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
+	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -240,4 +243,46 @@ func (r *ChalkosControlPlaneReconciler) cleanUp(ctx context.Context, err error, 
 		}
 	}
 	return kerrors.NewAggregate(errs)
+}
+
+// countWorkers counts the cluster's Machines that are not control-plane Machines, and its
+// MachinePools. They are listed uncached: the controller watches neither. A management cluster
+// without the MachinePool CRD has no MachinePools.
+func (r *ChalkosControlPlaneReconciler) countWorkers(ctx context.Context, s *scope) (machines, pools int, err error) {
+	inCluster := []client.ListOption{client.InNamespace(s.cp.Namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: s.cluster.Name}}
+	var ms clusterv1.MachineList
+	if err := r.APIReader.List(ctx, &ms, inCluster...); err != nil {
+		return 0, 0, fmt.Errorf("list the cluster's Machines: %w", err)
+	}
+	for i := range ms.Items {
+		if !util.IsControlPlaneMachine(&ms.Items[i]) {
+			machines++
+		}
+	}
+	var mps clusterv1.MachinePoolList
+	if err := r.APIReader.List(ctx, &mps, inCluster...); err != nil && !meta.IsNoMatchError(err) {
+		return 0, 0, fmt.Errorf("list the cluster's MachinePools: %w", err)
+	}
+	return machines, len(mps.Items), nil
+}
+
+// waitingForWorkersMessage is the Deleting condition's message while the deletion waits for the
+// worker Machines and MachinePools.
+func waitingForWorkersMessage(machines, pools int) string {
+	var waiting []string
+	if machines > 0 {
+		waiting = append(waiting, plural(machines, "worker Machine"))
+	}
+	if pools > 0 {
+		waiting = append(waiting, plural(pools, "MachinePool"))
+	}
+	return "Waiting for " + strings.Join(waiting, " and ") + " to be deleted"
+}
+
+// plural is n and the noun, which takes an s unless n is 1.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

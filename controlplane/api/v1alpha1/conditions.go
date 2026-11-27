@@ -115,6 +115,10 @@ const (
 	// NotDeletingReason documents a ChalkosControlPlane that is not being deleted.
 	NotDeletingReason = clusterv1.NotDeletingReason
 
+	// DeletingWaitingForWorkersDeletionReason documents a ChalkosControlPlane whose deletion waits for
+	// the cluster's worker Machines and MachinePools to be deleted, before it deletes its own Machines.
+	DeletingWaitingForWorkersDeletionReason = clusterv1.ClusterDeletingWaitingForWorkersDeletionReason
+
 	// DeletingWaitingForMachineDeletionReason documents a ChalkosControlPlane whose deletion waits
 	// for its Machines to be deleted.
 	DeletingWaitingForMachineDeletionReason = "WaitingForMachineDeletion"

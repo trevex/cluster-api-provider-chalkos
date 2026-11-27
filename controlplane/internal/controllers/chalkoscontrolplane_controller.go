@@ -104,6 +104,7 @@ type ChalkosControlPlaneReconciler struct {
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines/status,verbs=patch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinepools,verbs=list
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;create;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
@@ -301,11 +302,23 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	return earliest(res, ctrl.Result{RequeueAfter: renew}), nil
 }
 
-// reconcileDelete deletes the control plane's Machines and, once they are gone, removes the
-// finalizer. The Machines' own finalizers delete their infrastructure and nodes first.
+// reconcileDelete waits for the cluster's workers to be deleted, then deletes the control plane's
+// Machines and, once they are gone, removes the finalizer. The Machines' own finalizers delete
+// their infrastructure and nodes first. The workers go first, as with Cluster API's own control
+// plane, so that their nodes are drained while the cluster's API server still answers.
 func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result, error) {
 	if err := r.listMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
+	}
+	workers, pools, err := r.countWorkers(ctx, s)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if workers+pools > 0 {
+		s.deletingReason = controlplanev1.DeletingWaitingForWorkersDeletionReason
+		s.deletingMessage = waitingForWorkersMessage(workers, pools)
+		// No watch reports the workers' deletion; the requeue does.
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	for i := range s.machines {
 		err := r.Client.Delete(ctx, &s.machines[i])
@@ -319,10 +332,7 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 	}
 	if n := len(s.machines) + len(s.deleting); n > 0 {
 		s.deletingReason = controlplanev1.DeletingWaitingForMachineDeletionReason
-		s.deletingMessage = fmt.Sprintf("Deleting %d Machines", n)
-		if n == 1 {
-			s.deletingMessage = "Deleting 1 Machine"
-		}
+		s.deletingMessage = "Deleting " + plural(n, "Machine")
 		// The Machines' watch reconciles again as they go; the requeue covers a missed event.
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
