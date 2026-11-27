@@ -1,0 +1,10 @@
+# The chalkos providers for clusterctl, which does not list them itself: their GitHub releases,
+# in the form clusterctl expects of a GitHub repository. clusterctl init --bootstrap chalkos:<version>
+# picks a release; without a version it takes the latest.
+providers:
+- name: chalkos
+  type: BootstrapProvider
+  url: https://github.com/trevex/cluster-api-provider-chalkos/releases/latest/bootstrap-components.yaml
+- name: chalkos
+  type: ControlPlaneProvider
+  url: https://github.com/trevex/cluster-api-provider-chalkos/releases/latest/control-plane-components.yaml

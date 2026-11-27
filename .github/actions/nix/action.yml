@@ -17,8 +17,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # The lab's chalkos image, its containerDisk, the registry that holds both and the VMs' disks
-    # take more than the runner's free disk.
+    # The VMs' disks, imported from chalkos's containerDisk, with CDI's scratch space and the kind
+    # node's images take more than the runner's free disk.
     - name: Free disk space
       if: inputs.free-disk == 'true'
       shell: bash
@@ -41,8 +41,8 @@ runs:
         fi
     - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
     # The binary cache in the GitHub Actions cache: a job substitutes what main's runs and its
-    # pull request's earlier runs built, such as the ci shell's govulncheck or the lab's chalkos
-    # image, and uploads what it builds when it ends. Paths cache.nixos.org signs stay out of it.
+    # pull request's earlier runs built, such as the ci shell's govulncheck, and uploads what it
+    # builds when it ends. Paths cache.nixos.org signs stay out of it.
     - uses: Mic92/hestia@dfed9ced335d28978ba74e513939a10db1f71025 # v3.1.0
       with:
         version: v3.1.0

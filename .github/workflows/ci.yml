@@ -140,8 +140,8 @@ jobs:
   # The end-to-end test on the KubeVirt lab, the lab's VMs hardware-accelerated by the runner's
   # /dev/kvm: a ready pull request with the label e2e and the nightly run, whose event is schedule
   # or workflow_dispatch, run it; a push to main does not. The lab takes about 7 GiB of the
-  # runner's 16 GiB: two VMs of 3 and 2 GiB, KubeVirt, CDI and Cluster API. The first run of a
-  # branch builds the lab's chalkos image, which later runs substitute from the binary cache.
+  # runner's 16 GiB: two VMs of 3 and 2 GiB, KubeVirt, CDI and Cluster API. The VMs boot chalkos's
+  # released images from ghcr.io; the providers are built from the pull request's code.
   e2e:
     if: >-
       ${{ !github.event.pull_request.draft && github.event_name != 'push' &&
@@ -171,14 +171,12 @@ jobs:
             echo "::error title=No KVM::the runner has no writable /dev/kvm"
             exit 1
           fi
-      - name: Start the registry and the kind cluster
-        run: nix develop --command just -f lab/justfile registry create
+      - name: Create the kind cluster
+        run: nix develop --command just -f lab/justfile create
       - name: Install KubeVirt and CDI
         run: nix develop --command just -f lab/justfile kubevirt
-      - name: Build and push the chalkos image
-        run: nix develop --command just -f lab/justfile images
-      - name: Install the providers
-        run: nix develop --command just -f lab/justfile providers
+      - name: Build and install the providers
+        run: nix develop --command just -f lab/justfile providers-local
       # A test that skips, as when a provider is not available, fails the job. The memory the
       # runner uses is sampled while the test runs, and its peak goes to the run's summary.
       - name: Run the end-to-end test

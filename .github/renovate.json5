@@ -66,18 +66,6 @@
       depNameTemplate: 'Mic92/hestia',
       datasourceTemplate: 'github-releases',
     },
-    // The lab will boot chalkos's released images, ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm
-    // and ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm-disk, pinned by digest. A regex manager
-    // with the docker datasource then keeps their tags and digests at the release flake.nix names,
-    // in the chalkos group:
-    //
-    // {
-    //   customType: 'regex',
-    //   description: "chalkos's lab images",
-    //   managerFilePatterns: ['/^lab/images\\.env$/'],
-    //   matchStrings: ['(?<depName>ghcr\\.io/trevex/chalkos/\\S+):(?<currentValue>v\\S+)@(?<currentDigest>sha256:[0-9a-f]+)'],
-    //   datasourceTemplate: 'docker',
-    // },
   ],
   packageRules: [
     {
@@ -215,8 +203,9 @@
     },
     {
       // A chalkos release, in go.mod and flake.nix together, as soon as it is published: the
-      // providers follow chalkos's releases, and renovate-fixup.yml updates flake.lock. The
-      // end-to-end test runs on it, and a maintainer merges it.
+      // providers follow chalkos's releases, and renovate-fixup.yml updates flake.lock. The lab
+      // boots the images of the release go.mod names, so the end-to-end test runs on them. A
+      // maintainer merges it.
       matchPackageNames: ['github.com/trevex/chalkos', 'trevex/chalkos'],
       groupName: 'chalkos',
       groupSlug: 'chalkos',

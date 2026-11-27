@@ -1,8 +1,14 @@
 # The KubeVirt lab: a kind cluster that runs Cluster API, CAPK, KubeVirt, CDI and the chalkos
-# providers, and a workload cluster of chalkos VMs on it. Run the recipes in order from the
-# devshell (nix develop), from any directory:
+# providers, and a workload cluster of chalkos VMs on it. The VMs boot chalkos's released images
+# from ghcr.io, and the providers are the release provider_version names, so nothing is built.
+# From the devshell (nix develop), from any directory:
 #
-#   just -f lab/justfile registry create kubevirt images providers cluster
+#   just -f lab/justfile up
+#
+# up runs create, kubevirt, providers and cluster in order. providers-local in place of providers
+# builds the providers from the checkout, as the end-to-end test does:
+#
+#   just -f lab/justfile create kubevirt providers-local cluster
 #
 # Every recipe can run again. All state lives in .lab/ of the repository, never in /tmp.
 
@@ -17,48 +23,43 @@ export capi_version := `go list -m sigs.k8s.io/cluster-api | cut -d" " -f2`
 export capk_version := "v0.11.2"
 # The latest release of the chalkos providers, which release-please sets with each release.
 export provider_version := "v0.1.0" # x-release-please-version
+# The chalkos release whose images the VMs boot: the one go.mod builds the providers against,
+# which Renovate bumps with the flake input. The images are those of its Kubernetes minor,
+# ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm and its containerDisk, <...>-kvm-disk.
+export chalkos_version := `go list -m github.com/trevex/chalkos | cut -d" " -f2`
+export kubernetes_minor := "1.37"
+export chalkos_image := "ghcr.io/trevex/chalkos/kubernetes-" + kubernetes_minor + "-kvm"
+# The registry host in the names of the providers' images that providers-local builds. The images
+# go straight into the kind node, so no registry serves them.
+export local_registry := "kind.local"
 
 lab := justfile_directory() / ".." / ".lab"
 
-# The kind cluster's kubeconfig and the builds' temporary files stay in .lab, off the tmpfs.
+# The kind cluster's kubeconfig and the temporary files stay in .lab, off the tmpfs.
 export KUBECONFIG := lab / "kind.kubeconfig"
 export TMPDIR := lab / "tmp"
 
 default:
     @just --list --justfile {{justfile()}}
 
-# The providers' images, the containerDisk and the chalkos image are pushed here.
-[doc("Run the lab's registry: localhost:5001 from the host, kind-registry:5000 inside kind.")]
-registry:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p {{lab}}/registry {{lab}}/tmp
-    if [ "$(docker inspect -f '{{{{.State.Running}}' kind-registry 2>/dev/null)" != true ]; then
-      docker rm -f kind-registry >/dev/null 2>&1 || true
-      docker run -d --restart=always --name kind-registry --user "$(id -u):$(id -g)" \
-        -p 127.0.0.1:5001:5000 -v {{lab}}/registry:/var/lib/registry registry:2
-    fi
+[doc("Create the lab and its workload cluster from released images: create kubevirt providers cluster.")]
+up: create kubevirt providers cluster
 
-[doc("Create the kind cluster with the registry's mirror and join the registry to its network.")]
+[doc("Create the kind cluster.")]
 create:
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p {{lab}}/tmp
     if ! kind get clusters | grep -qx "$kind_name"; then
-      kind create cluster --name "$kind_name" --config lab/kind.yaml --kubeconfig "$KUBECONFIG"
+      kind create cluster --name "$kind_name" --kubeconfig "$KUBECONFIG"
     fi
     for node in $(kind get nodes --name "$kind_name"); do
-      docker exec "$node" mkdir -p /etc/containerd/certs.d/localhost:5001
-      printf '[host."http://kind-registry:5000"]\n' | \
-        docker exec -i "$node" cp /dev/stdin /etc/containerd/certs.d/localhost:5001/hosts.toml
       # A VM on the pod network takes its pod's /24 as on-link, so it reaches other pods, among
       # them the providers and the other VMs, by ARP; the node answers for them.
       docker exec "$node" sysctl -q -w net.ipv4.conf.all.proxy_arp=1
     done
-    if [ "$(docker inspect -f '{{{{json .NetworkSettings.Networks.kind}}' kind-registry)" = null ]; then
-      docker network connect kind kind-registry
-    fi
 
-# Install KubeVirt and CDI, which imports the VMs' disks from the lab's registry.
+# Install KubeVirt and CDI, which imports the VMs' disks from ghcr.io.
 kubevirt:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -73,29 +74,40 @@ kubevirt:
     kubectl -n kubevirt wait kubevirt kubevirt --for condition=Available --timeout 15m
     kubectl wait cdi cdi --for condition=Available --timeout 15m
 
-[doc("Build and push the chalkos image and its containerDisk; keep the digest in .lab/image-digest.")]
-images:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p {{lab}}/tmp
-    nix build .#lab-image-oci -o {{lab}}/image-oci
-    nix build .#lab-disk -o {{lab}}/disk
-    crane push {{lab}}/disk localhost:5001/chalkos-kvm-disk:dev
-    ref=$(chalkbuild push {{lab}}/image-oci localhost:5001/chalkos/kubernetes-kvm:dev | tail -n1)
-    echo "${ref##*@}" > {{lab}}/image-digest
-    echo "$ref"
-
-# A second run rolls the providers out to the images it pushed.
-[doc("Build, push and install the chalkos providers with Cluster API, cert-manager and CAPK.")]
+# clusterctl fetches the components of provider_version from the GitHub release, as
+# lab/clusterctl.yaml names them. A lab whose providers run already keeps them, released or local.
+[doc("Install the released chalkos providers with Cluster API, cert-manager and CAPK.")]
 providers:
     #!/usr/bin/env bash
     set -euo pipefail
-    make local-repo REGISTRY=localhost:5001
+    if kubectl get namespace bootstrap-chalkos-system >/dev/null 2>&1; then
+      echo "the chalkos providers run already; just destroy and create the lab again to change them"
+      exit 0
+    fi
+    clusterctl init --config lab/clusterctl.yaml --wait-providers \
+      --core "cluster-api:$capi_version" \
+      --infrastructure "kubevirt:$capk_version" \
+      --bootstrap "chalkos:$provider_version" --control-plane "chalkos:$provider_version"
+
+# The images are tagged dev and loaded into the kind node, which runs them without a pull. A
+# second run, or a run on a lab with the released providers, rolls the managers out to the images
+# it built.
+[doc("Build the chalkos providers from the checkout and install them, with Cluster API, cert-manager and CAPK.")]
+providers-local:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    make local-repo-manifests REGISTRY="$local_registry" IMG_TAG=dev
+    for p in bootstrap controlplane; do
+      docker build --build-arg package=$p -t "$local_registry/cluster-api-provider-chalkos-$p:dev" .
+      kind load docker-image --name "$kind_name" "$local_registry/cluster-api-provider-chalkos-$p:dev"
+    done
     if kubectl get namespace bootstrap-chalkos-system >/dev/null 2>&1; then
       for p in bootstrap:bootstrap-chalkos controlplane:control-plane-chalkos; do
-        image="localhost:5001/cluster-api-provider-chalkos-${p%%:*}"
-        kubectl -n "${p#*:}-system" set image "deployment/${p#*:}-controller-manager" \
-          "manager=$image@$(crane digest "$image:dev")"
+        deployment="deployment/${p#*:}-controller-manager"
+        kubectl -n "${p#*:}-system" set image "$deployment" \
+          "manager=$local_registry/cluster-api-provider-chalkos-${p%%:*}:dev"
+        kubectl -n "${p#*:}-system" rollout restart "$deployment"
+        kubectl -n "${p#*:}-system" rollout status "$deployment" --timeout 5m
       done
     else
       clusterctl init --config out/clusterctl.yaml --wait-providers \
@@ -104,15 +116,18 @@ providers:
         --bootstrap chalkos --control-plane chalkos
     fi
 
-# The image's reference names the registry by its address on the kind network, which the
-# providers and the nodes reach over plain HTTP.
-[doc("Create the workload cluster lab from lab/cluster.yaml.tmpl and the pushed chalkos image.")]
+# The ChalkosControlPlane and the ChalkosConfigTemplate name the chalkos image by digest, the
+# DataVolumes its containerDisk, and the version is the Kubernetes release the image carries.
+[doc("Create the workload cluster lab from lab/cluster.yaml.tmpl and chalkos's released images.")]
 cluster:
     #!/usr/bin/env bash
     set -euo pipefail
-    registry="$(docker inspect -f '{{{{.NetworkSettings.Networks.kind.IPAddress}}' kind-registry):5000"
-    image="$registry/chalkos/kubernetes-kvm@$(cat {{lab}}/image-digest)"
-    sed -e "s|@IMAGE@|$image|g" -e "s|@REGISTRY@|$registry|g" lab/cluster.yaml.tmpl > {{lab}}/cluster.yaml
+    image="$chalkos_image@$(crane digest "$chalkos_image:$chalkos_version")"
+    disk="$chalkos_image-disk@$(crane digest "$chalkos_image-disk:$chalkos_version")"
+    version=v$(crane manifest "$image" | jq -er '.annotations["dev.chalkos.kubernetes.version"]')
+    echo "chalkos $chalkos_version with Kubernetes $version: $image"
+    sed -e "s|@IMAGE@|$image|g" -e "s|@DISK@|$disk|g" -e "s|@VERSION@|$version|g" \
+      lab/cluster.yaml.tmpl > {{lab}}/cluster.yaml
     # CAPK's webhook may refuse connections for a moment after clusterctl init returns.
     for attempt in $(seq 12); do
       kubectl apply -f {{lab}}/cluster.yaml && exit 0
@@ -153,8 +168,7 @@ kt *args:
     @[ -f {{lab}}/lab.kubeconfig ] || just --justfile {{justfile()}} kubeconfig
     @kubectl --kubeconfig {{lab}}/lab.kubeconfig "$@"
 
-# Delete the workload cluster, the kind cluster and the registry with its storage.
+# Delete the workload cluster with the kind cluster.
 destroy:
     -kind delete cluster --name "$kind_name" --kubeconfig "$KUBECONFIG"
-    -docker rm -f kind-registry
-    rm -rf {{lab}}/registry {{lab}}/image-digest {{lab}}/lab.kubeconfig {{lab}}/cluster.yaml
+    rm -rf {{lab}}/lab.kubeconfig {{lab}}/cluster.yaml
