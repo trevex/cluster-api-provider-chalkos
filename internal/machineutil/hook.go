@@ -102,7 +102,10 @@ func DeletingReason(m *clusterv1.Machine) string {
 
 // WaitingForHook tells whether Cluster API waits for the Machine's pre-terminate hooks: the
 // Machine is being deleted and its Deleting condition is true with the reason
-// WaitingForPreTerminateHook, so its node was drained and its volumes detached.
+// WaitingForPreTerminateHook. Cluster API gets there after the drain and the volume detach it
+// runs, if any: it skips both while the Cluster or the control plane is being deleted, for the
+// last control-plane Machine, for a Machine without a Node, when the Machine's annotations
+// exclude them, and once their timeouts passed.
 func WaitingForHook(m *clusterv1.Machine) bool {
 	c := conditions.Get(m, clusterv1.MachineDeletingCondition)
 	return !m.DeletionTimestamp.IsZero() && c != nil && c.Status == metav1.ConditionTrue &&

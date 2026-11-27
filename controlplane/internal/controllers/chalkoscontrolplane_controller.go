@@ -279,10 +279,15 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 		return ctrl.Result{}, err
 	}
 	if !s.cluster.DeletionTimestamp.IsZero() {
+		// The Cluster's deletion deletes the ChalkosControlPlane once the workers are gone: no
+		// Machine is created or bootstrapped meanwhile, and the kubeconfig is only renewed.
 		if err := r.removeAllHooks(ctx, s); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if err := r.addHooks(ctx, s); err != nil {
+		renew, err := r.renewKubeconfig(ctx, s)
+		return ctrl.Result{RequeueAfter: renew}, err
+	}
+	if err := r.addHooks(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
 	if !s.cluster.Spec.ControlPlaneEndpoint.IsValid() {
@@ -328,17 +333,9 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 			return ctrl.Result{}, err
 		}
 	}
-	var renew time.Duration
-	if s.initialized() {
-		sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if ok {
-			if renew, err = r.reconcileKubeconfig(ctx, s, sec); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
+	renew, err := r.renewKubeconfig(ctx, s)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	workers, pools, err := r.countWorkers(ctx, s)
 	if err != nil {
@@ -370,6 +367,20 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 	s.deletingReason, s.deletingMessage = controlplanev1.DeletionCompletedReason, ""
 	controllerutil.RemoveFinalizer(s.cp, controlplanev1.ChalkosControlPlaneFinalizer)
 	return ctrl.Result{}, nil
+}
+
+// renewKubeconfig keeps the kubeconfig Secret of an initialized control plane while it or its
+// Cluster is being deleted, from the cluster's secrets if they still exist, and returns when to
+// renew it next; zero when it is not kept.
+func (r *ChalkosControlPlaneReconciler) renewKubeconfig(ctx context.Context, s *scope) (time.Duration, error) {
+	if !s.initialized() {
+		return 0, nil
+	}
+	sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
+	if err != nil || !ok {
+		return 0, err
+	}
+	return r.reconcileKubeconfig(ctx, s, sec)
 }
 
 // initialize bootstraps the cluster on the first Machine once it is installed, and marks the

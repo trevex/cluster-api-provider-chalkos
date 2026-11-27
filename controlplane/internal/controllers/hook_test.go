@@ -102,8 +102,8 @@ func TestNoHookOnADeletingControlPlaneMachine(t *testing.T) {
 	}
 }
 
-// Deleting the Cluster removes every hook at once, also of the Machines being deleted, and a
-// Machine created while it is being deleted gets none.
+// Deleting the Cluster removes every hook at once, also of the Machines being deleted, and no
+// Machine is created while it is being deleted.
 func TestClusterDeletionRemovesEveryHook(t *testing.T) {
 	e := newEnv(t, 3, true)
 	first := e.initialize("10.0.0.1")
@@ -111,9 +111,31 @@ func TestClusterDeletionRemovesEveryHook(t *testing.T) {
 	e.deleteHeld(second.Name)
 	e.deleteClusterHeld()
 	e.mustReconcile()
-	for _, m := range e.wantMachines(3) {
+	for _, m := range e.wantMachines(2) {
 		if machineutil.HasHook(&m) {
 			t.Errorf("the Machine %s keeps its hook", m.Name)
 		}
+	}
+}
+
+// A ChalkosControlPlane deleted with its Cluster removes the hooks of its Machines, which it
+// deletes, and asks no node to leave etcd.
+func TestDeletionWithTheClusterRemovesEveryHook(t *testing.T) {
+	e := newEnv(t, 3, true)
+	first := e.initialize("10.0.0.1")
+	e.hold(first.Name)
+	e.deleteClusterHeld()
+	if err := testClient.Delete(t.Context(), e.cp()); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	e.mustReconcile()
+	for _, m := range e.machines() {
+		if machineutil.HasHook(&m) || m.DeletionTimestamp.IsZero() {
+			t.Errorf("the Machine %s: hook %v, deleted %v", m.Name, machineutil.HasHook(&m), !m.DeletionTimestamp.IsZero())
+		}
+	}
+	if n, _ := e.fake.Node("10.0.0.1"); n.Leaves != 0 {
+		t.Errorf("%d leaves", n.Leaves)
 	}
 }

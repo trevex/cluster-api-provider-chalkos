@@ -161,6 +161,25 @@ func TestClusterDeletionRemovesTheHook(t *testing.T) {
 	}
 }
 
+// Deleting the Cluster removes the hook of a worker that is not being deleted, which gets no
+// NodeRemoved condition.
+func TestClusterDeletionRemovesTheHookOfAWorkerNotDeleted(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, "")
+	e.mustReconcile("w-1")
+	if !machineutil.HasHook(e.machineObj("w-1")) {
+		t.Fatal("the worker has no hook")
+	}
+	e.deleteHeld(&clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: clusterName}})
+	e.mustReconcile("w-1")
+	if machineutil.HasHook(e.machineObj("w-1")) {
+		t.Error("the worker keeps its hook while the Cluster is being deleted")
+	}
+	if c := conditions.Get(e.config("w-1"), bootstrapv1.NodeRemovedCondition); c != nil {
+		t.Errorf("NodeRemoved = %+v on a worker not being deleted", c)
+	}
+}
+
 // cpAddr is the address of the control plane cp-1 in revokableWorker.
 const cpAddr = "10.0.0.10"
 
