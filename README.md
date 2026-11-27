@@ -1,5 +1,7 @@
 # cluster-api-provider-chalkos
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/trevex/cluster-api-provider-chalkos/badge)](https://scorecard.dev/viewer/?uri=github.com/trevex/cluster-api-provider-chalkos)
+
 Cluster API bootstrap and control-plane providers for [chalkos](https://github.com/trevex/chalkos),
 the API-driven, immutable NixOS-based Linux distribution. The bootstrap provider installs a
 Machine's chalkos node over chalkd's API. The control-plane provider creates a cluster's
