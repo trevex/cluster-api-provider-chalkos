@@ -40,7 +40,8 @@ The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK,
 both providers, and boots chalkos VMs on it from chalkos's released images. `just -f lab/justfile
 up` installs the released providers; the tests run the providers of your checkout, which
 `providers-local` builds and installs. `make e2e` creates the workload cluster `lab` there, checks
-it and deletes it:
+it, scales its workers to two and back to one, checks that the removed worker was revoked, and
+deletes the cluster:
 
 ```sh
 just -f lab/justfile create kubevirt providers-local

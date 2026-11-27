@@ -19,15 +19,20 @@ What works:
 - Creating a cluster: the control-plane Machines one at a time, then the workers of
   MachineDeployments.
 - Scaling the control plane up, one Machine at a time, each after the one before it joined etcd.
+- Removing a Machine: a pre-terminate hook takes its node out of etcd and revokes it before
+  Cluster API deletes the Machine's infrastructure, as [Removing Machines](#removing-machines)
+  describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
+- Scaling the control plane down, one Machine at a time, oldest first, once every Machine joined
+  and etcd lists one healthy member per Machine.
+- Replacing the only Machine of a one-replica control plane, as a MachineHealthCheck does: the
+  replacement joins etcd before the old Machine leaves it.
 - Deleting a cluster: the control plane waits until the cluster's worker Machines and
   MachinePools are deleted, then deletes its own Machines. Deleting the Cluster deletes them in
-  this order. A ChalkosControlPlane deleted on its own deletes no workers: it waits until someone
-  else deletes them.
+  this order, and no node leaves etcd or is revoked. A ChalkosControlPlane deleted on its own
+  deletes no workers: it waits until someone else deletes them.
 
 What does not work yet:
 
-- Scaling the control plane down. A ChalkosControlPlane never removes a running control-plane
-  Machine.
 - Rollouts and upgrades of the control plane. A changed `spec.version` marks the Machines as not
   up to date, and a changed `spec.image` does not affect Machines that exist; neither replaces a
   Machine.
@@ -35,8 +40,9 @@ What does not work yet:
   credential the providers renew.
 
 The end-to-end test covers one control plane and one worker on KubeVirt through
-[CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt). Other infrastructure
-providers, ClusterClass topologies and worker rollouts are untested. An infrastructure provider
+[CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt), with the workers scaled
+to two and back to one. Scaling the control plane down is covered by unit tests only. Other
+infrastructure providers, ClusterClass topologies and worker rollouts are untested. An infrastructure provider
 must report each Machine's `providerID` and an `InternalIP` address that the managers can reach:
 the providers talk to chalkd on that address.
 
@@ -63,6 +69,102 @@ API objects and refuse documents that set them: the Node's type and providerID, 
 endpoint, and its IP families and pod and service ranges when the Cluster's `clusterNetwork` gives
 ranges. [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl) is a complete example of a Cluster with
 one control plane and a MachineDeployment of one worker.
+
+## Removing Machines
+
+Every chalkos Machine carries the pre-terminate hook
+`pre-terminate.delete.hook.machine.cluster.x-k8s.io/chalkos`. Its value names the provider that
+runs it: `control-plane-chalkos` on control-plane Machines and `bootstrap-chalkos` on workers.
+Cluster API drains a deleted Machine and then keeps its infrastructure until no pre-terminate hook
+is left. The provider runs the hook only once Cluster API waits for it, so the kubelet can still
+report while its pods are evicted:
+
+- A worker's node is revoked through the first control plane that answers.
+- A control plane leaves etcd. When its node cannot be reached, another control plane removes its
+  etcd member instead. Then its node is revoked through another control plane. The control-plane
+  provider runs the hooks of its Machines one at a time, oldest deletion first.
+
+Then the provider removes the annotation, and Cluster API deletes the infrastructure and the Node.
+A revoked node can no longer renew its certificates or change anything in the cluster;
+[Kubernetes certificates](https://github.com/trevex/chalkos/blob/main/docs/how-it-works/kubernetes/certificates.md#revoking-a-node-cuts-off-its-writes-and-renewals)
+in the chalkos docs lists what the revocation blocks. A control plane's disk also held the
+cluster's CA keys, which no revocation takes back: when a removed control plane's disk may be
+read by someone else, rotate the cluster's CAs with chalkctl.
+
+Some Machines skip the steps:
+
+- A Machine whose machine the bootstrap provider never reached to install loses its hook at
+  once: it never received certificates.
+- The last Machine of a ChalkosControlPlane that is being deleted, or that is not initialized,
+  neither leaves etcd nor is revoked.
+- The only Machine of an initialized one-replica control plane keeps its hook until its
+  replacement has joined etcd. The control plane creates the replacement as soon as the Machine
+  is deleted, so deleting that Machine, or a MachineHealthCheck remediating it, replaces it.
+- Deleting the Cluster removes every hook at once: nothing leaves etcd and nothing is revoked.
+
+A step that cannot finish, such as a leave that etcd refuses for its quorum or a revocation that
+no control plane answers, keeps the hook, records a Warning event and runs again 30 seconds later.
+Every step can be repeated safely.
+
+### What the conditions say
+
+A worker's ChalkosConfig reports its hook in the condition `NodeRemoved`:
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| False | `Revoking` | A control plane refused the revocation, or it failed. The message names each control plane tried and its answer. |
+| False | `WaitingForControlPlane` | No control plane could be reached, none has an address, or the cluster's secrets are gone. |
+| False | `RevokedListFull` | The list of revoked nodes has no room, even after the provider pruned it. See [The list of revoked nodes](#the-list-of-revoked-nodes). |
+| True | `Done` | The node was revoked, and the message names the control plane and the list's fill level. Or the node needs no revocation, because its machine was never reached or the Cluster is being deleted. |
+
+The ChalkosControlPlane reports control-plane removals in the condition `ScalingDown`:
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| True | `ScalingDown` | A Machine is being removed. The message names the Machine and the step it waits on: its drain ("is drained before it leaves etcd"), a leave that its node refuses, an etcd member that no other control plane removes, a revocation that no control plane answers, or the replacement of a one-replica control plane ("waits for its replacement control plane to join etcd"). |
+| True | `RevokedListFull` | The Machine's node is not revoked because the list of revoked nodes has no room, even after the provider pruned it. |
+| False | `WaitingToScaleDown` | The control plane has more Machines than `replicas`, but may not delete one yet: a Machine has not joined the cluster, or etcd does not list one healthy voting member per Machine. The message says which. |
+| False | `NotScalingDown` | No Machine is being removed. |
+
+While the ChalkosControlPlane itself is being deleted, `ScalingDown` stays `NotScalingDown` and
+the `Deleting` condition, with the reason `WaitingForMachineDeletion`, carries the message of the
+hook that waits. Both providers also record events on the ChalkosConfig or ChalkosControlPlane,
+such as `NodeRevoked`, `ControlPlaneRemoved` and `PreTerminateHookWaits`.
+
+### The list of revoked nodes
+
+chalkos keeps the cluster's revoked nodes in one list, the ConfigMap
+`kube-system/chalkos-revoked-nodes`, of a fixed capacity. A control plane reports the list's
+length and capacity in its Kubernetes status. Each entry stores when it expires: once the node's
+last certificate has expired, plus a margin. chalkd does not prune the list on its own; the
+control-plane provider calls `PruneRevoked` through a control plane:
+
+- after each revocation of a control plane,
+- once a day otherwise, which covers the workers' revocations; `status.lastRevokedPruneTime` on
+  the ChalkosControlPlane records the last attempt,
+- before a hook that finds the list full tries the revocation again, at most every five minutes.
+  The bootstrap provider does the same for a worker, once per pass of its hook.
+
+`PruneRevoked` drops the expired entries and those revoked before both the cluster's OS CA and its
+Kubernetes CA were made. A prune that fails is logged and recorded as a Warning event
+`PruneRevokedFailed`; it never holds a hook. When the list stays full, the hook waits with the
+reason `RevokedListFull`. Rotate the cluster's CAs with `chalkctl rotate os-ca` and
+`chalkctl rotate kubernetes-ca` to make room: the next prune drops every node revoked before them.
+
+### Removing the hook by hand
+
+Removing the annotation is the break-glass for a hook that cannot finish, such as one whose
+control planes are all gone:
+
+```sh
+kubectl annotate machine <machine> pre-terminate.delete.hook.machine.cluster.x-k8s.io/chalkos-
+```
+
+Cluster API then deletes the Machine's infrastructure without either step. A control plane
+removed this way stays an etcd member until `chalkctl etcd remove-member <node>` removes it, and
+its node is not revoked: its certificates stay valid until they expire, unless
+`chalkctl node revoke <node>` revokes it. The provider adds no hook to a Machine that is being
+deleted, so the annotation stays removed.
 
 ## Install
 
@@ -259,8 +361,13 @@ clusterctl init \
 
 `make e2e` runs the lab's scenario against a running lab: it creates the workload cluster `lab`
 of one control plane and one worker, waits for the control plane to become available and both
-nodes to become Ready, checks the providers' statuses and the kubeconfig's certificate, and then
-deletes the cluster and waits until its Machines and VMs are gone. It skips unless the lab runs.
+nodes to become Ready, and checks the providers' statuses and the kubeconfig's certificate. It
+then scales the MachineDeployment to two workers and back to one, and checks that every Machine
+carries its hook and that the removed worker's Node is gone and its node revoked: the control
+plane lists it among the revoked nodes in its Kubernetes status, which the test reads from chalkd
+through a NodePort Service on the kind node. This step takes a few minutes more and a third VM,
+of 2 GiB. Last, the test deletes the cluster and waits until its Machines and VMs are gone. It
+skips unless the lab runs.
 The test is for the providers of the checkout, so start the lab with `providers-local`:
 
 ```sh
