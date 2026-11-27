@@ -44,3 +44,16 @@ clusterctl init \
   --control-plane chalkos \
   --infrastructure kubevirt
 ```
+
+## End-to-end test
+
+`make e2e` runs the lab's scenario against a running lab: it creates the workload cluster `lab`
+of one control plane and one worker, waits for the control plane to become available and both
+nodes to become Ready, checks the providers' statuses and the kubeconfig's certificate, and then
+deletes the cluster and waits until its Machines and VMs are gone. It skips unless the lab runs:
+
+```sh
+just -f lab/justfile registry create kubevirt images providers
+make e2e
+just -f lab/justfile destroy
+```
