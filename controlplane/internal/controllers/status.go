@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 )
 
 // setStatus sets the ChalkosControlPlane's replica counts, versions and conditions from its
@@ -119,10 +120,35 @@ func setStatus(s *scope) {
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason})
 	}
 
+	switch want := ptr.Deref(s.cp.Spec.Replicas, 1); {
+	case !s.cp.DeletionTimestamp.IsZero():
+		// The Deleting condition reports the hooks of a deletion.
+		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingDownReason})
+	case s.removing != "":
+		reason := s.removingReason
+		if reason == "" {
+			reason = controlplanev1.ScalingDownReason
+		}
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionTrue, Reason: reason,
+			Message: machineutil.Truncate("Removing a control plane: " + s.removing),
+		})
+	case n > want:
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.ScalingDownReason,
+			Message: fmt.Sprintf("Scaling down from %d to %d replicas", n, want),
+		})
+	default:
+		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingDownReason})
+	}
+
 	switch {
 	case n == 0:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.MachinesReadyCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NoReplicasReason})
 	case len(notReady) > 0:
+		// By name, so that the message does not change once a Machine created in this reconcile,
+		// listed last, is listed in order at the next.
+		slices.Sort(notReady)
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.MachinesReadyCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.MachinesNotReadyReason,
 			Message: "Machines not ready: " + strings.Join(notReady, ", "),

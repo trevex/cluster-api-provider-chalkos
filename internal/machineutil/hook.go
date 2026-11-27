@@ -53,6 +53,9 @@ const (
 	HookRetry = 30 * time.Second
 	// HookCallTimeout bounds one call to a node while a hook runs.
 	HookCallTimeout = 2 * time.Minute
+	// HookPassTimeout bounds one pass of a hook, all its calls to nodes together, so that
+	// several nodes that do not answer cannot hold a reconcile for long.
+	HookPassTimeout = 3 * time.Minute
 )
 
 // HasHook tells whether the Machine carries HookAnnotation, of any value.

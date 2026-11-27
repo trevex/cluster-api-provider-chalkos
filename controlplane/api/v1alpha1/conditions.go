@@ -143,6 +143,11 @@ const (
 	// etcd is not healthy; the message says why.
 	ScalingDownWaitingReason = "WaitingToScaleDown"
 
+	// RevokedListFullReason documents a ChalkosControlPlane whose Machine being removed waits
+	// because the list of revoked nodes has no room for its node, even after PruneRevoked; the
+	// message names the CA rotations that make room.
+	RevokedListFullReason = "RevokedListFull"
+
 	// NotScalingDownReason documents a ChalkosControlPlane that removes no Machine.
 	NotScalingDownReason = "NotScalingDown"
 )

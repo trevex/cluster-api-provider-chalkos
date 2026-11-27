@@ -216,8 +216,8 @@ func (e *env) wantMachines(n int) []clusterv1.Machine {
 	return ms
 }
 
-// provision gives the Machine, as it is now, the InternalIP addr, marks its ChalkosConfig Ready
-// and serves the machine at addr installed as its node, in the phase.
+// provision gives the Machine, as it is now, the InternalIP addr, marks its ChalkosConfig Ready and
+// installed, and serves the machine at addr installed as its node, in the phase.
 func (e *env) provision(m clusterv1.Machine, addr string, phase kubernetesv1.Phase) {
 	e.t.Helper()
 	if err := testClient.Get(e.t.Context(), client.ObjectKeyFromObject(&m), &m); err != nil {
@@ -232,6 +232,7 @@ func (e *env) provision(m clusterv1.Machine, addr string, phase kubernetesv1.Pha
 		e.t.Fatal(err)
 	}
 	conditions.Set(&cfg, metav1.Condition{Type: bootstrapv1.ReadyCondition, Status: metav1.ConditionTrue, Reason: bootstrapv1.InstalledReason})
+	cfg.Status.Installed = ptr.To(true)
 	if err := testClient.Status().Update(e.t.Context(), &cfg); err != nil {
 		e.t.Fatal(err)
 	}

@@ -237,6 +237,10 @@ func (in *ChalkosControlPlaneStatus) DeepCopyInto(out *ChalkosControlPlaneStatus
 		in, out := &in.KubeconfigExpiresAt, &out.KubeconfigExpiresAt
 		*out = (*in).DeepCopy()
 	}
+	if in.LastRevokedPruneTime != nil {
+		in, out := &in.LastRevokedPruneTime, &out.LastRevokedPruneTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))
