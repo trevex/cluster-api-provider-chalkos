@@ -19,6 +19,7 @@ package node_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/trevex/cluster-api-provider-chalkos/internal/chalkostest"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
+	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
 )
 
 func generate(t *testing.T) clustersecrets.Secrets {
@@ -157,6 +159,63 @@ func TestKubernetesCalls(t *testing.T) {
 	}
 	if err := c.Bootstrap(context.Background(), n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) {
 		t.Errorf("Bootstrap as cp-2 = %v, want ErrOtherNode", err)
+	}
+}
+
+// A control plane that does not answer is one to move on from.
+func TestRemovalCallsToAnUnreachableNode(t *testing.T) {
+	s := generate(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	c := node.New()
+	for call, err := range map[string]error{
+		"EtcdLeave":        c.EtcdLeave(ctx, "127.0.0.1:1", s, "cp1"),
+		"EtcdRemoveMember": c.EtcdRemoveMember(ctx, "127.0.0.1:1", s, "cp1", "cp2"),
+	} {
+		if !node.Unreachable(err) || !node.TryNextControlPlane(err) {
+			t.Errorf("%s at a closed port = %v, want it unreachable", call, err)
+		}
+	}
+	if _, err := c.RevokeNode(ctx, "127.0.0.1:1", s, "cp1", "w1", false); !node.Unreachable(err) {
+		t.Errorf("RevokeNode at a closed port = %v, want it unreachable", err)
+	}
+}
+
+// The removal calls reach the installed node by its name.
+func TestRemovalCallsCheckTheName(t *testing.T) {
+	s := generate(t)
+	n := serveInstalled(t, s, "cp-1")
+	c := node.New()
+	ctx := context.Background()
+	if err := c.EtcdLeave(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) || !node.Unreachable(err) {
+		t.Errorf("EtcdLeave as cp-2 = %v, want ErrOtherNode", err)
+	}
+	if _, err := c.EtcdMembers(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) {
+		t.Errorf("EtcdMembers as cp-2 = %v, want ErrOtherNode", err)
+	}
+	if _, err := c.PruneRevoked(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) {
+		t.Errorf("PruneRevoked as cp-2 = %v, want ErrOtherNode", err)
+	}
+}
+
+// Another control plane may answer where one is unreachable or no etcd member, but not where it
+// refused for etcd's quorum or a full revoked list.
+func TestTryNextControlPlane(t *testing.T) {
+	for err, want := range map[error]bool{
+		nodetest.Unreachable("10.0.0.1"):          true,
+		nodetest.NotEtcdMember():                  true,
+		nodetest.QuorumRefused("cp2"):             false,
+		nodetest.RevokedListFull("w1"):            false,
+		context.DeadlineExceeded:                  true,
+		fmt.Errorf("x: %w", sdk.ErrNotInstalled):  true,
+		errors.New("the image has no such layer"): false,
+	} {
+		if got := node.TryNextControlPlane(err); got != want {
+			t.Errorf("TryNextControlPlane(%v) = %v, want %v", err, got, want)
+		}
+	}
+	if node.TryNextControlPlane(nil) {
+		t.Error("TryNextControlPlane(nil) = true")
 	}
 }
 

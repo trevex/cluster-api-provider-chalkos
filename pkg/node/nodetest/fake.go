@@ -22,16 +22,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
+	"connectrpc.com/connect/v2"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
 	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 	"github.com/trevex/chalkos/pkg/clustersecrets"
 	"github.com/trevex/chalkos/pkg/ociimage"
 	"github.com/trevex/chalkos/pkg/sdk"
+	sdkkubernetes "github.com/trevex/chalkos/pkg/sdk/layers/kubernetes"
 
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
@@ -55,11 +59,36 @@ type Node struct {
 	// Status is the node's Kubernetes status, which KubernetesStatus answers a copy of; nil answers
 	// an empty one.
 	Status *kubernetesv1.StatusResponse
+	// EtcdLeave, when set, answers an EtcdLeave of the node, which succeeds otherwise. The Fake
+	// calls it without holding its lock.
+	EtcdLeave func() error
+	// EtcdRemoveMember, when set, answers an EtcdRemoveMember through the node in place of the
+	// Fake's model of etcd. The Fake calls it without holding its lock.
+	EtcdRemoveMember func(member string) error
+	// Members are the etcd members the node lists. Without an EtcdRemoveMember hook, a removal
+	// finds the member here by name or by ID in hex, as etcd does, drops it, and fails with
+	// connect.CodeNotFound when there is none; a learner that has not started has no name.
+	Members []*kubernetesv1.EtcdMember
+	// RevokeNode, when set, answers a RevokeNode through the node, which otherwise succeeds unless
+	// the node to revoke is among Members and allowControlPlane is false. The Fake calls it without
+	// holding its lock.
+	RevokeNode func(node string, allowControlPlane bool) (*kubernetesv1.RevokeNodeResponse, error)
+	// PruneRevoked, when set, answers a PruneRevoked through the node, which prunes nothing
+	// otherwise. The Fake calls it without holding its lock.
+	PruneRevoked func() (*kubernetesv1.PruneRevokedResponse, error)
 
 	// Installs are the install requests the machine received, in order.
 	Installs []sdk.InstallRequest
 	// Bootstraps counts the bootstraps the node received.
 	Bootstraps int
+	// Leaves counts the EtcdLeave calls the node received.
+	Leaves int
+	// Removed are the members removed through the node, in order, as the calls named them.
+	Removed []string
+	// Revoked are the nodes revoked through the node, in order.
+	Revoked []string
+	// Prunes counts the PruneRevoked calls the node answered.
+	Prunes int
 }
 
 // Fake is a node.Client of machines and images in memory, keyed by address and by reference. It
@@ -106,6 +135,9 @@ func (f *Fake) Node(addr string) (n Node, ok bool) {
 	}
 	n = *p
 	n.Installs = slices.Clone(p.Installs)
+	n.Members = cloneMembers(p.Members)
+	n.Removed = slices.Clone(p.Removed)
+	n.Revoked = slices.Clone(p.Revoked)
 	return n, true
 }
 
@@ -121,7 +153,7 @@ func (f *Fake) reach(addr string) (*Node, error) {
 	n, ok := f.nodes[addr]
 	switch {
 	case !ok:
-		return nil, fmt.Errorf("dial %s: connection refused", addr)
+		return nil, Unreachable(addr)
 	case n.Err != nil:
 		return nil, n.Err
 	}
@@ -208,6 +240,118 @@ func (f *Fake) KubernetesStatus(_ context.Context, addr string, _ clustersecrets
 		return &kubernetesv1.StatusResponse{}, nil
 	}
 	return proto.CloneOf(n.Status), nil
+}
+
+// EtcdLeave records a leave of the machine at addr installed as name and answers it.
+func (f *Fake) EtcdLeave(_ context.Context, addr string, _ clustersecrets.Secrets, name string) error {
+	f.mu.Lock()
+	n, err := f.installed(addr, name)
+	if err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	n.Leaves++
+	hook := n.EtcdLeave
+	f.mu.Unlock()
+	if hook != nil {
+		return hook()
+	}
+	return nil
+}
+
+// EtcdRemoveMember removes member through the machine at addr installed as name and records it;
+// a refused removal is not recorded.
+func (f *Fake) EtcdRemoveMember(_ context.Context, addr string, _ clustersecrets.Secrets, name, member string) error {
+	f.mu.Lock()
+	n, err := f.installed(addr, name)
+	if err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	hook := n.EtcdRemoveMember
+	if hook == nil {
+		defer f.mu.Unlock()
+		i := slices.IndexFunc(n.Members, func(m *kubernetesv1.EtcdMember) bool {
+			return m.GetName() == member || fmt.Sprintf("%x", m.GetId()) == strings.ToLower(member)
+		})
+		if i < 0 {
+			return refusal(connect.CodeNotFound, "etcd has no member %s", member)
+		}
+		n.Members = slices.Delete(slices.Clone(n.Members), i, i+1)
+		n.Removed = append(n.Removed, member)
+		return nil
+	}
+	f.mu.Unlock()
+	if err := hook(member); err != nil {
+		return err
+	}
+	f.Update(addr, func(n *Node) { n.Removed = append(n.Removed, member) })
+	return nil
+}
+
+// EtcdMembers returns a copy of the members of the machine at addr installed as name.
+func (f *Fake) EtcdMembers(_ context.Context, addr string, _ clustersecrets.Secrets, name string) ([]*kubernetesv1.EtcdMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, err := f.installed(addr, name)
+	if err != nil {
+		return nil, err
+	}
+	return cloneMembers(n.Members), nil
+}
+
+// RevokeNode revokes node through the machine at addr installed as name and records it; a refused
+// revocation is not recorded.
+func (f *Fake) RevokeNode(_ context.Context, addr string, _ clustersecrets.Secrets, name, node string, allowControlPlane bool) (*kubernetesv1.RevokeNodeResponse, error) {
+	f.mu.Lock()
+	n, err := f.installed(addr, name)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	hook := n.RevokeNode
+	member := slices.ContainsFunc(n.Members, func(m *kubernetesv1.EtcdMember) bool { return m.GetName() != "" && m.GetName() == node })
+	f.mu.Unlock()
+	resp := &kubernetesv1.RevokeNodeResponse{RevokedAt: timestamppb.Now(), NodeDeleted: true, ListLength: 100, ListCapacity: 90_000}
+	switch {
+	case hook != nil:
+		if resp, err = hook(node, allowControlPlane); err != nil {
+			return nil, err
+		}
+	case member && !allowControlPlane:
+		return nil, &sdkkubernetes.EtcdMemberError{Node: node}
+	}
+	f.Update(addr, func(n *Node) { n.Revoked = append(n.Revoked, node) })
+	return resp, nil
+}
+
+// PruneRevoked counts a prune through the machine at addr installed as name and answers it.
+func (f *Fake) PruneRevoked(_ context.Context, addr string, _ clustersecrets.Secrets, name string) (*kubernetesv1.PruneRevokedResponse, error) {
+	f.mu.Lock()
+	n, err := f.installed(addr, name)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	n.Prunes++
+	hook := n.PruneRevoked
+	f.mu.Unlock()
+	if hook != nil {
+		return hook()
+	}
+	return &kubernetesv1.PruneRevokedResponse{ListLength: 100, ListCapacity: 90_000}, nil
+}
+
+// cloneMembers is a deep copy of members.
+func cloneMembers(members []*kubernetesv1.EtcdMember) []*kubernetesv1.EtcdMember {
+	if members == nil {
+		return nil
+	}
+	out := make([]*kubernetesv1.EtcdMember, len(members))
+	for i, m := range members {
+		out[i] = proto.CloneOf(m)
+	}
+	return out
 }
 
 // maintenance is the machine at addr as Maintenance returned it.
