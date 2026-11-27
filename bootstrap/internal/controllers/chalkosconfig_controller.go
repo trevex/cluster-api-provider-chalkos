@@ -89,6 +89,9 @@ const (
 	rebootGrace = 2 * time.Minute
 	// imageTimeout bounds the read of an image's header and contract from its registry.
 	imageTimeout = 2 * time.Minute
+	// controlPlaneWait is how soon a worker that waits for the Cluster's control plane is
+	// reconciled again in case the Cluster's watch missed the update that initialized it.
+	controlPlaneWait = time.Minute
 )
 
 const (
@@ -262,8 +265,7 @@ func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl
 	}
 	if !installed && !util.IsControlPlaneMachine(s.machine) && !ptr.Deref(s.cluster.Status.Initialization.ControlPlaneInitialized, false) {
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForControlPlaneReason, "The Cluster's control plane is not initialized yet")
-		// The Cluster's watch reconciles again once it is initialized; the requeue covers a missed event.
-		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
+		return ctrl.Result{RequeueAfter: controlPlaneWait}, nil
 	}
 	sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
 	switch {
