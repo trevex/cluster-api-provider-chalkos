@@ -1,0 +1,28 @@
+# Prepares a runner to run the commands of the flake's ci development shell: installs Nix, wires
+# up the binary cache and restores the Go caches. The ci workflow runs it after the checkout.
+name: nix
+description: Install Nix with the binary cache and restore the Go caches
+
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
+    # The binary cache in the GitHub Actions cache: a job substitutes what main's runs and its
+    # pull request's earlier runs built, such as the ci shell's govulncheck, and uploads what it
+    # builds when it ends. Paths cache.nixos.org signs stay out of it.
+    - uses: Mic92/hestia@dfed9ced335d28978ba74e513939a10db1f71025 # v3.1.0
+      with:
+        version: v3.1.0
+        upstream-cache-filter: true
+        drain-timeout: 900
+    # The module and build caches of Go and golangci-lint, and envtest's binaries, in one entry per
+    # job and go.sum. A job whose go.sum changed starts from its job's newest entry.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+          ~/.cache/golangci-lint
+          ~/.local/share/kubebuilder-envtest
+        key: go-${{ github.job }}-${{ hashFiles('go.sum') }}
+        restore-keys: go-${{ github.job }}-

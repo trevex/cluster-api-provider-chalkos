@@ -1,0 +1,228 @@
+# Lints, generates, tests and builds the providers on every pull request and every push to main.
+# A pull request's title, which a squash merge makes the subject of its commit on main, must be a
+# Conventional Commit, and each of its commits must carry its author's DCO sign-off. Editing the
+# title or the description runs the workflow again. A draft pull request runs only those two
+# jobs, lint and workflows, and fails result; marking it ready for review runs the workflow again
+# with everything. Every run but a draft's also runs govulncheck, which reads the Go
+# vulnerability database from the network. The jobs run the commands of the Makefile in the
+# flake's ci development shell. The job result is the one check that branch protection requires.
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, edited, ready_for_review, converted_to_draft]
+  push:
+    branches: [main]
+  workflow_call:
+
+# A pull request's newer run cancels its older one, also when an edit or a change between draft
+# and ready starts it. Every commit on main runs to its end.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  # golangci-lint of the ci shell, the version a developer runs with make lint, over the code of
+  # every build tag that .golangci.yml names.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Lint the Go code
+        run: nix develop .#ci --command make lint
+
+  # The generated files are committed: make generate manifests changes and adds none. The job
+  # then builds the providers' installation manifests and the local clusterctl repository from
+  # them with kustomize.
+  generate:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Generate the code and the manifests
+        run: nix develop .#ci --command make generate manifests
+      - name: Check that nothing changed
+        run: |
+          git add --intent-to-add .
+          if ! git diff --exit-code --stat; then
+            git diff
+            echo "::error title=Generated files out of date::run make generate manifests and commit what it changes"
+            exit 1
+          fi
+      - name: Build the installation manifests
+        run: nix develop .#ci --command make release-manifests local-repo-manifests
+
+  # The unit tests and the envtest suites, whose control plane binaries setup-envtest fetches.
+  test:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Run the tests
+        run: nix develop .#ci --command make test
+
+  # Each manager's image, built from the Dockerfile and pushed nowhere. The layers are cached in
+  # the GitHub Actions cache, one scope per manager.
+  build:
+    if: ${{ !github.event.pull_request.draft }}
+    name: build (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [bootstrap, controlplane]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: package=${{ matrix.package }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.package }}
+          cache-to: type=gha,scope=${{ matrix.package }},mode=max
+
+  # govulncheck checks the Go code against the Go vulnerability database, which it reads from
+  # vuln.go.dev, and fails when the code calls a function with a known vulnerability; one in a
+  # module the code requires but does not call passes.
+  govulncheck:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Check for vulnerabilities the Go code calls
+        run: nix develop .#ci --command govulncheck ./...
+
+  # The workflows and the composite action pass actionlint, with shellcheck for their scripts; the
+  # scripts of .github/scripts pass shellcheck, and their test passes.
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Lint the workflows and the scripts
+        run: |
+          nix develop .#ci --command sh -c '
+            actionlint -shellcheck shellcheck .github/workflows/*.yml &&
+            shellcheck .github/scripts/*.sh'
+      - name: Test the scripts
+        run: bash .github/scripts/test.sh
+
+  # A squash merge makes the pull request's title the subject of its commit on main, from which
+  # release-please writes the changelog.
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: .github/scripts/pr-title.sh "$TITLE"
+
+  # Each commit of a pull request carries a Signed-off-by trailer of its author, which certifies
+  # the Developer Certificate of Origin; the commits of Renovate and the release App's bot need
+  # none.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the sign-offs
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/dco.sh "$BASE" "$HEAD"
+
+  # The jobs that run on pull requests alone pass on a push when skipped. On a draft pull request
+  # this job fails at once. Branch protection counts a skipped job as passed, and GitHub keeps a
+  # commit's older checks, so a skipped result of the draft's run would pass the required check
+  # while the run that "Ready for review" starts has yet to report its own, and a passed result of
+  # a ready run would still show after "Convert to draft".
+  result:
+    needs: [lint, generate, test, build, govulncheck, workflows, pr-title, dco]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every check passed
+        env:
+          DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT: ${{ github.event_name }}
+          LINT: ${{ needs.lint.result }}
+          GENERATE: ${{ needs.generate.result }}
+          TEST: ${{ needs.test.result }}
+          BUILD: ${{ needs.build.result }}
+          GOVULNCHECK: ${{ needs.govulncheck.result }}
+          WORKFLOWS: ${{ needs.workflows.result }}
+          PR_TITLE: ${{ needs.pr-title.result }}
+          DCO: ${{ needs.dco.result }}
+        run: |
+          if [ "$DRAFT" = true ]; then
+            echo "::error title=Draft::a draft pull request runs only dco, pr-title, lint and workflows; mark it ready for review to run every check"
+            exit 1
+          fi
+          echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, workflows: $WORKFLOWS, title: $PR_TITLE, sign-offs: $DCO"
+          passed() { [ "$1" = success ] || { [ "$EVENT" != pull_request ] && [ "$1" = skipped ]; }; }
+          [ "$LINT" = success ] && [ "$GENERATE" = success ] && [ "$TEST" = success ] &&
+            [ "$BUILD" = success ] && [ "$GOVULNCHECK" = success ] && [ "$WORKFLOWS" = success ] &&
+            passed "$PR_TITLE" && passed "$DCO"
