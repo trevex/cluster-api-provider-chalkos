@@ -18,7 +18,9 @@ What works:
   MachineDeployments.
 - Scaling the control plane up, one Machine at a time, each after the one before it joined etcd.
 - Deleting a cluster: the control plane waits until the cluster's worker Machines and
-  MachinePools are deleted, then deletes its own Machines.
+  MachinePools are deleted, then deletes its own Machines. Deleting the Cluster deletes them in
+  this order. A ChalkosControlPlane deleted on its own deletes no workers: it waits until someone
+  else deletes them.
 
 What does not work yet:
 
@@ -47,9 +49,9 @@ The API has four kinds:
 
 | Kind | Provider | What it holds |
 | --- | --- | --- |
-| `ChalkosControlPlane` | control plane | `replicas` (odd, default 1), `version`, `image`, `machineTemplate` with the infrastructure template, `files` with the cluster-wide chalkos documents, and `kubeconfig.ttlSeconds`. |
+| `ChalkosControlPlane` | control plane | `replicas` (odd, default 1), `version`, `image`, `imagePullSecretRef`, `machineTemplate` with the infrastructure template, `files` with the cluster-wide chalkos documents, and `kubeconfig.ttlSeconds`. |
 | `ChalkosControlPlaneTemplate` | control plane | The same without `replicas`, `version` and the infrastructure reference, for a ClusterClass. |
-| `ChalkosConfig` | bootstrap | One Machine's `image` and the `files` of its pool, such as a Node's labels and taints. |
+| `ChalkosConfig` | bootstrap | One Machine's `image`, `imagePullSecretRef` and the `files` of its pool, such as a Node's labels and taints. |
 | `ChalkosConfigTemplate` | bootstrap | The ChalkosConfig that a MachineDeployment or MachineSet clones for each Machine. |
 
 Every `image` names a chalkos image by digest, `repository@sha256:…`. A `files` entry is a chalkos
@@ -85,7 +87,8 @@ kind cluster and the registry with its storage.
 
 The lab installs the Cluster API core release that `go.mod` builds the providers against. The
 devshell's `clusterctl` runs `go tool clusterctl`, a tool that `go.mod` names, so it is of the same
-release. It works only from inside the repository.
+release. It works only from inside the repository. `go.mod` depends on Cluster API v1.15.0-rc.0
+for now and moves to v1.15.0 once that release is out.
 
 ## Security model
 
@@ -119,7 +122,8 @@ The control-plane provider generates this Secret once the Cluster has a control-
 none exists. It sets the ChalkosControlPlane as the Secret's owner, so the Secret is deleted with
 the ChalkosControlPlane, and labels it for `clusterctl move`. A Secret that exists already is kept
 as it is. To install images that carry an OS CA, create the Secret before the Cluster from the
-`secrets.json` that `chalkctl gen secrets --plaintext` writes, with the labels
+`secrets.json` that `chalkctl gen secrets --plaintext` writes, of type `cluster.x-k8s.io/secret`
+and with the labels
 `cluster.x-k8s.io/cluster-name: <cluster>` and `clusterctl.cluster.x-k8s.io/move: ""`, and build
 the images with the `secrets.pub.json` written beside it.
 
