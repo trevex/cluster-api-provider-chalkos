@@ -80,3 +80,26 @@ const (
 	// authority refused.
 	ImageRefusedReason = "ImageRefused"
 )
+
+// Reasons for the MachinesReady condition.
+const (
+	// MachinesReadyReason documents a ChalkosControlPlane whose Machines are all ready.
+	MachinesReadyReason = "Ready"
+
+	// MachinesNotReadyReason documents a ChalkosControlPlane with Machines that are not ready.
+	MachinesNotReadyReason = "NotReady"
+
+	// NoReplicasReason documents a ChalkosControlPlane without Machines.
+	NoReplicasReason = "NoReplicas"
+)
+
+// More reasons for the Initialized condition.
+const (
+	// BootstrappedMachineGoneReason documents a ChalkosControlPlane whose bootstrapped Machine is
+	// gone before the control plane was initialized; the controller bootstraps a new first Machine.
+	BootstrappedMachineGoneReason = "BootstrappedMachineGone"
+
+	// BootstrapRefusedReason documents a ChalkosControlPlane whose first Machine refused the
+	// bootstrap, as one whose Kubernetes files are not prepared yet. The controller tries again.
+	BootstrapRefusedReason = "BootstrapRefused"
+)

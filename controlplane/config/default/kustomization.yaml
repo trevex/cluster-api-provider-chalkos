@@ -1,3 +1,8 @@
+# The control-plane provider's installation: its CRDs, RBAC and manager in the namespace
+# control-plane-chalkos-system.
+namespace: control-plane-chalkos-system
+namePrefix: control-plane-chalkos-
+
 # Labels every resource of the control-plane provider's installation with the provider label
 # clusterctl uses to find and lifecycle it.
 labels:
@@ -8,4 +13,5 @@ labels:
 resources:
 - ../crd
 - ../rbac
+- ../manager
 #+kubebuilder:scaffold:defaultresource

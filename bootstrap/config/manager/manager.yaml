@@ -31,13 +31,14 @@ spec:
       containers:
       - name: manager
         image: controller:latest
+        imagePullPolicy: IfNotPresent
         args:
         - --leader-elect
-        - --metrics-bind-address=:8080
+        - --metrics-bind-address=:8443
         - --health-probe-bind-address=:8081
         ports:
         - name: metrics
-          containerPort: 8080
+          containerPort: 8443
           protocol: TCP
         - name: healthz
           containerPort: 8081

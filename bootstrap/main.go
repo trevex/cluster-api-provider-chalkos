@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -38,6 +39,10 @@ import (
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
+
+// The metrics endpoint authenticates and authorizes its clients through the API server.
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 
 func main() {
 	var (
@@ -50,7 +55,7 @@ func main() {
 		watchFilter    string
 	)
 	flag.StringVar(&namespace, "namespace", "", "The namespace whose objects the manager reconciles; empty reconciles every namespace.")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to; 0 disables it.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to, over HTTPS for authenticated and authorized clients; 0 disables it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Elect a leader among the manager's replicas, so one reconciles at a time.")
 	flag.IntVar(&concurrency, "concurrency", 10, "How many machines install at once; twice as many ChalkosConfigs are reconciled at once.")
@@ -74,9 +79,13 @@ func main() {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{namespace: {}}
 	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Cache:                  cacheOpts,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Scheme: scheme,
+		Cache:  cacheOpts,
+		Metrics: metricsserver.Options{
+			BindAddress:    metricsAddr,
+			SecureServing:  true,
+			FilterProvider: filters.WithAuthenticationAndAuthorization,
+		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "bootstrap-chalkos",

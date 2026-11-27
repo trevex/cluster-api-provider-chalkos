@@ -24,6 +24,11 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
+// ChalkosControlPlaneFinalizer keeps a ChalkosControlPlane until its Machines are deleted: the
+// Cluster API core controllers do not wait for a control plane's Machines when they delete a
+// Cluster.
+const ChalkosControlPlaneFinalizer = "chalkos.controlplane.cluster.x-k8s.io"
+
 // ChalkosControlPlaneSpec is the chalkos part of a cluster's control plane: the image its
 // Machines install, how many there are, and the documents of the cluster's node pool.
 type ChalkosControlPlaneSpec struct {
