@@ -27,6 +27,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
 	"github.com/trevex/chalkos/pkg/clustersecrets"
 	sdkkubernetes "github.com/trevex/chalkos/pkg/sdk/layers/kubernetes"
@@ -41,6 +43,15 @@ import (
 // that is not being deleted, and removes it from every Machine once the Cluster is being deleted;
 // done is set when the reconcile ends here.
 func (r *ChalkosConfigReconciler) reconcileHook(ctx context.Context, s *scope) (ctrl.Result, bool, error) {
+	if !machineutil.HasHook(s.machine) && s.machine.DeletionTimestamp.IsZero() && s.cluster.DeletionTimestamp.IsZero() {
+		// The cache may not have seen the Machine's deletion yet: the hook must not land on a
+		// Machine being deleted, whose deletion may have passed the hook already.
+		var fresh clusterv1.Machine
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(s.machine), &fresh); err != nil {
+			return ctrl.Result{}, true, client.IgnoreNotFound(err)
+		}
+		s.machine = &fresh
+	}
 	m := s.machine
 	switch {
 	case !s.cluster.DeletionTimestamp.IsZero():
@@ -62,23 +73,29 @@ func (r *ChalkosConfigReconciler) reconcileHook(ctx context.Context, s *scope) (
 	return r.removeWorker(ctx, s)
 }
 
-// removeWorker runs the hook of a worker Machine being deleted: a machine never installed loses
-// it at once; an installed one, once Cluster API waits for the hook, is revoked through the first
-// control plane that answers, then loses it. Revoking earlier would deny the kubelet's writes
-// while its pods are evicted. A step that cannot finish keeps the hook and is tried again after
-// machineutil.HookRetry.
+// removeWorker runs the hook of a worker Machine being deleted: a Machine whose machine was never
+// reached to be installed loses it at once; any other, once Cluster API waits for the hook, is
+// revoked through the first control plane that does it, then loses it. Revoking earlier would
+// deny the kubelet's writes while its pods are evicted. A pass that cannot finish keeps the hook
+// and is tried again after machineutil.HookRetry; it writes the same status each time, so that
+// the ChalkosConfig's watch does not start the next pass at once.
 func (r *ChalkosConfigReconciler) removeWorker(ctx context.Context, s *scope) (ctrl.Result, bool, error) {
 	m := s.machine
+	if ptr.Deref(s.cfg.Status.Installed, false) {
+		// The machine stays installed until its infrastructure goes.
+		s.setReady(metav1.ConditionFalse, bootstrapv1.MachineDeletingReason, "The Machine is being deleted")
+	} else {
+		s.set(metav1.ConditionFalse, bootstrapv1.MachineDeletingReason, "The Machine is being deleted")
+	}
 	switch {
 	case !machineutil.HasHook(m):
 		// Done already, or removed by hand.
 		return ctrl.Result{}, true, nil
-	case !ptr.Deref(s.cfg.Status.Installed, false):
+	case !everReached(&s.cfg.Status):
 		if err := machineutil.RemoveHook(ctx, r.Client, m); err != nil {
 			return ctrl.Result{}, true, err
 		}
-		s.set(metav1.ConditionFalse, bootstrapv1.MachineDeletingReason, "The Machine is being deleted")
-		s.nodeRemoved(metav1.ConditionTrue, bootstrapv1.DoneReason, "The machine was never installed; nothing is revoked")
+		s.nodeRemoved(metav1.ConditionTrue, bootstrapv1.DoneReason, "The machine was never reached to be installed; nothing is revoked")
 		return ctrl.Result{}, true, nil
 	case !machineutil.WaitingForHook(m):
 		// The Machine's watch reconciles again once Cluster API waits for the hook.
@@ -96,51 +113,74 @@ func (r *ChalkosConfigReconciler) removeWorker(ctx context.Context, s *scope) (c
 	if err != nil {
 		return ctrl.Result{}, true, err
 	}
-	s.nodeRemoved(metav1.ConditionFalse, bootstrapv1.RevokingReason, "Revoking the node")
-	if err := s.checkpoint(ctx); err != nil {
+	// The calls to the nodes share one deadline; the writes to the management cluster do not.
+	passCtx, cancel := context.WithTimeout(ctx, machineutil.HookPassTimeout)
+	defer cancel()
+	via, resp, reason, msg := r.revokeWorker(passCtx, s, cps, sec)
+	if via == "" {
+		return r.hookWaits(ctx, s, reason, msg)
+	}
+	if err := machineutil.RemoveHook(ctx, r.Client, m); err != nil {
 		return ctrl.Result{}, true, err
 	}
+	s.nodeRemoved(metav1.ConditionTrue, bootstrapv1.DoneReason,
+		fmt.Sprintf("Revoked through %s; the list of revoked nodes is %d of %d characters long", via, resp.GetListLength(), resp.GetListCapacity()))
+	machineutil.Event(r.Recorder, s.cfg, m, corev1.EventTypeNormal, "NodeRevoked", "RevokeNode", "Revoked the node %s through the control plane %s", m.Name, via)
+	ctrl.LoggerFrom(ctx).Info("Revoked the node and removed the pre-terminate hook", "controlPlane", via)
+	return ctrl.Result{}, true, nil
+}
+
+// everReached tells whether the bootstrap provider ever reached the machine to install it, which
+// may have given it certificates: the status records it installed, an install, or a
+// maintenance-mode fingerprint, which is written before the install starts.
+func everReached(st *bootstrapv1.ChalkosConfigStatus) bool {
+	return ptr.Deref(st.Installed, false) || st.LastInstallTime != nil || len(st.MaintenanceFingerprints) > 0
+}
+
+// revokeWorker revokes the worker's node through the first of the control planes cps that does,
+// and returns that control plane's name and its answer. One that cannot be reached, or is no
+// etcd member, such as one that left etcd, is passed over, and so is one that refuses otherwise;
+// when none revokes the node, it returns the reason and message the hook waits with. A full list
+// is pruned through the control plane that refused it and the revocation tried once more; when
+// the list stays full, no other control plane is asked, as the list is the cluster's. A pass
+// prunes once at most.
+func (r *ChalkosConfigReconciler) revokeWorker(ctx context.Context, s *scope, cps []clusterv1.Machine, sec clustersecrets.Secrets) (string, *kubernetesv1.RevokeNodeResponse, string, string) {
+	worker := s.machine.Name
 	var tried []string
+	refused, pruned := false, ""
 	for i := range cps {
 		cp := &cps[i]
-		cpAddr := machineutil.InternalIP(cp)
-		if cpAddr == "" {
+		addr := machineutil.InternalIP(cp)
+		if addr == "" {
 			continue
 		}
-		resp, err := r.revoke(ctx, cpAddr, sec, cp.Name, m.Name)
-		var pruned string
-		if sdkkubernetes.RevokedListFull(err) {
+		resp, err := r.revoke(ctx, addr, sec, cp.Name, worker)
+		if sdkkubernetes.RevokedListFull(err) && pruned == "" {
 			// A full list may hold entries nothing lets back in any more: drop them and try once
 			// more.
-			pruned = r.prune(ctx, s, cpAddr, sec, cp.Name)
-			resp, err = r.revoke(ctx, cpAddr, sec, cp.Name, m.Name)
+			pruned = r.prune(ctx, s, addr, sec, cp.Name)
+			resp, err = r.revoke(ctx, addr, sec, cp.Name, worker)
 		}
 		switch {
 		case err == nil:
-			if err := machineutil.RemoveHook(ctx, r.Client, m); err != nil {
-				return ctrl.Result{}, true, err
-			}
-			s.nodeRemoved(metav1.ConditionTrue, bootstrapv1.DoneReason,
-				fmt.Sprintf("Revoked through %s; the list of revoked nodes is %d of %d characters long", cp.Name, resp.GetListLength(), resp.GetListCapacity()))
-			machineutil.Event(r.Recorder, s.cfg, m, corev1.EventTypeNormal, "NodeRevoked", "RevokeNode", "Revoked the node %s through the control plane %s", m.Name, cp.Name)
-			ctrl.LoggerFrom(ctx).Info("Revoked the node and removed the pre-terminate hook", "controlPlane", cp.Name)
-			return ctrl.Result{}, true, nil
+			return cp.Name, resp, "", ""
 		case sdkkubernetes.RevokedListFull(err):
-			return r.hookWaits(ctx, s, bootstrapv1.RevokedListFullReason, fmt.Sprintf(
+			return "", nil, bootstrapv1.RevokedListFullReason, fmt.Sprintf(
 				"%v; %s; the Machine waits until there is room: rotate the cluster's CAs with chalkctl rotate os-ca and chalkctl rotate kubernetes-ca, "+
 					"after which PruneRevoked drops the nodes revoked before them, or remove the annotation %s to delete the Machine without revoking its node",
-				err, pruned, machineutil.HookAnnotation))
-		case node.TryNextControlPlane(err):
-			tried = append(tried, fmt.Sprintf("%s: %v", cp.Name, err))
-		default:
-			return r.hookWaits(ctx, s, bootstrapv1.RevokingReason, fmt.Sprintf("Revoking the node through %s: %v", cp.Name, err))
+				err, pruned, machineutil.HookAnnotation)
+		case !node.TryNextControlPlane(err):
+			refused = true
 		}
+		tried = append(tried, fmt.Sprintf("%s: %v", cp.Name, err))
 	}
-	msg := "No control-plane Machine has an address to revoke the node through"
-	if len(tried) > 0 {
-		msg = "No control plane revoked the node: " + strings.Join(tried, "; ")
+	switch {
+	case len(tried) == 0:
+		return "", nil, bootstrapv1.WaitingForControlPlaneReason, "No control-plane Machine has an address to revoke the node through"
+	case refused:
+		return "", nil, bootstrapv1.RevokingReason, "No control plane revoked the node: " + strings.Join(tried, "; ")
 	}
-	return r.hookWaits(ctx, s, bootstrapv1.WaitingForControlPlaneReason, msg)
+	return "", nil, bootstrapv1.WaitingForControlPlaneReason, "No control plane revoked the node: " + strings.Join(tried, "; ")
 }
 
 // revoke revokes the node worker through the control plane name at addr, within
@@ -168,8 +208,8 @@ func (r *ChalkosConfigReconciler) prune(ctx context.Context, s *scope, addr stri
 	return fmt.Sprintf("pruning the list through %s dropped %d nodes, which made too little room", name, len(resp.GetPruned()))
 }
 
-// hookWaits reports a hook step that could not finish: the hook stays, a Warning event is
-// recorded, and the step is tried again after machineutil.HookRetry.
+// hookWaits reports a hook pass that could not finish: the hook stays, a Warning event is
+// recorded, and the pass is tried again after machineutil.HookRetry.
 func (r *ChalkosConfigReconciler) hookWaits(ctx context.Context, s *scope, reason, message string) (ctrl.Result, bool, error) {
 	s.nodeRemoved(metav1.ConditionFalse, reason, message)
 	machineutil.Event(r.Recorder, s.cfg, s.machine, corev1.EventTypeWarning, reason, "RevokeNode", "%s", machineutil.Truncate(message))

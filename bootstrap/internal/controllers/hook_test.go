@@ -22,7 +22,9 @@ import (
 	"strings"
 	"testing"
 
+	"connectrpc.com/connect/v2"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -38,6 +40,7 @@ import (
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
+	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
 )
 
 // holdFinalizer keeps a deleted object until the test releases it.
@@ -234,6 +237,7 @@ func TestWorkerRevokedAtThePreTerminateHook(t *testing.T) {
 	if ev := nextEvent(rec); !strings.Contains(ev, "NodeRevoked") {
 		t.Errorf("event %q", ev)
 	}
+	wantReason(t, e.config("w-1"), metav1.ConditionFalse, bootstrapv1.MachineDeletingReason)
 }
 
 // A control plane that does not answer is passed over; with none left the hook stays, the step
@@ -267,7 +271,9 @@ func TestWorkerRevocationWaitsForAControlPlane(t *testing.T) {
 func TestWorkerRevocationOfAFullList(t *testing.T) {
 	e, _ := revokableWorker(t)
 	e.fake.Update(cpAddr, func(n *nodetest.Node) {
-		n.RevokeNode = func(node string, _ bool) (*kubernetesv1.RevokeNodeResponse, error) { return nil, nodetest.RevokedListFull(node) }
+		n.RevokeNode = func(node string, _ bool) (*kubernetesv1.RevokeNodeResponse, error) {
+			return nil, nodetest.RevokedListFull(node)
+		}
 	})
 	e.atHook("w-1")
 	if res := e.mustReconcile("w-1"); res.RequeueAfter != machineutil.HookRetry {
@@ -336,5 +342,146 @@ func nextEvent(rec *events.FakeRecorder) string {
 		return ev
 	default:
 		return ""
+	}
+}
+
+// A waiting pass writes the same status as the one before, so the ChalkosConfig's watch does not
+// start the next pass at once: the second pass writes neither the ChalkosConfig nor the Machine.
+func TestWaitingWorkerHookWritesNothingAgain(t *testing.T) {
+	e, _ := revokableWorker(t)
+	e.fake.Update(cpAddr, func(n *nodetest.Node) { n.Err = nodetest.Unreachable(cpAddr) })
+	e.atHook("w-1")
+	e.mustReconcile("w-1")
+	cfgVersion, mVersion := e.config("w-1").ResourceVersion, e.machineObj("w-1").ResourceVersion
+	if res := e.mustReconcile("w-1"); res.RequeueAfter != machineutil.HookRetry {
+		t.Errorf("reconcile = %+v", res)
+	}
+	if e.config("w-1").ResourceVersion != cfgVersion || e.machineObj("w-1").ResourceVersion != mVersion {
+		t.Error("a waiting hook wrote the ChalkosConfig or the Machine again")
+	}
+}
+
+// A worker whose machine the provider tried to install may hold certificates: it is revoked,
+// also when it never answered as its node, as after an accepted install or a crash during one.
+func TestWorkerOnceReachedIsRevoked(t *testing.T) {
+	for name, reached := range map[string]func(*bootstrapv1.ChalkosConfigStatus){
+		"installed and rebooting": func(st *bootstrapv1.ChalkosConfigStatus) { st.LastInstallTime = ptr.To(metav1.Now()) },
+		"install started": func(st *bootstrapv1.ChalkosConfigStatus) {
+			st.MaintenanceFingerprints = []bootstrapv1.Fingerprint{{SHA256: strings.Repeat("ab", 32), SeenAt: metav1.Now()}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e, _ := revokableWorker(t)
+			c := e.config("w-1")
+			c.Status.Installed = nil
+			reached(&c.Status)
+			if err := testClient.Status().Update(e.ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			e.fake.Update(addr, func(n *nodetest.Node) { n.Err = nodetest.Unreachable(addr) })
+			e.deleteMachineHeld("w-1")
+			e.mustReconcile("w-1")
+			if !machineutil.HasHook(e.machineObj("w-1")) {
+				t.Fatal("the hook went before Cluster API waits for it")
+			}
+			e.setDeleting("w-1", clusterv1.MachineDeletingWaitingForPreTerminateHookReason)
+			e.mustReconcile("w-1")
+			if n, _ := e.fake.Node(cpAddr); !slices.Equal(n.Revoked, []string{"w-1"}) || machineutil.HasHook(e.machineObj("w-1")) {
+				t.Errorf("revoked %v; hook kept %v", n.Revoked, machineutil.HasHook(e.machineObj("w-1")))
+			}
+		})
+	}
+}
+
+// A control plane that refuses the revocation for another reason is passed over too, and the next
+// one revokes the node; when none does, the hook waits with the reason Revoking.
+func TestWorkerRevocationTriesEveryControlPlane(t *testing.T) {
+	e, _ := revokableWorker(t)
+	refuse := func(string, bool) (*kubernetesv1.RevokeNodeResponse, error) {
+		return nil, connect.NewError(connect.CodeInternal, "the revoked list cannot be written")
+	}
+	e.fake.Update(cpAddr, func(n *nodetest.Node) { n.RevokeNode = refuse })
+	e.machine("cp-2", true, "10.0.0.11")
+	e.fake.Set("10.0.0.11", nodetest.Node{Name: "cp-2", RevokeNode: refuse})
+	e.atHook("w-1")
+	if res := e.mustReconcile("w-1"); res.RequeueAfter != machineutil.HookRetry {
+		t.Errorf("reconcile = %+v", res)
+	}
+	c := conditions.Get(e.config("w-1"), bootstrapv1.NodeRemovedCondition)
+	if c == nil || c.Reason != bootstrapv1.RevokingReason || !strings.Contains(c.Message, "cp-1") || !strings.Contains(c.Message, "cp-2") {
+		t.Fatalf("NodeRemoved = %+v", c)
+	}
+	e.fake.Update("10.0.0.11", func(n *nodetest.Node) { n.RevokeNode = nil })
+	e.mustReconcile("w-1")
+	if n, _ := e.fake.Node("10.0.0.11"); !slices.Equal(n.Revoked, []string{"w-1"}) || machineutil.HasHook(e.machineObj("w-1")) {
+		t.Errorf("revoked through cp-2: %v", n.Revoked)
+	}
+}
+
+// A control plane being deleted that left etcd, and one that is not installed, are passed over
+// as unreachable ones are: the hook waits for a control plane, and the next one revokes the node.
+func TestWorkerRevocationPassesOverControlPlanesThatCannotRevoke(t *testing.T) {
+	e, _ := revokableWorker(t)
+	e.fake.Update(cpAddr, func(n *nodetest.Node) { n.Name = "" })
+	e.machine("cp-2", true, "10.0.0.11")
+	e.fake.Set("10.0.0.11", nodetest.Node{Name: "cp-2", RevokeNode: func(string, bool) (*kubernetesv1.RevokeNodeResponse, error) {
+		return nil, nodetest.NotEtcdMember()
+	}})
+	e.deleteMachineHeld("cp-2")
+	e.atHook("w-1")
+	e.mustReconcile("w-1")
+	c := conditions.Get(e.config("w-1"), bootstrapv1.NodeRemovedCondition)
+	if c == nil || c.Reason != bootstrapv1.WaitingForControlPlaneReason || !strings.Contains(c.Message, "cp-1") || !strings.Contains(c.Message, "cp-2") {
+		t.Fatalf("NodeRemoved = %+v", c)
+	}
+	e.machine("cp-3", true, "10.0.0.12")
+	e.fake.Set("10.0.0.12", nodetest.Node{Name: "cp-3"})
+	e.mustReconcile("w-1")
+	if n, _ := e.fake.Node("10.0.0.12"); !slices.Equal(n.Revoked, []string{"w-1"}) || machineutil.HasHook(e.machineObj("w-1")) {
+		t.Errorf("revoked through cp-3: %v", n.Revoked)
+	}
+}
+
+// Without the Cluster's secrets no control plane can be reached: the hook waits and says so.
+func TestWorkerRevocationWithoutTheClusterSecrets(t *testing.T) {
+	e, _ := revokableWorker(t)
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: secrets.Name(clusterName)}}
+	if err := testClient.Delete(e.ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	e.atHook("w-1")
+	if res := e.mustReconcile("w-1"); res.RequeueAfter != machineutil.HookRetry || !machineutil.HasHook(e.machineObj("w-1")) {
+		t.Fatalf("reconcile = %+v", res)
+	}
+	c := conditions.Get(e.config("w-1"), bootstrapv1.NodeRemovedCondition)
+	if c == nil || c.Reason != bootstrapv1.WaitingForControlPlaneReason || !strings.Contains(c.Message, secrets.Name(clusterName)) {
+		t.Errorf("NodeRemoved = %+v", c)
+	}
+	if n, _ := e.fake.Node(cpAddr); len(n.Revoked) != 0 {
+		t.Errorf("revoked %v", n.Revoked)
+	}
+}
+
+// staleMachines is a client whose Machines' deletions are not seen yet, as a cache's may not be.
+type staleMachines struct{ client.Client }
+
+func (c staleMachines) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	if m, ok := obj.(*clusterv1.Machine); ok {
+		m.DeletionTimestamp = nil
+	}
+	return err
+}
+
+// The hook is added only to a Machine the API server does not delete, also when the cache has
+// not seen the deletion yet.
+func TestNoHookOnADeletingWorker(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, "")
+	e.deleteMachineHeld("w-1")
+	e.r.Client = staleMachines{testClient}
+	e.mustReconcile("w-1")
+	if machineutil.HasHook(e.machineObj("w-1")) {
+		t.Error("a Machine being deleted got the hook")
 	}
 }
