@@ -105,8 +105,9 @@ const (
 type ChalkosConfigReconciler struct {
 	// Client reads and writes the management cluster's objects, from the manager's cache.
 	Client client.Client
-	// APIReader reads uncached: the cluster's secrets, the data and image pull Secrets, which the
-	// controller does not watch.
+	// APIReader reads uncached: the ChalkosConfig, whose status the last reconcile may have
+	// written after the cache's copy, and the cluster's secrets, the data and image pull Secrets,
+	// which the controller does not watch.
 	APIReader client.Reader
 	// Node reaches the machines and reads their images.
 	Node node.Client
@@ -153,8 +154,9 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 
 // Reconcile moves the ChalkosConfig's Machine one step towards installed.
 func (r *ChalkosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
+	// A cached copy may lack the last install's time and so install the machine again.
 	cfg := &bootstrapv1.ChalkosConfig{}
-	if err := r.Client.Get(ctx, req.NamespacedName, cfg); err != nil {
+	if err := r.APIReader.Get(ctx, req.NamespacedName, cfg); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	machine, err := util.GetOwnerMachine(ctx, r.Client, cfg.ObjectMeta)

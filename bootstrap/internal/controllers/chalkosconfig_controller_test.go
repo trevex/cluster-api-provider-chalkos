@@ -370,6 +370,39 @@ func TestInstallsAControlPlane(t *testing.T) {
 	wantReason(t, e.config("cp-1"), metav1.ConditionFalse, bootstrapv1.InstallingReason)
 }
 
+// staleClient returns the ChalkosConfig as it was before, as a cache that has not seen the last
+// reconcile's writes does.
+type staleClient struct {
+	client.Client
+	cfg *bootstrapv1.ChalkosConfig
+}
+
+func (c staleClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if cfg, ok := obj.(*bootstrapv1.ChalkosConfig); ok {
+		c.cfg.DeepCopyInto(cfg)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// A machine rebooting into its install is not installed again by a reconcile whose cache still
+// holds the ChalkosConfig from before the install.
+func TestStaleCacheDoesNotInstallAgain(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, addr)
+	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint})
+	e.mustReconcile("w-1")
+	e.wantInstalls(addr, 1)
+	stale := e.config("w-1")
+	stale.Status.LastInstallTime = nil
+	e.r.Client = staleClient{Client: testClient, cfg: stale}
+	_, err := e.reconcile("w-1")
+	e.wantInstalls(addr, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A machine that presents another certificate in maintenance mode is pinned to it again, and the
 // new fingerprint is recorded besides the old one.
 func TestRepinsAndRecordsNewFingerprint(t *testing.T) {
