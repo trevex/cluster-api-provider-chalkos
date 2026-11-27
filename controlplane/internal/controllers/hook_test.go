@@ -35,7 +35,6 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
-	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -364,17 +363,15 @@ func TestControlPlaneLeaveUnavailableIsTriedAgain(t *testing.T) {
 	}
 }
 
-// An unreachable node's member is removed through a peer, the next one when one refuses, and
-// the node is revoked through it too.
+// An unreachable node's member is removed through a peer, the next one when one is no etcd
+// member, and the node is revoked through the next one when one fails.
 func TestUnreachableControlPlaneIsRemovedThroughAPeer(t *testing.T) {
 	e := newEnv(t, 3, true)
 	ms, addrs := e.controlPlanes(3)
 	gone := ms[0].Name
 	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.Err = nodetest.Unreachable(addrs[gone]) })
 	e.fake.Update(addrs[ms[1].Name], func(n *nodetest.Node) {
-		n.EtcdRemoveMember = func(string) error {
-			return nodetest.Reasoned(connect.CodeFailedPrecondition, nodev1.ErrorReason_ERROR_REASON_UNSPECIFIED, "etcdserver: unhealthy cluster")
-		}
+		n.EtcdRemoveMember = func(string) error { return nodetest.NotEtcdMember() }
 		n.RevokeNode = func(string, bool) (*kubernetesv1.RevokeNodeResponse, error) {
 			return nil, connect.NewError(connect.CodeInternal, "the API server refused the policy").WithRemote()
 		}
@@ -389,8 +386,32 @@ func TestUnreachableControlPlaneIsRemovedThroughAPeer(t *testing.T) {
 	}
 }
 
+// A peer's refusal to remove an unreachable node's member, as for etcd's quorum, is the cluster's:
+// no other peer is asked, and the hook waits.
+func TestRemovalRefusedByAPeerAsksNoOther(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[0].Name
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.Err = nodetest.Unreachable(addrs[gone]) })
+	e.fake.Update(addrs[ms[1].Name], func(n *nodetest.Node) {
+		n.EtcdRemoveMember = func(member string) error { return nodetest.QuorumRefused(member) }
+	})
+	e.atHook(gone)
+	if res := e.mustReconcile(); res.RequeueAfter != machineutil.HookRetry {
+		t.Errorf("reconcile = %+v", res)
+	}
+	if n, _ := e.fake.Node(addrs[ms[2].Name]); len(n.Removed) != 0 || len(n.Revoked) != 0 {
+		t.Errorf("through %s: removed %v, revoked %v", ms[2].Name, n.Removed, n.Revoked)
+	}
+	if !e.hooked(gone) {
+		t.Error("the hook is gone")
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "quorum")
+}
+
 // A member etcd does not list counts as removed, unless etcd lists a learner without a name at
-// the node's peer URL: one that never started, which is removed by its ID.
+// the node's peer URL: one that never started, which is removed by its ID. The peer URL may be at
+// any of the Machine's InternalIPs.
 func TestUnstartedLearnerIsRemovedByID(t *testing.T) {
 	e := newEnv(t, 3, true)
 	ms, addrs := e.controlPlanes(3)
@@ -403,7 +424,15 @@ func TestUnstartedLearnerIsRemovedByID(t *testing.T) {
 	for _, m := range ms[:2] {
 		e.fake.Update(addrs[m.Name], func(n *nodetest.Node) { n.Members = members })
 	}
-	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.Err = nodetest.Unreachable(addrs[gone]) })
+	// The Machine's first InternalIP reaches nothing; etcd pinned the node's second.
+	m := e.machine(gone)
+	m.Status.Addresses = clusterv1.MachineAddresses{
+		{Type: clusterv1.MachineInternalIP, Address: "10.0.1.99"},
+		{Type: clusterv1.MachineInternalIP, Address: addrs[gone]},
+	}
+	if err := testClient.Status().Update(t.Context(), m); err != nil {
+		t.Fatal(err)
+	}
 	e.atHook(gone)
 	e.mustReconcile()
 	if n, _ := e.fake.Node(addrs[ms[0].Name]); !slices.Equal(n.Removed, []string{"beef"}) || len(n.Members) != 2 {
@@ -428,6 +457,7 @@ func TestControlPlaneRevocationOfAFullList(t *testing.T) {
 	}
 	gone := ms[2].Name
 	prunes := e.prunes(addrs[ms[0].Name])
+	e.clock.Step(fullListPruneInterval)
 	e.atHook(gone)
 	e.mustReconcile()
 	if !e.hooked(gone) {
@@ -439,6 +469,27 @@ func TestControlPlaneRevocationOfAFullList(t *testing.T) {
 	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.RevokedListFullReason, "chalkctl rotate os-ca")
 	if ev := nextEvent(rec); !strings.Contains(ev, "Warning") {
 		t.Errorf("event %q, want a warning", ev)
+	}
+
+	// The passes that follow soon after prune no more and write nothing, so the status write of
+	// the first does not reconcile again and again.
+	cpVersion, mVersion := e.cp().ResourceVersion, e.machine(gone).ResourceVersion
+	for range 2 {
+		e.clock.Step(machineutil.HookRetry)
+		if res := e.mustReconcile(); res.RequeueAfter != machineutil.HookRetry {
+			t.Errorf("reconcile = %+v", res)
+		}
+	}
+	if got := e.prunes(addrs[ms[0].Name]); got != prunes+1 {
+		t.Errorf("%d prunes within %s, want %d", got, fullListPruneInterval, prunes+1)
+	}
+	if e.cp().ResourceVersion != cpVersion || e.machine(gone).ResourceVersion != mVersion {
+		t.Error("a waiting pass wrote the ChalkosControlPlane or the Machine")
+	}
+	e.clock.Step(fullListPruneInterval)
+	e.mustReconcile()
+	if got := e.prunes(addrs[ms[0].Name]); got != prunes+2 {
+		t.Errorf("%d prunes after %s, want %d", got, fullListPruneInterval, prunes+2)
 	}
 }
 
@@ -460,6 +511,7 @@ func TestControlPlaneRevokedAfterAPrune(t *testing.T) {
 		}
 	})
 	gone := ms[2].Name
+	e.clock.Step(fullListPruneInterval)
 	e.atHook(gone)
 	e.mustReconcile()
 	if n, _ := e.fake.Node(addrs[ms[0].Name]); !slices.Equal(n.Revoked, []string{gone}) {

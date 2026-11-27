@@ -17,6 +17,7 @@ limitations under the License.
 package machineutil
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,5 +48,17 @@ func TestInternalIP(t *testing.T) {
 	}
 	if got := InternalIP(&clusterv1.Machine{}); got != "" {
 		t.Errorf("InternalIP of a Machine without addresses = %q, want empty", got)
+	}
+}
+
+// InternalIPs are every InternalIP of the Machine, in order.
+func TestInternalIPs(t *testing.T) {
+	m := &clusterv1.Machine{Status: clusterv1.MachineStatus{Addresses: clusterv1.MachineAddresses{
+		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.1"},
+		{Type: clusterv1.MachineExternalIP, Address: "192.0.2.1"},
+		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.2"},
+	}}}
+	if got := InternalIPs(m); !slices.Equal(got, []string{"10.0.0.1", "10.0.0.2"}) {
+		t.Errorf("InternalIPs = %q", got)
 	}
 }

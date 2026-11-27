@@ -57,3 +57,14 @@ func InternalIP(m *clusterv1.Machine) string {
 	}
 	return ""
 }
+
+// InternalIPs are all the Machine's InternalIPs, in order.
+func InternalIPs(m *clusterv1.Machine) []string {
+	var ips []string
+	for _, a := range m.Status.Addresses {
+		if a.Type == clusterv1.MachineInternalIP {
+			ips = append(ips, a.Address)
+		}
+	}
+	return ips
+}
