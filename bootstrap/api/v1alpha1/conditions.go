@@ -35,6 +35,10 @@ const (
 	// infrastructure to be ready before it can install.
 	WaitingForInfrastructureReason = "WaitingForInfrastructure"
 
+	// MachineDeletingReason documents a ChalkosConfig whose Machine is being deleted before its
+	// machine was installed: the controller does not install it.
+	MachineDeletingReason = "MachineDeleting"
+
 	// WaitingForControlPlaneReason documents a worker's ChalkosConfig waiting for the cluster's
 	// control plane to be initialized.
 	WaitingForControlPlaneReason = "WaitingForControlPlane"

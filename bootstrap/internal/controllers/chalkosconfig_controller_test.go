@@ -36,6 +36,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -794,5 +796,65 @@ func eventually(t *testing.T, what string, done func() bool) {
 	})
 	if err != nil {
 		t.Fatalf("waiting for %s: %v", what, err)
+	}
+}
+
+// A Machine that is deleted before its machine was installed is not installed.
+func TestDeletingMachineNotInstalled(t *testing.T) {
+	e := newEnv(t, false, kubernetestest.Image)
+	e.machine("cp-1", true, addr)
+	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint})
+	var m clusterv1.Machine
+	if err := testClient.Get(e.ctx, client.ObjectKey{Namespace: e.ns, Name: "cp-1"}, &m); err != nil {
+		t.Fatal(err)
+	}
+	const hold = "test.chalkos.dev/hold"
+	controllerutil.AddFinalizer(&m, hold)
+	if err := testClient.Update(e.ctx, &m); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var m clusterv1.Machine
+		if err := testClient.Get(context.Background(), client.ObjectKey{Namespace: e.ns, Name: "cp-1"}, &m); err == nil {
+			controllerutil.RemoveFinalizer(&m, hold)
+			_ = testClient.Update(context.Background(), &m)
+		}
+	})
+	if err := testClient.Delete(e.ctx, &m); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile("cp-1")
+	e.wantInstalls(addr, 0)
+	wantReason(t, e.config("cp-1"), metav1.ConditionFalse, bootstrapv1.MachineDeletingReason)
+}
+
+// The Machine watch passes the changes a reconcile reads and drops the others, such as the
+// Machine's conditions.
+func TestMachineChanged(t *testing.T) {
+	base := &clusterv1.Machine{Spec: clusterv1.MachineSpec{Version: "v1.37.1"}}
+	now := metav1.Now()
+	cases := map[string]struct {
+		edit func(*clusterv1.Machine)
+		want bool
+	}{
+		"conditions": {func(m *clusterv1.Machine) {
+			m.Status.Conditions = []metav1.Condition{{Type: clusterv1.ReadyCondition, Status: metav1.ConditionTrue}}
+		}, false},
+		"providerID": {func(m *clusterv1.Machine) { m.Spec.ProviderID = "kubevirt://m" }, true},
+		"addresses": {func(m *clusterv1.Machine) {
+			m.Status.Addresses = clusterv1.MachineAddresses{{Type: clusterv1.MachineInternalIP, Address: addr}}
+		}, true},
+		"version":        {func(m *clusterv1.Machine) { m.Spec.Version = "v1.37.2" }, true},
+		"labels":         {func(m *clusterv1.Machine) { m.Labels = map[string]string{clusterv1.MachineControlPlaneLabel: ""} }, true},
+		"dataSecretName": {func(m *clusterv1.Machine) { m.Spec.Bootstrap.DataSecretName = ptr.To("m") }, true},
+		"infrastructure": {func(m *clusterv1.Machine) { m.Status.Initialization.InfrastructureProvisioned = ptr.To(true) }, true},
+		"deletion":       {func(m *clusterv1.Machine) { m.DeletionTimestamp = &now }, true},
+	}
+	for name, c := range cases {
+		cur := base.DeepCopy()
+		c.edit(cur)
+		if got := machineChanged().Update(event.UpdateEvent{ObjectOld: base, ObjectNew: cur}); got != c.want {
+			t.Errorf("%s: the update passes %v, want %v", name, got, c.want)
+		}
 	}
 }

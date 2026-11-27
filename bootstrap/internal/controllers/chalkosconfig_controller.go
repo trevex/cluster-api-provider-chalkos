@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -136,7 +138,8 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		For(&bootstrapv1.ChalkosConfig{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 2 * r.maxInstalls()}).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), log, r.WatchFilterValue)).
-		Watches(&clusterv1.Machine{}, handler.EnqueueRequestsFromMapFunc(machineToConfig)).
+		Watches(&clusterv1.Machine{}, handler.EnqueueRequestsFromMapFunc(machineToConfig),
+			builder.WithPredicates(machineChanged())).
 		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(r.clusterToConfigs),
 			builder.WithPredicates(predicates.Any(mgr.GetScheme(), log,
 				predicates.ClusterPausedTransitions(mgr.GetScheme(), log),
@@ -243,6 +246,10 @@ func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl
 		return ctrl.Result{}, err
 	}
 	installed := ptr.Deref(s.cfg.Status.Installed, false)
+	if !installed && !s.machine.DeletionTimestamp.IsZero() {
+		s.set(metav1.ConditionFalse, bootstrapv1.MachineDeletingReason, "The Machine is being deleted")
+		return ctrl.Result{}, nil
+	}
 	if !installed && s.bootImageRefused() {
 		return ctrl.Result{}, nil
 	}
@@ -685,4 +692,27 @@ func (c *imageCache) add(key string, a *ociimage.Artifact) {
 		}
 	}
 	c.artifacts[key] = a
+}
+
+// machineChanged passes the creation and deletion of a Machine, and the updates that change what
+// a reconcile reads of it: its providerID, addresses, version, labels, bootstrap data Secret,
+// infrastructure's readiness and deletion. The periodic verify of an installed machine covers
+// any other change.
+func machineChanged() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok := e.ObjectOld.(*clusterv1.Machine)
+			cur, ok2 := e.ObjectNew.(*clusterv1.Machine)
+			if !ok || !ok2 {
+				return false
+			}
+			return old.Spec.ProviderID != cur.Spec.ProviderID ||
+				!slices.Equal(old.Status.Addresses, cur.Status.Addresses) ||
+				old.Spec.Version != cur.Spec.Version ||
+				!maps.Equal(old.Labels, cur.Labels) ||
+				!ptr.Equal(old.Spec.Bootstrap.DataSecretName, cur.Spec.Bootstrap.DataSecretName) ||
+				!ptr.Equal(old.Status.Initialization.InfrastructureProvisioned, cur.Status.Initialization.InfrastructureProvisioned) ||
+				!old.DeletionTimestamp.Equal(cur.DeletionTimestamp)
+		},
+	}
 }
