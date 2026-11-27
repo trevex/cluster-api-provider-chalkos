@@ -1,0 +1,9 @@
+# The build context needs the Go sources only: local state, build output and the repository's
+# history stay out of it.
+.git
+.lab
+out
+bin
+result
+result-*
+.direnv
