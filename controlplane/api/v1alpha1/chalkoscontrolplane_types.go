@@ -22,6 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
+	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 )
 
 // ChalkosControlPlaneFinalizer keeps a ChalkosControlPlane until its Machines are deleted: the
@@ -51,8 +53,7 @@ type ChalkosControlPlaneSpec struct {
 
 	// Image is the chalkos image the control planes install, by digest: repository@sha256:….
 	// +required
-	// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
-	Image string `json:"image"`
+	Image bootstrapv1.ImageReference `json:"image"`
 
 	// ImagePullSecretRef names a Secret of type kubernetes.io/dockerconfigjson in the
 	// ChalkosControlPlane's namespace whose credentials the controller reads the image with. The
@@ -73,6 +74,7 @@ type ChalkosControlPlaneSpec struct {
 	// Cluster's clusterNetwork gives ranges.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:MaxItems=256
 	Files []runtime.RawExtension `json:"files,omitempty"`
 
 	// Kubeconfig says how the cluster's kubeconfig Secret's certificate is issued.

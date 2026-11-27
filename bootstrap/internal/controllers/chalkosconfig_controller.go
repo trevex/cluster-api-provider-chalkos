@@ -322,7 +322,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		return ctrl.Result{}, cpErr
 	}
 	m := machineOf(s.machine, s.cluster)
-	in, err := inputsDigest(m, s.cluster.Spec.ControlPlaneRef, clusterFiles, s.cfg.Spec.Files, s.cfg.Spec.Image, sec.OSCA.Certificate)
+	in, err := inputsDigest(m, s.cluster.Spec.ControlPlaneRef, clusterFiles, s.cfg.Spec.Files, string(s.cfg.Spec.Image), sec.OSCA.Certificate)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -394,7 +394,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		Node:      s.machine.Name,
 		Documents: docs,
 		Secrets:   sec,
-		Image:     s.cfg.Spec.Image,
+		Image:     string(s.cfg.Spec.Image),
 		Keychain:  kc,
 	})
 	switch {
@@ -493,7 +493,7 @@ func (r *ChalkosConfigReconciler) keychain(ctx context.Context, cfg *bootstrapv1
 // image reads the ChalkosConfig's image with kc, or answers it from the images read before with
 // the same pull Secret. An image is named by digest, so what was read once stays true.
 func (r *ChalkosConfigReconciler) image(ctx context.Context, cfg *bootstrapv1.ChalkosConfig, kc authn.Keychain) (*ociimage.Artifact, error) {
-	key := cfg.Spec.Image
+	key := string(cfg.Spec.Image)
 	if ref := cfg.Spec.ImagePullSecretRef; ref != nil {
 		key += " " + cfg.Namespace + "/" + ref.Name
 	}
@@ -502,7 +502,7 @@ func (r *ChalkosConfigReconciler) image(ctx context.Context, cfg *bootstrapv1.Ch
 	}
 	ctx, cancel := context.WithTimeout(ctx, imageTimeout)
 	defer cancel()
-	a, err := r.Node.Image(ctx, cfg.Spec.Image, kc)
+	a, err := r.Node.Image(ctx, string(cfg.Spec.Image), kc)
 	if err != nil {
 		return nil, err
 	}

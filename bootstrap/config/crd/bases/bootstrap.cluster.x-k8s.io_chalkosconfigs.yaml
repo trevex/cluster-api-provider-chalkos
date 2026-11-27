@@ -65,6 +65,7 @@ spec:
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
+                maxItems: 256
                 type: array
                 x-kubernetes-preserve-unknown-fields: true
               image:

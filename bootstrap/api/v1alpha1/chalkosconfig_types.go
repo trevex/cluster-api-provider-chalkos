@@ -27,8 +27,7 @@ import (
 type ChalkosConfigSpec struct {
 	// Image is the chalkos image the machine installs, by digest: repository@sha256:….
 	// +required
-	// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
-	Image string `json:"image"`
+	Image ImageReference `json:"image"`
 
 	// ImagePullSecretRef names a Secret of type kubernetes.io/dockerconfigjson in the
 	// ChalkosConfig's namespace whose credentials the controller reads the image with. The node
@@ -42,6 +41,7 @@ type ChalkosConfigSpec struct {
 	// ipFamilies, podCIDRs and serviceCIDRs when the Cluster's clusterNetwork gives ranges.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:MaxItems=256
 	Files []runtime.RawExtension `json:"files,omitempty"`
 }
 
@@ -170,3 +170,8 @@ type ChalkosConfigList struct {
 func init() {
 	objectTypes = append(objectTypes, &ChalkosConfig{}, &ChalkosConfigList{})
 }
+
+// ImageReference names a chalkos image by digest: repository@sha256:…. Both providers' APIs
+// name their images with it.
+// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
+type ImageReference string

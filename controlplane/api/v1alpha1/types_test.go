@@ -34,6 +34,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
+
+	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
@@ -89,8 +91,8 @@ func TestMain(m *testing.M) {
 
 // digestImage returns a well-formed repository@sha256:… reference, filled with the given byte
 // so different tests don't collide on a shared image.
-func digestImage(fill byte) string {
-	return fmt.Sprintf("example.com/chalkos@sha256:%s", strings.Repeat(string(fill), 64))
+func digestImage(fill byte) bootstrapv1.ImageReference {
+	return bootstrapv1.ImageReference("example.com/chalkos@sha256:" + strings.Repeat(string(fill), 64))
 }
 
 // validMachineTemplate returns a ChalkosControlPlaneMachineTemplate referencing a plausible
@@ -156,7 +158,7 @@ func TestChalkosControlPlane_ImagePattern(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		image   string
+		image   bootstrapv1.ImageReference
 		wantErr bool
 	}{
 		{name: "by digest", image: digestImage('b'), wantErr: false},
@@ -221,7 +223,7 @@ func TestChalkosControlPlane_FilesMustBeAList(t *testing.T) {
 		"metadata": map[string]any{"generateName": "files-notlist-", "namespace": "default"},
 		"spec": map[string]any{
 			"version": "v1.33.0",
-			"image":   digestImage('e'),
+			"image":   string(digestImage('e')),
 			"machineTemplate": map[string]any{
 				"spec": map[string]any{
 					"infrastructureRef": map[string]any{

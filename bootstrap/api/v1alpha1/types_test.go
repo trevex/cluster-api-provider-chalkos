@@ -89,8 +89,8 @@ func TestMain(m *testing.M) {
 
 // digestImage returns a well-formed repository@sha256:… reference, filled with the given byte
 // so different tests don't collide on a shared image.
-func digestImage(fill byte) string {
-	return fmt.Sprintf("example.com/chalkos@sha256:%s", strings.Repeat(string(fill), 64))
+func digestImage(fill byte) ImageReference {
+	return ImageReference("example.com/chalkos@sha256:" + strings.Repeat(string(fill), 64))
 }
 
 func TestChalkosConfig_ImagePattern(t *testing.T) {
@@ -98,7 +98,7 @@ func TestChalkosConfig_ImagePattern(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		image   string
+		image   ImageReference
 		wantErr bool
 	}{
 		{name: "by digest", image: digestImage('a'), wantErr: false},
@@ -158,7 +158,7 @@ func TestChalkosConfig_FilesMustBeAList(t *testing.T) {
 	cfg := &unstructured.Unstructured{Object: map[string]any{
 		"metadata": map[string]any{"generateName": "files-notlist-", "namespace": "default"},
 		"spec": map[string]any{
-			"image": digestImage('c'),
+			"image": string(digestImage('c')),
 			"files": "not-a-list",
 		},
 	}}

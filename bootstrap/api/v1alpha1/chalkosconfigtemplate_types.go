@@ -45,13 +45,13 @@ type ChalkosConfigTemplateResource struct {
 }
 
 // ChalkosConfigTemplateResourceSpec is the cloned ChalkosConfig's spec. It is ChalkosConfigSpec
-// with Image optional: a MachineDeployment's or MachineSet's rollout may compute it for each
-// Machine that uses it, instead.
+// with Image optional, so that a ClusterClass's patch can fill it in for each Cluster that uses the
+// template. A MachineDeployment or MachineSet clones the template as it is, and a ChalkosConfig
+// without an Image is refused, so a template they use directly must name the image.
 type ChalkosConfigTemplateResourceSpec struct {
 	// Image is the chalkos image the machine installs, by digest: repository@sha256:….
 	// +optional
-	// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
-	Image string `json:"image,omitempty"`
+	Image ImageReference `json:"image,omitempty"`
 
 	// ImagePullSecretRef names a Secret of type kubernetes.io/dockerconfigjson in the
 	// ChalkosConfig's namespace whose credentials the controller reads the image with. The node
@@ -65,6 +65,7 @@ type ChalkosConfigTemplateResourceSpec struct {
 	// ipFamilies, podCIDRs and serviceCIDRs when the Cluster's clusterNetwork gives ranges.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:MaxItems=256
 	Files []runtime.RawExtension `json:"files,omitempty"`
 }
 
