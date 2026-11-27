@@ -19,6 +19,7 @@ package nodetest
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"sync"
@@ -41,6 +42,8 @@ type Node struct {
 	Name string
 	// Fingerprint is that of the certificate the machine presents in maintenance mode.
 	Fingerprint string
+	// RootHash is the verity root hash, in hex, of the image the machine runs once installed.
+	RootHash string
 	// Err, when set, fails every call to the machine, as an unreachable one does.
 	Err error
 	// Install, when set, answers an install in place, which succeeds otherwise. The Fake calls it
@@ -157,10 +160,12 @@ func (f *Fake) Maintenance(_ context.Context, addr string, _ clustersecrets.Secr
 func (f *Fake) Installed(_ context.Context, addr string, _ clustersecrets.Secrets, name string) (*nodev1.InfoResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, err := f.installed(addr, name); err != nil {
+	n, err := f.installed(addr, name)
+	if err != nil {
 		return nil, err
 	}
-	return &nodev1.InfoResponse{Mode: nodev1.Mode_MODE_NORMAL, NodeName: name}, nil
+	rootHash, _ := hex.DecodeString(n.RootHash)
+	return &nodev1.InfoResponse{Mode: nodev1.Mode_MODE_NORMAL, NodeName: name, RootHash: rootHash}, nil
 }
 
 // Image returns the artifact SetImage serves at ref.

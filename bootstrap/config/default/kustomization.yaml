@@ -1,3 +1,8 @@
+# The bootstrap provider's installation: its CRDs, RBAC and manager in the namespace
+# bootstrap-chalkos-system.
+namespace: bootstrap-chalkos-system
+namePrefix: bootstrap-chalkos-
+
 # Labels every resource of the bootstrap provider's installation with the provider label
 # clusterctl uses to find and lifecycle it.
 labels:
@@ -8,4 +13,5 @@ labels:
 resources:
 - ../crd
 - ../rbac
+- ../manager
 #+kubebuilder:scaffold:defaultresource

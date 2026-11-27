@@ -30,6 +30,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	"github.com/trevex/chalkos/pkg/config"
 	"github.com/trevex/chalkos/pkg/constants"
 )
@@ -100,7 +102,10 @@ type file struct {
 // The cluster files must hold the Cluster document, which names the etcd, coredns, pause and
 // flannel images; the pool files hold none. A Node document among the cluster files holds the
 // control planes' Node fields, which workers do not get; the pool files may hold the pool's. When
-// the files hold no Node document, For generates one with the owned fields alone.
+// the files hold no Node document, For generates one with the owned fields alone. A worker's Node
+// gets Cluster API's taint node.cluster.x-k8s.io/uninitialized, which Cluster API removes once it
+// has synced the Machine's labels to the node; a control plane's does not, since the cluster's
+// add-ons start on it before Cluster API reaches the cluster.
 //
 // For refuses a file that sets an owned field, naming the field: the Node's spec.type and
 // spec.providerID, the Cluster's spec.endpoint and, when the Cluster gives ranges, its
@@ -233,7 +238,8 @@ func (f *file) own(spec map[string]any, field string, v any) error {
 	return nil
 }
 
-// setNode sets the fields of the Node document that the Machine owns.
+// setNode sets the fields of the Node document that the Machine owns, and gives a worker the
+// taint Cluster API removes once it has synced the Machine's labels to the node.
 func setNode(f *file, m Machine) error {
 	spec, err := f.spec()
 	if err != nil {
@@ -242,9 +248,31 @@ func setNode(f *file, m Machine) error {
 	if err := f.own(spec, "type", m.Type); err != nil {
 		return err
 	}
+	if m.Type == Worker {
+		if err := f.taintUninitialized(spec); err != nil {
+			return err
+		}
+	}
 	if _, ok := spec["providerID"]; ok || m.ProviderID != "" {
 		return f.own(spec, "providerID", m.ProviderID)
 	}
+	return nil
+}
+
+// taintUninitialized adds Cluster API's uninitialized taint to the spec's taints, unless the
+// user's document names it already.
+func (f *file) taintUninitialized(spec map[string]any) error {
+	taint := clusterv1.NodeUninitializedTaint
+	taints, ok := spec["taints"].([]any)
+	if _, set := spec["taints"]; set && !ok {
+		return fmt.Errorf("%s: the Node's spec.taints is not a list", f.source)
+	}
+	for _, t := range taints {
+		if t, ok := t.(map[string]any); ok && t["key"] == taint.Key {
+			return nil
+		}
+	}
+	spec["taints"] = append(taints, map[string]any{"key": taint.Key, "effect": string(taint.Effect)})
 	return nil
 }
 

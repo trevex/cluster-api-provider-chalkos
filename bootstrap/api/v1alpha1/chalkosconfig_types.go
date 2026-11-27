@@ -69,6 +69,24 @@ type ChalkosConfigStatus struct {
 	// +optional
 	Installed *bool `json:"installed,omitempty"`
 
+	// ImageRootHash is the verity root hash of the image the machine installs, in lower-case hex,
+	// as the image's header names it. An installed machine that runs another image fell back.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	ImageRootHash string `json:"imageRootHash,omitempty"`
+
+	// LastInstallTime is when the machine last accepted an install. The machine reboots into the
+	// install afterwards, so it is not installed again for a while.
+	// +optional
+	LastInstallTime *metav1.Time `json:"lastInstallTime,omitempty"`
+
+	// RefusedInputs is a digest of what the controller installed the machine from when its config
+	// or image was refused: the Machine's generated fields, the cluster's and the pool's files, the
+	// image and the cluster's OS CA. The controller tries again once they change.
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	RefusedInputs string `json:"refusedInputs,omitempty"`
+
 	// Conditions are the ChalkosConfig's current observations. Known condition types are Ready,
 	// Installed and Paused.
 	// +optional

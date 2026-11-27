@@ -165,6 +165,12 @@ spec:
                 maxLength: 253
                 minLength: 1
                 type: string
+              imageRootHash:
+                description: |-
+                  ImageRootHash is the verity root hash of the image the machine installs, in lower-case hex,
+                  as the image's header names it. An installed machine that runs another image fell back.
+                pattern: ^[a-f0-9]{64}$
+                type: string
               initialization:
                 description: Initialization reports the bootstrap data's creation,
                   as the Cluster API contract reads it.
@@ -179,6 +185,12 @@ spec:
                 description: Installed is set once the machine answered in normal
                   mode as its node.
                 type: boolean
+              lastInstallTime:
+                description: |-
+                  LastInstallTime is when the machine last accepted an install. The machine reboots into the
+                  install afterwards, so it is not installed again for a while.
+                format: date-time
+                type: string
               maintenanceFingerprints:
                 description: |-
                   MaintenanceFingerprints are the certificate fingerprints the machine presented in
@@ -209,6 +221,13 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              refusedInputs:
+                description: |-
+                  RefusedInputs is a digest of what the controller installed the machine from when its config
+                  or image was refused: the Machine's generated fields, the cluster's and the pool's files, the
+                  image and the cluster's OS CA. The controller tries again once they change.
+                maxLength: 64
+                type: string
             type: object
         required:
         - spec

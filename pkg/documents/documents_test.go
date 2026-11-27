@@ -91,6 +91,36 @@ func TestGeneratedNodeOfAWorker(t *testing.T) {
 	}
 }
 
+// A worker's Node registers with Cluster API's uninitialized taint, once, and a control plane's
+// without it.
+func TestUninitializedTaintOfWorkers(t *testing.T) {
+	const want = `[{"effect":"NoSchedule","key":"node.cluster.x-k8s.io/uninitialized"}]`
+	docs, err := documents.For(worker(), []runtime.RawExtension{file(clusterFile)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jsonOf(t, single(t, docs, "Node")["taints"]); got != want {
+		t.Errorf("worker's taints %s, want %s", got, want)
+	}
+	pool := `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Node", "metadata": {"name": "default"}, "spec": {"taints": [{"key": "node.cluster.x-k8s.io/uninitialized", "effect": "NoSchedule"}]}}`
+	docs, err = documents.For(worker(), []runtime.RawExtension{file(clusterFile)}, []runtime.RawExtension{file(pool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jsonOf(t, single(t, docs, "Node")["taints"]); got != want {
+		t.Errorf("worker's taints %s with the taint in its pool, want it once", got)
+	}
+	m := worker()
+	m.Type = documents.ControlPlane
+	docs, err = documents.For(m, []runtime.RawExtension{file(clusterFile)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taints, ok := single(t, docs, "Node")["taints"]; ok {
+		t.Errorf("control plane's taints %v, want none", taints)
+	}
+}
+
 func TestClusterFieldsFromClusterAPI(t *testing.T) {
 	m := worker()
 	m.PodCIDRs = []string{"fd00:10:244::/56", "10.244.0.0/16"}
@@ -157,7 +187,7 @@ func TestPoolLabelsKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	node := single(t, docs, "Node")
-	if jsonOf(t, node["labels"]) != `{"pool":"gpu"}` || jsonOf(t, node["taints"]) != `[{"effect":"NoSchedule","key":"gpu"}]` || node["type"] != "worker" {
+	if jsonOf(t, node["labels"]) != `{"pool":"gpu"}` || jsonOf(t, node["taints"]) != `[{"effect":"NoSchedule","key":"gpu"},{"effect":"NoSchedule","key":"node.cluster.x-k8s.io/uninitialized"}]` || node["type"] != "worker" {
 		t.Errorf("Node spec %v, want the pool's labels and taints with the owned fields", node)
 	}
 }

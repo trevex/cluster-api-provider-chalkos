@@ -148,6 +148,10 @@ func (in *ChalkosConfigStatus) DeepCopyInto(out *ChalkosConfigStatus) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.LastInstallTime != nil {
+		in, out := &in.LastInstallTime, &out.LastInstallTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

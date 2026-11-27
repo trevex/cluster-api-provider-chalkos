@@ -4,7 +4,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: chalkos-control-plane
+  name: aggregated-manager-role
   labels:
     cluster.x-k8s.io/aggregate-to-manager: "true"
 rules:

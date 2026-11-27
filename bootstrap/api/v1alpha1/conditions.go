@@ -46,12 +46,16 @@ const (
 	// InstallingReason documents a ChalkosConfig whose machine is installing.
 	InstallingReason = "Installing"
 
-	// ConfigRefusedReason documents a ChalkosConfig whose Files the controller refused, because
-	// they set a field the controllers own.
+	// ConfigRefusedReason documents a ChalkosConfig whose documents were refused: by the
+	// controller, because they set a field the controllers own or the Cluster has no
+	// ChalkosControlPlane, or by the machine's image. The controller tries again once the inputs
+	// change.
 	ConfigRefusedReason = "ConfigRefused"
 
-	// ImageRefusedReason documents a ChalkosConfig whose Image the machine's OS check authority
-	// refused.
+	// ImageRefusedReason documents a ChalkosConfig whose Image was refused: it trusts another OS
+	// CA than the one the cluster's secrets issue client certificates with, or its kubelet is not
+	// of the Machine's version. A machine whose booted image trusts another OS CA refuses the
+	// controller altogether, which no change of the ChalkosConfig repairs.
 	ImageRefusedReason = "ImageRefused"
 
 	// NodeUnreachableReason documents a ChalkosConfig whose machine could not be reached.
@@ -61,6 +65,14 @@ const (
 	InstalledReason = "Installed"
 
 	// FellBackToMaintenanceReason documents a ChalkosConfig whose machine, once installed,
-	// answered in maintenance mode again; a MachineHealthCheck replaces it instead of a reinstall.
+	// answered in maintenance mode again. The controller does not install it again: a
+	// MachineHealthCheck replaces it, given an unhealthyMachineConditions entry for the Machine's
+	// BootstrapConfigReady condition, which mirrors the ChalkosConfig's Ready, with status False.
 	FellBackToMaintenanceReason = "FellBackToMaintenance"
+
+	// ImageFellBackReason documents a ChalkosConfig whose installed machine runs another image
+	// than the one it installed, such as the previous one after a first boot that was not found
+	// healthy. The controller does not install it again; a MachineHealthCheck replaces it as it
+	// replaces a machine that fell back to maintenance mode.
+	ImageFellBackReason = "ImageFellBack"
 )
