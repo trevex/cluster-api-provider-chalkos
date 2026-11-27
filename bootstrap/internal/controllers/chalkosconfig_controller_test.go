@@ -796,15 +796,3 @@ func eventually(t *testing.T, what string, done func() bool) {
 		t.Fatalf("waiting for %s: %v", what, err)
 	}
 }
-
-// A long message is cut to maxMessage bytes at a character's boundary.
-func TestTruncate(t *testing.T) {
-	long := strings.Repeat("ä", maxMessage)
-	got := truncate(long)
-	if len(got) > maxMessage || !strings.HasSuffix(got, "…") || !strings.HasPrefix(long, strings.TrimSuffix(got, "…")) {
-		t.Errorf("truncate gives %d bytes: %q", len(got), got)
-	}
-	if truncate("short") != "short" {
-		t.Error("a short message is changed")
-	}
-}

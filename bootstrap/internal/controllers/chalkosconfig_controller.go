@@ -29,7 +29,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"connectrpc.com/connect/v2"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -64,6 +63,7 @@ import (
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/documents"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
@@ -76,11 +76,6 @@ const dataSecretValue = "# chalkos: installed over chalkd's API\n"
 const (
 	// maxFingerprints is how many maintenance fingerprints a ChalkosConfig's status keeps.
 	maxFingerprints = 10
-	// maxMessage is the longest condition message, in bytes, a refusal or error gives.
-	maxMessage = 1024
-	// retryAfter is how soon a ChalkosConfig whose machine is unreachable, or that waits for
-	// something no watch reports, is reconciled again.
-	retryAfter = 15 * time.Second
 	// slotWait is how soon a ChalkosConfig that found every install slot taken tries again.
 	slotWait = 30 * time.Second
 	// verifyEvery is about how often an installed machine is asked whether it still runs as its
@@ -219,13 +214,13 @@ func (s *scope) checkpoint(ctx context.Context) error {
 // set sets the Ready and Installed conditions, which move together.
 func (s *scope) set(status metav1.ConditionStatus, reason, message string) {
 	s.setReady(status, reason, message)
-	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.InstalledCondition, Status: status, Reason: reason, Message: truncate(message)})
+	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.InstalledCondition, Status: status, Reason: reason, Message: machineutil.Truncate(message)})
 }
 
 // setReady sets the Ready condition alone, as for an installed machine that is unreachable for
 // now but still installed.
 func (s *scope) setReady(status metav1.ConditionStatus, reason, message string) {
-	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.ReadyCondition, Status: status, Reason: reason, Message: truncate(message)})
+	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.ReadyCondition, Status: status, Reason: reason, Message: machineutil.Truncate(message)})
 }
 
 // refuse reports that the config or the image was refused, as reason says, for the inputs, which
@@ -251,7 +246,7 @@ func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl
 	if !installed && s.bootImageRefused() {
 		return ctrl.Result{}, nil
 	}
-	addr := internalIP(s.machine)
+	addr := machineutil.InternalIP(s.machine)
 	if !installed && (s.machine.Spec.ProviderID == "" || addr == "") {
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForInfrastructureReason, "The Machine has no providerID or InternalIP yet")
 		return ctrl.Result{}, nil
@@ -268,7 +263,7 @@ func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl
 		return ctrl.Result{}, fmt.Errorf("the Cluster's secrets %s are gone", secrets.Name(s.cluster.Name))
 	case !ok:
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForClusterSecretsReason, fmt.Sprintf("The Secret %s does not exist yet", secrets.Name(s.cluster.Name)))
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	if installed {
 		return r.verify(ctx, s, addr, sec, true)
@@ -320,7 +315,7 @@ var errNoChalkosControlPlane = errors.New("a ChalkosConfig needs a ChalkosContro
 func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr string, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	if !s.cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForInfrastructureReason, "The Cluster has no controlPlaneEndpoint yet")
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	clusterFiles, cpErr := r.clusterFiles(ctx, s.cluster)
 	if cpErr != nil && !errors.Is(cpErr, errNoChalkosControlPlane) {
@@ -375,7 +370,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		return ctrl.Result{}, nil
 	case err != nil:
 		s.set(metav1.ConditionFalse, bootstrapv1.NodeUnreachableReason, err.Error())
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	defer conn.Close()
 	log := ctrl.LoggerFrom(ctx).WithValues("address", addr)
@@ -413,7 +408,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		// The machine accepted an install already and reboots into it.
 		s.cfg.Status.LastInstallTime = ptr.To(metav1.Now())
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, "The machine is installed and reboots")
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	case err != nil:
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, fmt.Sprintf("The install failed: %v", err))
 		return ctrl.Result{}, err
@@ -440,7 +435,7 @@ func (r *ChalkosConfigReconciler) verify(ctx context.Context, s *scope, addr str
 	}
 	if addr == "" {
 		unreachable(metav1.ConditionFalse, bootstrapv1.NodeUnreachableReason, "The Machine has no InternalIP")
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	info, err := r.Node.Installed(ctx, addr, sec, s.machine.Name)
 	switch {
@@ -457,10 +452,10 @@ func (r *ChalkosConfigReconciler) verify(ctx context.Context, s *scope, addr str
 		return ctrl.Result{}, nil
 	case errors.Is(err, sdk.ErrNotInstalled):
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, "The machine does not answer as its node yet")
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	unreachable(metav1.ConditionFalse, bootstrapv1.NodeUnreachableReason, err.Error())
-	return ctrl.Result{RequeueAfter: retryAfter}, nil
+	return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 }
 
 // maxInstalls is how many installs run at once.
@@ -600,15 +595,6 @@ func machineOf(m *clusterv1.Machine, cluster *clusterv1.Cluster) documents.Machi
 	}
 }
 
-// internalIP is the Machine's first InternalIP; empty when it has none.
-func internalIP(m *clusterv1.Machine) string {
-	for _, a := range m.Status.Addresses {
-		if a.Type == clusterv1.MachineInternalIP {
-			return a.Address
-		}
-	}
-	return ""
-}
 
 // recordFingerprint appends the fingerprint seen at now unless it is the last one recorded,
 // keeping the newest maxFingerprints. It tells whether it appended the fingerprint.
@@ -622,19 +608,6 @@ func recordFingerprint(cfg *bootstrapv1.ChalkosConfig, fingerprint string, now t
 	return true
 }
 
-// truncate shortens a condition's message to maxMessage bytes, at a character's boundary. The
-// messages are chalkos's refusals and errors, which name the documents' fields but not the
-// values of Secret documents: chalkos checks rules and validators against redacted documents.
-func truncate(message string) string {
-	if len(message) <= maxMessage {
-		return message
-	}
-	cut := maxMessage - len("…")
-	for cut > 0 && !utf8.RuneStart(message[cut]) {
-		cut--
-	}
-	return message[:cut] + "…"
-}
 
 // machineToConfig maps a Machine to its ChalkosConfig.
 func machineToConfig(_ context.Context, o client.Object) []ctrl.Request {

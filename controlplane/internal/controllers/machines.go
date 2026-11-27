@@ -42,6 +42,7 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 )
 
 // selectorLabels are the labels that select the control plane's Machines. The control plane's
@@ -143,7 +144,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 			ok, err := r.joined(ctx, s, &s.machines[i], sec)
 			if err != nil || !ok {
 				s.waitingToJoin = s.machines[i].Name
-				return ctrl.Result{RequeueAfter: retryAfter}, err
+				return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, err
 			}
 		}
 	}

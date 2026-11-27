@@ -19,24 +19,15 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-
-	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
-	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/controlplane/internal/controllers"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/manager"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
 
@@ -46,80 +37,26 @@ import (
 
 func main() {
 	var (
-		namespace        string
-		metricsAddr      string
-		probeAddr        string
-		leaderElect      bool
+		opts             manager.Options
 		concurrency      int
 		bootstrapTimeout time.Duration
-		watchFilter      string
 	)
-	flag.StringVar(&namespace, "namespace", "", "The namespace whose objects the manager reconciles; empty reconciles every namespace.")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to, over HTTPS for authenticated and authorized clients; 0 disables it.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
-	flag.BoolVar(&leaderElect, "leader-elect", false, "Elect a leader among the manager's replicas, so one reconciles at a time.")
+	opts.BindFlags(flag.CommandLine)
 	flag.IntVar(&concurrency, "concurrency", 10, "How many ChalkosControlPlanes are reconciled at once.")
 	flag.DurationVar(&bootstrapTimeout, "bootstrap-timeout", controllers.DefaultBootstrapTimeout, "How long one bootstrap call may take.")
-	flag.StringVar(&watchFilter, "watch-filter", "", "When set, reconcile only objects whose cluster.x-k8s.io/watch-filter label has this value.")
-	opts := zap.Options{}
-	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-	log := ctrl.Log.WithName("setup")
-
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, clusterv1.AddToScheme, bootstrapv1.AddToScheme, controlplanev1.AddToScheme} {
-		if err := add(scheme); err != nil {
-			log.Error(err, "register the API types")
-			os.Exit(1)
+	err := manager.Run(opts, "control-plane-chalkos", func(ctx context.Context, mgr ctrl.Manager) error {
+		r := &controllers.ChalkosControlPlaneReconciler{
+			Client:                  mgr.GetClient(),
+			APIReader:               mgr.GetAPIReader(),
+			Node:                    node.New(),
+			BootstrapTimeout:        bootstrapTimeout,
+			MaxConcurrentReconciles: concurrency,
+			WatchFilterValue:        opts.WatchFilter,
 		}
-	}
-	var cacheOpts cache.Options
-	if namespace != "" {
-		cacheOpts.DefaultNamespaces = map[string]cache.Config{namespace: {}}
-	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		Cache:  cacheOpts,
-		Metrics: metricsserver.Options{
-			BindAddress:    metricsAddr,
-			SecureServing:  true,
-			FilterProvider: filters.WithAuthenticationAndAuthorization,
-		},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         leaderElect,
-		LeaderElectionID:       "control-plane-chalkos",
-		// A stopping manager gives up its lease, so the next leader takes over at once.
-		LeaderElectionReleaseOnCancel: true,
+		return r.SetupWithManager(ctx, mgr)
 	})
 	if err != nil {
-		log.Error(err, "create the manager")
-		os.Exit(1)
-	}
-	ctx := ctrl.SetupSignalHandler()
-	r := &controllers.ChalkosControlPlaneReconciler{
-		Client:                  mgr.GetClient(),
-		APIReader:               mgr.GetAPIReader(),
-		Node:                    node.New(),
-		BootstrapTimeout:        bootstrapTimeout,
-		MaxConcurrentReconciles: concurrency,
-		WatchFilterValue:        watchFilter,
-	}
-	if err := r.SetupWithManager(ctx, mgr); err != nil {
-		log.Error(err, "set up the ChalkosControlPlane controller")
-		os.Exit(1)
-	}
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		log.Error(err, "add the health check")
-		os.Exit(1)
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		log.Error(err, "add the readiness check")
-		os.Exit(1)
-	}
-	log.Info("starting the manager")
-	if err := mgr.Start(ctx); err != nil {
-		log.Error(err, "run the manager")
 		os.Exit(1)
 	}
 }

@@ -26,7 +26,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"connectrpc.com/connect/v2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -58,18 +57,12 @@ import (
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
 )
 
 const (
-	// retryAfter is how soon a ChalkosControlPlane that waits for a node, which no watch reports,
-	// is reconciled again.
-	retryAfter = 15 * time.Second
-
-	// maxMessage is the longest condition message, in bytes, a refusal or error gives.
-	maxMessage = 1024
-
 	// DefaultBootstrapTimeout is how long a bootstrap call may take when the reconciler names no
 	// timeout. chalkd commits the node to the bootstrap before it waits for the cluster's add-ons,
 	// so a call that times out goes on on the node, and the reconciler follows it through the
@@ -246,7 +239,7 @@ func (s *scope) initialized() bool {
 func (s *scope) notInitialized(reason, message string) {
 	conditions.Set(s.cp, metav1.Condition{
 		Type: controlplanev1.InitializedCondition, Status: metav1.ConditionFalse,
-		Reason: reason, Message: truncate(message),
+		Reason: reason, Message: machineutil.Truncate(message),
 	})
 }
 
@@ -331,7 +324,7 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 			s.deletingMessage = "Deleting 1 Machine"
 		}
 		// The Machines' watch reconciles again as they go; the requeue covers a missed event.
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	ctrl.LoggerFrom(ctx).Info("The Machines are gone; removing the finalizer")
 	s.deletingReason, s.deletingMessage = controlplanev1.DeletionCompletedReason, ""
@@ -392,7 +385,7 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 			// The node's status tells the outcome at the next reconcile.
 			res, done, err := r.bootstrap(ctx, s, m, sec)
 			if done {
-				res = ctrl.Result{RequeueAfter: retryAfter}
+				res = ctrl.Result{RequeueAfter: machineutil.RetryAfter}
 			}
 			return res, err
 		}
@@ -400,11 +393,11 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 	st, err := r.nodeStatus(ctx, s, m, sec)
 	if err != nil {
 		s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Reading the status of the Machine %s: %v", m.Name, err))
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	if !st.GetAddonsApplied() {
 		s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Waiting for the Machine %s to apply the cluster's add-ons: %s", m.Name, st.GetState()))
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	s.cp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
 	return ctrl.Result{}, nil
@@ -422,7 +415,7 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	log := ctrl.LoggerFrom(ctx).WithValues("machine", m.Name)
-	err = r.Node.Bootstrap(callCtx, internalIP(m), sec, m.Name)
+	err = r.Node.Bootstrap(callCtx, machineutil.InternalIP(m), sec, m.Name)
 	delete(s.statuses, m.Name)
 	switch {
 	case err == nil:
@@ -437,7 +430,7 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 		return ctrl.Result{}, true, nil
 	case connect.CodeOf(err) == connect.CodeFailedPrecondition:
 		s.notInitialized(controlplanev1.BootstrapRefusedReason, fmt.Sprintf("The Machine %s refused the bootstrap: %v", m.Name, err))
-		return ctrl.Result{RequeueAfter: retryAfter}, false, nil
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, false, nil
 	}
 	s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Bootstrapping the Machine %s: %v", m.Name, err))
 	return ctrl.Result{}, false, err
@@ -457,7 +450,7 @@ func (r *ChalkosControlPlaneReconciler) nodeStatus(ctx context.Context, s *scope
 	if ns, ok := s.statuses[m.Name]; ok {
 		return ns.status, ns.err
 	}
-	st, err := r.Node.KubernetesStatus(ctx, internalIP(m), sec, m.Name)
+	st, err := r.Node.KubernetesStatus(ctx, machineutil.InternalIP(m), sec, m.Name)
 	if s.statuses == nil {
 		s.statuses = map[string]nodeStatus{}
 	}
@@ -468,7 +461,7 @@ func (r *ChalkosControlPlaneReconciler) nodeStatus(ctx context.Context, s *scope
 // installed tells whether the Machine's ChalkosConfig reports the machine installed and the
 // Machine has an InternalIP to reach it at.
 func (r *ChalkosControlPlaneReconciler) installed(ctx context.Context, m *clusterv1.Machine) (bool, error) {
-	if internalIP(m) == "" {
+	if machineutil.InternalIP(m) == "" {
 		return false, nil
 	}
 	var cfg bootstrapv1.ChalkosConfig
@@ -510,17 +503,6 @@ func earliest(a, b ctrl.Result) ctrl.Result {
 	return b
 }
 
-// truncate shortens a condition's message to maxMessage bytes, at a character's boundary.
-func truncate(message string) string {
-	if len(message) <= maxMessage {
-		return message
-	}
-	cut := maxMessage - len("…")
-	for cut > 0 && !utf8.RuneStart(message[cut]) {
-		cut--
-	}
-	return message[:cut] + "…"
-}
 
 // uncached is a client that reads with reader and writes with its Client: secrets.Ensure must not
 // read the Secret from a cache that does not hold it yet, or it would generate the secrets again,
@@ -535,15 +517,6 @@ func (u uncached) Get(ctx context.Context, key client.ObjectKey, obj client.Obje
 	return u.reader.Get(ctx, key, obj, opts...)
 }
 
-// internalIP is the Machine's first InternalIP; empty when it has none.
-func internalIP(m *clusterv1.Machine) string {
-	for _, a := range m.Status.Addresses {
-		if a.Type == clusterv1.MachineInternalIP {
-			return a.Address
-		}
-	}
-	return ""
-}
 
 // isControlPlaneRef tells whether ref names a ChalkosControlPlane.
 func isControlPlaneRef(ref metav1.OwnerReference) bool {
