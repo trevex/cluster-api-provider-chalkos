@@ -315,7 +315,11 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 		return ctrl.Result{}, err
 	}
 	for i := range s.machines {
-		if err := r.Client.Delete(ctx, &s.machines[i]); client.IgnoreNotFound(err) != nil {
+		err := r.Client.Delete(ctx, &s.machines[i])
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("delete the Machine %s: %w", s.machines[i].Name, err)
 		}
 		ctrl.LoggerFrom(ctx).Info("Deleting the Machine", "machine", s.machines[i].Name)
@@ -375,6 +379,8 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 		if err := s.checkpoint(ctx); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Logged once: a retry of the call, while the node waits, is not logged again.
+		ctrl.LoggerFrom(ctx).Info("Bootstrapping the cluster", "machine", m.Name)
 		if res, done, err := r.bootstrap(ctx, s, m, sec); !done {
 			return res, err
 		}
@@ -416,7 +422,6 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	log := ctrl.LoggerFrom(ctx).WithValues("machine", m.Name)
-	log.Info("Bootstrapping the cluster")
 	err = r.Node.Bootstrap(callCtx, internalIP(m), sec, m.Name)
 	delete(s.statuses, m.Name)
 	switch {
