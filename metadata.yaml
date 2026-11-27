@@ -1,0 +1,9 @@
+# Maps release series of major.minor to the Cluster API contract version the chalkos providers
+# implement. clusterctl reads this to pick a compatible provider version for a management
+# cluster's core Cluster API version. Update it only when the contract version changes.
+apiVersion: clusterctl.cluster.x-k8s.io/v1alpha3
+kind: Metadata
+releaseSeries:
+- major: 0
+  minor: 1
+  contract: v1beta2
