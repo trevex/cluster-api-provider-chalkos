@@ -27,25 +27,40 @@
       # The images of the KubeVirt lab in lab/: lab-image, lab-image-oci and lab-disk.
       packages.${system} = import ./nix/lab-images.nix { inherit chalkos pkgs; };
 
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          go
-          pkgs.kubernetes-controller-tools # controller-gen
-          pkgs.kustomize
-          pkgs.setup-envtest
-          pkgs.kind
-          pkgs.kubectl
-          # clusterctl of the Cluster API release go.mod names, built as a go.mod tool, so the lab
-          # installs the core release the providers build against. It runs inside the repository.
-          (pkgs.writeShellScriptBin "clusterctl" ''exec go tool clusterctl "$@"'')
-          pkgs.kubevirt # virtctl
-          pkgs.just
-          pkgs.crane
-          pkgs.qemu # qemu-img
-          pkgs.golangci-lint
-          # Pushes the lab's chalkos image to the lab's registry.
-          chalkos.packages.${system}.chalkbuild
-        ];
+      devShells.${system} = rec {
+        # The tools of CI's jobs, without the lab's, whose chalkbuild builds from source.
+        ci = pkgs.mkShell {
+          packages = [
+            go
+            pkgs.kubernetes-controller-tools # controller-gen
+            pkgs.kustomize
+            pkgs.setup-envtest
+            pkgs.golangci-lint
+            # govulncheck built with the Go release go.mod names, which also types the standard
+            # library it checks.
+            go.tools.govulncheck.latest
+            pkgs.actionlint
+            pkgs.shellcheck
+          ];
+        };
+
+        default = pkgs.mkShell {
+          inputsFrom = [ ci ];
+          packages = [
+            pkgs.kind
+            pkgs.kubectl
+            # clusterctl of the Cluster API release go.mod names, built as a go.mod tool, so the
+            # lab installs the core release the providers build against. It runs inside the
+            # repository.
+            (pkgs.writeShellScriptBin "clusterctl" ''exec go tool clusterctl "$@"'')
+            pkgs.kubevirt # virtctl
+            pkgs.just
+            pkgs.crane
+            pkgs.qemu # qemu-img
+            # Pushes the lab's chalkos image to the lab's registry.
+            chalkos.packages.${system}.chalkbuild
+          ];
+        };
       };
     };
 }
