@@ -1,11 +1,135 @@
 # cluster-api-provider-chalkos
 
 Cluster API bootstrap and control-plane providers for [chalkos](https://github.com/trevex/chalkos),
-the API-driven, immutable NixOS-based Linux distribution. The bootstrap provider turns a Machine's
-chalkos node into a Kubernetes node; the control-plane provider turns a set of Machines into a
-control plane, keeps its kubeconfig Secret current, and scales it the way Cluster API scales any
-control plane. See [`lab/`](lab/) for a KubeVirt-based lab that runs both providers against
-chalkos virtual machines end to end.
+the API-driven, immutable NixOS-based Linux distribution. The bootstrap provider installs a
+Machine's chalkos node over chalkd's API. The control-plane provider creates a cluster's
+control-plane Machines one at a time, bootstraps the cluster on the first, and keeps the cluster's
+kubeconfig Secret current. See [`lab/`](lab/) for a KubeVirt-based lab that runs both providers
+against chalkos virtual machines end to end.
+
+## Status and limitations
+
+The providers are alpha. Their API is `v1alpha1` and may change between releases without a
+conversion path.
+
+What works:
+
+- Creating a cluster: the control-plane Machines one at a time, then the workers of
+  MachineDeployments.
+- Scaling the control plane up, one Machine at a time, each after the one before it joined etcd.
+- Deleting a cluster: the control plane waits until the cluster's worker Machines and
+  MachinePools are deleted, then deletes its own Machines.
+
+What does not work yet:
+
+- Scaling the control plane down. A ChalkosControlPlane never removes a running control-plane
+  Machine.
+- Rollouts and upgrades of the control plane. A changed `spec.version` marks the Machines as not
+  up to date, and a changed `spec.image` does not affect Machines that exist; neither replaces a
+  Machine.
+- Rotation of the cluster's CAs and keys. The kubeconfig Secret's client certificate is the only
+  credential the providers renew.
+
+The end-to-end test covers one control plane and one worker on KubeVirt through
+[CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt). Other infrastructure
+providers, ClusterClass topologies and worker rollouts are untested. An infrastructure provider
+must report each Machine's `providerID` and an `InternalIP` address that the managers can reach:
+the providers talk to chalkd on that address.
+
+## How the providers fit together
+
+The two providers ship together and work only together. The control-plane provider creates a
+ChalkosConfig for each control-plane Machine. The bootstrap provider watches ChalkosControlPlanes
+and reads the cluster-wide documents from them, so it refuses a Machine whose Cluster names
+another kind of control plane in `spec.controlPlaneRef`.
+
+The API has four kinds:
+
+| Kind | Provider | What it holds |
+| --- | --- | --- |
+| `ChalkosControlPlane` | control plane | `replicas` (odd, default 1), `version`, `image`, `machineTemplate` with the infrastructure template, `files` with the cluster-wide chalkos documents, and `kubeconfig.ttlSeconds`. |
+| `ChalkosControlPlaneTemplate` | control plane | The same without `replicas`, `version` and the infrastructure reference, for a ClusterClass. |
+| `ChalkosConfig` | bootstrap | One Machine's `image` and the `files` of its pool, such as a Node's labels and taints. |
+| `ChalkosConfigTemplate` | bootstrap | The ChalkosConfig that a MachineDeployment or MachineSet clones for each Machine. |
+
+Every `image` names a chalkos image by digest, `repository@sha256:…`. A `files` entry is a chalkos
+config document, written inline in the object. The ChalkosControlPlane's `files` must hold the
+`kubernetes.chalkos.dev` Cluster document. The providers set the fields they own from the Cluster
+API objects and refuse documents that set them: the Node's type and providerID, the Cluster's
+endpoint, and its IP families and pod and service ranges when the Cluster's `clusterNetwork` gives
+ranges. [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl) is a complete example of a Cluster with
+one control plane and a MachineDeployment of one worker.
+
+## Quick start
+
+The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK, KubeVirt, CDI
+and both providers, and creates the workload cluster `lab` of chalkos VMs on it. It needs Nix with
+flakes and Docker. The two VMs take 5 GiB of memory on top of the kind cluster. With `/dev/kvm`
+the VMs run hardware-accelerated; without it, KubeVirt emulates them. All state lives in `.lab/`
+of the repository.
+
+From the devshell (`nix develop`), run the recipes in order:
+
+```sh
+just -f lab/justfile registry create kubevirt images providers cluster
+just -f lab/justfile describe
+just -f lab/justfile kt get nodes
+```
+
+`registry` and `create` start a local registry and the kind cluster. `kubevirt` installs KubeVirt
+and CDI. `images` builds the chalkos image and the VMs' containerDisk and pushes both. `providers`
+builds and installs the chalkos providers with Cluster API, cert-manager and CAPK. `cluster`
+creates the workload cluster from [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl). `describe`
+shows its state, and `kt` runs kubectl against it. `just -f lab/justfile destroy` deletes the
+kind cluster and the registry with its storage.
+
+The lab installs the Cluster API core release that `go.mod` builds the providers against. The
+devshell's `clusterctl` runs `go tool clusterctl`, a tool that `go.mod` names, so it is of the same
+release. It works only from inside the repository.
+
+## Security model
+
+The providers never pass a node's configuration through the infrastructure provider. Every
+Machine's bootstrap data Secret holds a fixed marker, which the infrastructure provider passes to
+the machine as user data. The configuration, the node's certificates and the keys it needs reach
+the machine over chalkd's API, in the install call the bootstrap provider makes.
+
+A machine in maintenance mode presents a self-signed certificate that nothing can verify in
+advance. The bootstrap provider trusts it on first use: it reads the certificate's fingerprint over
+an unverified connection, then connects again pinned to that fingerprint, so the install goes to
+that certificate alone. Each new fingerprint is recorded, with the time it was seen, in the
+ChalkosConfig's `status.maintenanceFingerprints`, which keeps the last 10. Compare them with
+fingerprints obtained from the machines out of band to check after the fact that no install went to
+another host. Once installed, a node presents a certificate that the cluster's node CA issued, and
+the providers verify it.
+
+An image can carry the cluster's OS CA, set when the image is built. A machine that boots such an
+image accepts only clients whose certificates that OS CA issued, also in maintenance mode, so no
+other party can install it. Before an install, the bootstrap provider checks the image's OS CA
+against the cluster's secrets and reports `ImageRefused` when they differ. An image without an OS
+CA, such as the lab's, accepts any client in maintenance mode and suits a private network only.
+
+The cluster's secrets live in plaintext in the Secret `<cluster>-chalkos-secrets` next to the
+Cluster, under the key `secrets.json`. It holds every CA and private key of the cluster, among them
+the OS CA, the node CA, the Kubernetes, front-proxy and etcd CAs, the service-account key and the
+encryption key. Anyone who can read it controls the cluster, so restrict read access to Secrets in
+the Cluster's namespace and encrypt Secrets at rest in the management cluster.
+
+The control-plane provider generates this Secret once the Cluster has a control-plane endpoint, if
+none exists. It sets the ChalkosControlPlane as the Secret's owner, so the Secret is deleted with
+the ChalkosControlPlane, and labels it for `clusterctl move`. A Secret that exists already is kept
+as it is. To install images that carry an OS CA, create the Secret before the Cluster from the
+`secrets.json` that `chalkctl gen secrets --plaintext` writes, with the labels
+`cluster.x-k8s.io/cluster-name: <cluster>` and `clusterctl.cluster.x-k8s.io/move: ""`, and build
+the images with the `secrets.pub.json` written beside it.
+
+The kubeconfig Secret `<cluster>-kubeconfig` holds an admin kubeconfig whose client certificate
+the cluster's Kubernetes CA issues. The certificate is valid for `spec.kubeconfig.ttlSeconds`, one
+day by default, and is issued again after two thirds of that time.
+
+Both managers read and create Secrets, and the control-plane manager also updates them. Their
+ClusterRoles grant this in every namespace. `--namespace` limits the objects a manager reconciles
+to one namespace, but not what its ClusterRole grants.
 
 ## Building a local provider repository
 
@@ -33,9 +157,8 @@ Docker.
 
 `clusterctl init` reads `out/clusterctl.yaml` through its `--config` flag, which adds the chalkos
 providers to clusterctl's built-in provider list rather than replacing it. Pointed at a management
-cluster that can reach `REGISTRY`, and paired with an infrastructure provider such as
-[CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt), this installs every
-provider the [lab](lab/) needs:
+cluster that can reach `REGISTRY`, and paired with an infrastructure provider such as CAPK, this
+installs every provider the [lab](lab/) needs:
 
 ```sh
 clusterctl init \
