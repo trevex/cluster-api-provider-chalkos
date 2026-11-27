@@ -1,11 +1,11 @@
 {
   description = "Cluster API bootstrap and control-plane providers for chalkos";
 
-  # Follows chalkos's own nixpkgs and go-overlay, so the toolchain this devShell
-  # builds is the one chalkos builds for itself, and both repositories move
-  # together when chalkos's pin is bumped.
+  # Follows chalkos's own nixpkgs and go-overlay, so the toolchain this devShell builds is the one
+  # chalkos builds for itself, and both repositories move together when chalkos's pin is bumped.
+  # The input names the chalkos release that go.mod requires, and Renovate bumps both together.
   inputs = {
-    chalkos.url = "github:trevex/chalkos/46f275276f65a3a5fb980487a429b2315ec47c60";
+    chalkos.url = "github:trevex/chalkos/v0.8.0";
     nixpkgs.follows = "chalkos/nixpkgs";
     go-overlay.follows = "chalkos/go-overlay";
   };
@@ -28,7 +28,7 @@
       packages.${system} = import ./nix/lab-images.nix { inherit chalkos pkgs; };
 
       devShells.${system} = rec {
-        # The tools of CI's jobs, without the lab's, whose chalkbuild builds from source.
+        # The tools of CI's Go jobs, without the lab's, whose chalkbuild builds from source.
         ci = pkgs.mkShell {
           packages = [
             go
@@ -39,13 +39,24 @@
             # govulncheck built with the Go release go.mod names, which also types the standard
             # library it checks.
             go.tools.govulncheck.latest
+          ];
+        };
+
+        # The tools of CI's workflows job, a shell of their own that keeps Renovate's Node.js out of
+        # the Go jobs.
+        workflows = pkgs.mkShell {
+          packages = [
             pkgs.actionlint
             pkgs.shellcheck
+            pkgs.renovate # renovate-config-validator
           ];
         };
 
         default = pkgs.mkShell {
-          inputsFrom = [ ci ];
+          inputsFrom = [
+            ci
+            workflows
+          ];
           packages = [
             pkgs.kind
             pkgs.kubectl
