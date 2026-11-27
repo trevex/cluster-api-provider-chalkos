@@ -18,9 +18,11 @@ limitations under the License.
 
 // Package e2e runs the lab's scenario against the KubeVirt lab: it creates the workload cluster
 // lab of one control plane and one worker, checks that its nodes join and that the providers
-// report them installed, and deletes it again. The lab must run already, as after
+// report them installed, and deletes it again. The lab must run already, with the providers built
+// from the checkout or the released ones, as after
 //
 //	just -f lab/justfile create kubevirt providers-local
+//	just -f lab/justfile create kubevirt providers
 //
 // and the test skips otherwise. A run that stops early deletes the cluster too, unless E2E_KEEP=1.
 package e2e
