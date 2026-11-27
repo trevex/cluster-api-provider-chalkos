@@ -188,6 +188,10 @@ just -f lab/justfile destroy
 A run that stops early still deletes the cluster, after it logged the cluster's state on failure.
 `E2E_KEEP=1 make e2e` keeps the cluster of such a run to look at.
 
+CI runs the same steps for a pull request with the label `e2e` and every night on `main`. A
+failed run uploads the test's output, the cluster's state and the kind node's logs as the
+artifact `e2e-logs`.
+
 ## Contributing and security
 
 [CONTRIBUTING.md](CONTRIBUTING.md) describes the development setup, the tests and the rules for

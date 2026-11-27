@@ -5,7 +5,10 @@
 # jobs, lint and workflows, and fails result; marking it ready for review runs the workflow again
 # with everything. Every run but a draft's also runs govulncheck, which reads the Go
 # vulnerability database from the network. The jobs run the commands of the Makefile in the
-# flake's ci development shell. The job result is the one check that branch protection requires.
+# flake's ci development shell. A ready pull request with the label e2e, which adding the label
+# runs the workflow again for, and the nightly run, which calls this workflow, also run the
+# end-to-end test on the KubeVirt lab; a push to main does not. The job result is the one check
+# that branch protection requires.
 name: ci
 
 on:
@@ -133,6 +136,87 @@ jobs:
       - name: Check for vulnerabilities the Go code calls
         run: nix develop .#ci --command govulncheck ./...
 
+  # The end-to-end test on the KubeVirt lab, the lab's VMs hardware-accelerated by the runner's
+  # /dev/kvm: a ready pull request with the label e2e and the nightly run, whose event is schedule
+  # or workflow_dispatch, run it; a push to main does not. The lab takes about 7 GiB of the
+  # runner's 16 GiB: two VMs of 3 and 2 GiB, KubeVirt, CDI and Cluster API. The first run of a
+  # branch builds the lab's chalkos image, which later runs substitute from the binary cache.
+  e2e:
+    if: >-
+      ${{ !github.event.pull_request.draft && github.event_name != 'push' &&
+      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      # Hestia checks which cached packs GitHub has evicted.
+      actions: read
+    env:
+      # The lab is destroyed after the test in any case, so a failed run keeps its cluster for the
+      # logs.
+      E2E_KEEP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+        with:
+          free-disk: "true"
+          kvm: "true"
+      # Without /dev/kvm the lab would emulate the VMs, which takes longer than the test waits.
+      - name: Check for KVM
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::error title=No KVM::the runner has no writable /dev/kvm"
+            exit 1
+          fi
+      - name: Start the registry and the kind cluster
+        run: nix develop --command just -f lab/justfile registry create
+      - name: Install KubeVirt and CDI
+        run: nix develop --command just -f lab/justfile kubevirt
+      - name: Build and push the chalkos image
+        run: nix develop --command just -f lab/justfile images
+      - name: Install the providers
+        run: nix develop --command just -f lab/justfile providers
+      # A test that skips, as when a provider is not available, fails the job. The memory the
+      # runner uses is sampled while the test runs, and its peak goes to the run's summary.
+      - name: Run the end-to-end test
+        run: |
+          set -o pipefail
+          mkdir -p .lab/logs
+          while :; do free -m | awk '/^Mem:/ {print $3}'; sleep 10; done >.lab/logs/memory.log &
+          sampler=$!
+          status=0
+          nix develop --command make e2e 2>&1 | tee .lab/logs/e2e.log || status=$?
+          kill "$sampler"
+          peak=$(sort -n .lab/logs/memory.log | tail -n1)
+          echo "The runner used at most $peak MiB of memory during the test; its disk: $(df -h --output=used,avail / | tail -n1)." >>"$GITHUB_STEP_SUMMARY"
+          if [ "$status" = 0 ] && grep -q -- '--- SKIP' .lab/logs/e2e.log; then
+            echo "::error title=Skipped::the end-to-end test skipped; the lab did not run"
+            exit 1
+          fi
+          exit "$status"
+      - name: Collect the lab's logs
+        if: failure()
+        run: |
+          mkdir -p .lab/logs
+          nix develop --command sh -c '
+            export KUBECONFIG=.lab/kind.kubeconfig
+            clusterctl describe cluster lab --show-conditions all >.lab/logs/describe.txt 2>&1
+            kubectl get all,virtualmachineinstances,datavolumes,events -A -o wide >.lab/logs/resources.txt 2>&1
+            kind export logs .lab/logs/kind --name chalkos-lab' || true
+      - name: Destroy the lab
+        if: always()
+        run: nix develop --command just -f lab/justfile destroy
+      - name: Keep the lab's logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: .lab/logs
+          retention-days: 7
+          if-no-files-found: ignore
+
   # The workflows and the composite action pass actionlint, with shellcheck for their scripts; the
   # scripts of .github/scripts pass shellcheck, and their test passes.
   workflows:
@@ -193,13 +277,13 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/dco.sh "$BASE" "$HEAD"
 
-  # The jobs that run on pull requests alone pass on a push when skipped. On a draft pull request
-  # this job fails at once. Branch protection counts a skipped job as passed, and GitHub keeps a
-  # commit's older checks, so a skipped result of the draft's run would pass the required check
-  # while the run that "Ready for review" starts has yet to report its own, and a passed result of
-  # a ready run would still show after "Convert to draft".
+  # The jobs that run on pull requests alone pass on a push or in the nightly run when skipped. On
+  # a draft pull request this job fails at once. Branch protection counts a skipped job as passed,
+  # and GitHub keeps a commit's older checks, so a skipped result of the draft's run would pass the
+  # required check while the run that "Ready for review" starts has yet to report its own, and a
+  # passed result of a ready run would still show after "Convert to draft".
   result:
-    needs: [lint, generate, test, build, govulncheck, workflows, pr-title, dco]
+    needs: [lint, generate, test, build, govulncheck, e2e, workflows, pr-title, dco]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -213,6 +297,8 @@ jobs:
           TEST: ${{ needs.test.result }}
           BUILD: ${{ needs.build.result }}
           GOVULNCHECK: ${{ needs.govulncheck.result }}
+          E2E: ${{ needs.e2e.result }}
+          E2E_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'e2e') }}
           WORKFLOWS: ${{ needs.workflows.result }}
           PR_TITLE: ${{ needs.pr-title.result }}
           DCO: ${{ needs.dco.result }}
@@ -221,8 +307,12 @@ jobs:
             echo "::error title=Draft::a draft pull request runs only dco, pr-title, lint and workflows; mark it ready for review to run every check"
             exit 1
           fi
-          echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, workflows: $WORKFLOWS, title: $PR_TITLE, sign-offs: $DCO"
+          echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, e2e: $E2E, workflows: $WORKFLOWS, title: $PR_TITLE, sign-offs: $DCO"
           passed() { [ "$1" = success ] || { [ "$EVENT" != pull_request ] && [ "$1" = skipped ]; }; }
+          # The e2e job runs for a pull request with the label e2e and in the nightly run, and
+          # passes only when it ran there; elsewhere it skips.
+          e2e_selected() { [ "$EVENT" != push ] && { [ "$EVENT" != pull_request ] || [ "$E2E_LABEL" = true ]; }; }
           [ "$LINT" = success ] && [ "$GENERATE" = success ] && [ "$TEST" = success ] &&
             [ "$BUILD" = success ] && [ "$GOVULNCHECK" = success ] && [ "$WORKFLOWS" = success ] &&
+            { [ "$E2E" = success ] || { ! e2e_selected && [ "$E2E" = skipped ]; }; } &&
             passed "$PR_TITLE" && passed "$DCO"
