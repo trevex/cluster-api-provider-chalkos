@@ -2,13 +2,14 @@
 # A pull request's title, which a squash merge makes the subject of its commit on main, must be a
 # Conventional Commit, and each of its commits must carry its author's DCO sign-off. Editing the
 # title or the description runs the workflow again. A draft pull request runs only those two
-# jobs, lint and workflows, and fails result; marking it ready for review runs the workflow again
-# with everything. Every run but a draft's also runs govulncheck, which reads the Go
-# vulnerability database from the network. The jobs run the commands of the Makefile in the
+# jobs, lint, workflows and release-series, and fails result; marking it ready for review runs
+# the workflow again with everything. Every run but a draft's also runs govulncheck, which reads
+# the Go vulnerability database from the network. The jobs run the commands of the Makefile in the
 # flake's ci development shell. A ready pull request with the label e2e, which adding the label
 # runs the workflow again for, and the nightly run, which calls this workflow, also run the
 # end-to-end test on the KubeVirt lab; a push to main does not. The job result is the one check
-# that branch protection requires.
+# that branch protection requires. On the release pull request, release-pr checks that it is
+# release-please's one commit on the tip of main.
 name: ci
 
 on:
@@ -242,6 +243,53 @@ jobs:
       - name: Test the scripts
         run: bash .github/scripts/test.sh
 
+  # metadata.yaml lists the release series of the version that .release-please-manifest.json
+  # records. On the release pull request that is the version it releases, whose series a pull
+  # request to main must add first: release-please changes no metadata.yaml.
+  release-series:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the release series
+        run: .github/scripts/release-series.sh
+
+  # The release pull request must be release-please's one commit on the current tip of main, so
+  # that its versioned files and changelog hold every change it releases.
+  release-pr:
+    if: github.event_name == 'pull_request' && github.head_ref == 'release-please--branches--main' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check the release pull request's commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.base_ref }}
+          # The commits of release-please, which acts as the release GitHub App's bot.
+          RELEASE_BOT: 359050260+chalkreleaser[bot]@users.noreply.github.com
+        run: |
+          commit=$(gh api "repos/$GH_REPO/commits/$HEAD" --jq '{author: .commit.author.email, parents: [.parents[].sha]}')
+          author=$(jq -r .author <<<"$commit")
+          parents=$(jq -r '.parents | join(" ")' <<<"$commit")
+          tip=$(gh api "repos/$GH_REPO/git/ref/heads/$BASE" --jq .object.sha)
+          echo "head $HEAD by $author, parents $parents; $BASE is at $tip"
+          if [ "$author" != "$RELEASE_BOT" ] || [ "$(wc -w <<<"$parents")" != 1 ]; then
+            echo "::error title=Not release-please's commit::the release pull request has a commit release-please did not make, such as a merge from Update branch; keep the pull request open, and push to $BASE or run the release workflow again so that release-please rebuilds it"
+            exit 1
+          fi
+          if [ "$parents" != "$tip" ]; then
+            echo "::error title=Older $BASE::the release pull request was built on an older $BASE; release-please rebuilds it within a minute of a push to $BASE"
+            exit 1
+          fi
+
   # A squash merge makes the pull request's title the subject of its commit on main, from which
   # release-please writes the changelog.
   pr-title:
@@ -286,7 +334,7 @@ jobs:
   # required check while the run that "Ready for review" starts has yet to report its own, and a
   # passed result of a ready run would still show after "Convert to draft".
   result:
-    needs: [lint, generate, test, build, govulncheck, e2e, workflows, pr-title, dco]
+    needs: [lint, generate, test, build, govulncheck, e2e, workflows, release-series, release-pr, pr-title, dco]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -303,19 +351,22 @@ jobs:
           E2E: ${{ needs.e2e.result }}
           E2E_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'e2e') }}
           WORKFLOWS: ${{ needs.workflows.result }}
+          RELEASE_SERIES: ${{ needs.release-series.result }}
+          RELEASE_PR: ${{ needs.release-pr.result }}
           PR_TITLE: ${{ needs.pr-title.result }}
           DCO: ${{ needs.dco.result }}
         run: |
           if [ "$DRAFT" = true ]; then
-            echo "::error title=Draft::a draft pull request runs only dco, pr-title, lint and workflows; mark it ready for review to run every check"
+            echo "::error title=Draft::a draft pull request runs only dco, pr-title, lint, workflows and release-series; mark it ready for review to run every check"
             exit 1
           fi
-          echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, e2e: $E2E, workflows: $WORKFLOWS, title: $PR_TITLE, sign-offs: $DCO"
+          echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, e2e: $E2E, workflows: $WORKFLOWS, release series: $RELEASE_SERIES, release pull request: $RELEASE_PR, title: $PR_TITLE, sign-offs: $DCO"
           passed() { [ "$1" = success ] || { [ "$EVENT" != pull_request ] && [ "$1" = skipped ]; }; }
           # The e2e job runs for a pull request with the label e2e and in the nightly run, and
           # passes only when it ran there; elsewhere it skips.
           e2e_selected() { [ "$EVENT" != push ] && { [ "$EVENT" != pull_request ] || [ "$E2E_LABEL" = true ]; }; }
           [ "$LINT" = success ] && [ "$GENERATE" = success ] && [ "$TEST" = success ] &&
             [ "$BUILD" = success ] && [ "$GOVULNCHECK" = success ] && [ "$WORKFLOWS" = success ] &&
+            [ "$RELEASE_SERIES" = success ] && { [ "$RELEASE_PR" = success ] || [ "$RELEASE_PR" = skipped ]; } &&
             { [ "$E2E" = success ] || { ! e2e_selected && [ "$E2E" = skipped ]; }; } &&
             passed "$PR_TITLE" && passed "$DCO"

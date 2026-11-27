@@ -64,6 +64,67 @@ endpoint, and its IP families and pod and service ranges when the Cluster's `clu
 ranges. [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl) is a complete example of a Cluster with
 one control plane and a MachineDeployment of one worker.
 
+## Install
+
+Each release publishes both managers' images to the GitHub Container Registry, as
+`ghcr.io/trevex/cluster-api-provider-chalkos-bootstrap` and
+`ghcr.io/trevex/cluster-api-provider-chalkos-controlplane`. The GitHub release holds the files
+clusterctl installs the providers from: `bootstrap-components.yaml` and
+`control-plane-components.yaml`, which name the images by digest, and `metadata.yaml`. clusterctl
+does not list the chalkos providers itself, so add them to its configuration,
+`~/.config/cluster-api/clusterctl.yaml`:
+
+```yaml
+providers:
+- name: chalkos
+  type: BootstrapProvider
+  url: https://github.com/trevex/cluster-api-provider-chalkos/releases/latest/bootstrap-components.yaml
+- name: chalkos
+  type: ControlPlaneProvider
+  url: https://github.com/trevex/cluster-api-provider-chalkos/releases/latest/control-plane-components.yaml
+```
+
+The URLs take the form clusterctl expects of a GitHub repository, without the `download/` of a
+browser's link. Then install both providers of the same release with an infrastructure provider:
+
+<!-- x-release-please-start-version -->
+```sh
+clusterctl init --bootstrap chalkos:v0.1.0 --control-plane chalkos:v0.1.0 --infrastructure <provider>
+```
+<!-- x-release-please-end -->
+
+The release workflow signs each image and each file of a release with cosign, keylessly as the
+workflow itself, and attests their provenance with GitHub. To check a release's components files
+before you install it, download them with their signatures and verify both:
+
+<!-- x-release-please-start-version -->
+```sh
+gh release download v0.1.0 --repo trevex/cluster-api-provider-chalkos \
+  --pattern '*-components.yaml*' --pattern SHA256SUMS
+for file in bootstrap-components.yaml control-plane-components.yaml; do
+  cosign verify-blob "$file" --bundle "$file.sigstore.json" \
+    --certificate-identity https://github.com/trevex/cluster-api-provider-chalkos/.github/workflows/release.yml@refs/heads/main \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  gh attestation verify "$file" --repo trevex/cluster-api-provider-chalkos
+done
+sha256sum --check --ignore-missing SHA256SUMS
+```
+<!-- x-release-please-end -->
+
+Each components file names its manager's image as `repository:tag@sha256:<digest>`, and the
+release notes list both. Verify an image by that digest:
+
+```sh
+cosign verify ghcr.io/trevex/cluster-api-provider-chalkos-bootstrap@sha256:<digest> \
+  --certificate-identity https://github.com/trevex/cluster-api-provider-chalkos/.github/workflows/release.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/trevex/cluster-api-provider-chalkos-bootstrap@sha256:<digest> \
+  --repo trevex/cluster-api-provider-chalkos
+```
+
+Each image also carries an SPDX SBOM, as a release asset `<image>.spdx.json` and as cosign and
+GitHub attestations on its digest; the release notes show how to fetch it.
+
 ## Quick start
 
 The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK, KubeVirt, CDI
@@ -144,17 +205,19 @@ components files, addressed either on GitHub or on the local filesystem. `make l
 this repository on the local filesystem, so a management cluster can run both providers without a
 release:
 
+<!-- x-release-please-start-version -->
 ```sh
 make local-repo REGISTRY=localhost:5001 IMG_TAG=dev VERSION=v0.1.0
 ```
+<!-- x-release-please-end -->
 
 This builds the bootstrap and control-plane manager images, pushes them to `REGISTRY`, and lays
 out `out/repo/bootstrap-chalkos/$(VERSION)` and `out/repo/control-plane-chalkos/$(VERSION)`, each
 with a components file and a copy of `metadata.yaml`. It also writes `out/clusterctl.yaml`, a
 clusterctl configuration file with `providers:` entries pointing at those components files by
-absolute path. `REGISTRY`, `IMG_TAG` and `VERSION` default to `localhost:5001`, `dev` and
-`v0.1.0`; the registry must be reachable both from the machine running `make`, to push the
-images, and from the management cluster, to pull them.
+absolute path. `REGISTRY` and `IMG_TAG` default to `localhost:5001` and `dev`, and `VERSION` to
+the latest release's version; the registry must be reachable both from the machine running
+`make`, to push the images, and from the management cluster, to pull them.
 
 `make local-repo-manifests` runs the same layout step without building or pushing images. It
 produces the same `out/repo` and `out/clusterctl.yaml`, with the managers pointing at images that
