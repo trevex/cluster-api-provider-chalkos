@@ -31,7 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"connectrpc.com/connect/v2"
 	"github.com/google/go-containerregistry/pkg/authn"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -416,7 +415,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 	case errors.Is(err, sdk.ErrOSCARefused):
 		s.refuse(bootstrapv1.ImageRefusedReason, err.Error(), in)
 		return ctrl.Result{}, nil
-	case reboots(err):
+	case sdk.InstalledAndReboots(err):
 		// The machine accepted an install already and reboots into it.
 		s.cfg.Status.LastInstallTime = ptr.To(metav1.Now())
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, "The machine is installed and reboots")
@@ -428,12 +427,6 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 	log.Info("The machine accepted the install and reboots into it")
 	s.cfg.Status.LastInstallTime = ptr.To(metav1.Now())
 	return r.verify(ctx, s, addr, sec, false)
-}
-
-// reboots tells whether err is chalkd's refusal of an install while the machine reboots into one
-// it accepted. chalkd gives the refusal no reason, so its message tells.
-func reboots(err error) bool {
-	return connect.CodeOf(err) == connect.CodeFailedPrecondition && strings.Contains(err.Error(), "the node is installed and reboots")
 }
 
 // verify asks the machine at addr whether it answers as its node with the image it installed,

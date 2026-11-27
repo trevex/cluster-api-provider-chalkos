@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"connectrpc.com/connect/v2"
@@ -53,6 +52,7 @@ import (
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
 	"github.com/trevex/chalkos/pkg/clustersecrets"
+	sdkkubernetes "github.com/trevex/chalkos/pkg/sdk/layers/kubernetes"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -444,7 +444,7 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	case err == nil:
 		log.Info("The machine bootstrapped the cluster")
 		return ctrl.Result{}, true, nil
-	case bootstrappedAlready(err):
+	case sdkkubernetes.BootstrappedAlready(err):
 		log.Info("The machine is bootstrapped already")
 		return ctrl.Result{}, true, nil
 	case ctx.Err() == nil && (connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded)):
@@ -457,15 +457,6 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	}
 	s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Bootstrapping the Machine %s: %v", m.Name, err))
 	return ctrl.Result{}, false, err
-}
-
-// bootstrappedAlready tells whether err is chalkd's refusal of a bootstrap of a node that is
-// bootstrapped or joined the cluster already. chalkd gives the refusal no reason, so its message
-// tells.
-func bootstrappedAlready(err error) bool {
-	msg := err.Error()
-	return connect.CodeOf(err) == connect.CodeFailedPrecondition &&
-		(strings.Contains(msg, "the node is bootstrapped already") || strings.Contains(msg, "the node joined the cluster already"))
 }
 
 // nodeStatus is the Kubernetes status of the Machine's node, read once per reconcile.

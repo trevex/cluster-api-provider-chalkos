@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/test/builder"
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
+	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -434,7 +435,7 @@ func TestBootstrappedAlreadyIsDone(t *testing.T) {
 	e.fake.Update(addr, func(n *nodetest.Node) {
 		n.Bootstrap = func() error {
 			e.setStatus(addr, kubernetesv1.Phase_PHASE_BOOTSTRAPPED, false)
-			return connect.NewError(connect.CodeFailedPrecondition, "the node is bootstrapped already")
+			return nodetest.Reasoned(connect.CodeFailedPrecondition, nodev1.ErrorReason_ERROR_REASON_BOOTSTRAPPED_ALREADY, "the node is bootstrapped already")
 		}
 	})
 	if _, err := e.reconcile(); err != nil {

@@ -43,6 +43,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/conditions"
 
+	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 	"github.com/trevex/chalkos/pkg/chalkd/layers/kubernetes/kubernetestest"
 	"github.com/trevex/chalkos/pkg/check"
 	"github.com/trevex/chalkos/pkg/config"
@@ -628,7 +629,7 @@ func TestRebootingMachineIsWaitedFor(t *testing.T) {
 	e := newEnv(t, true, kubernetestest.Image)
 	e.machine("w-1", false, addr)
 	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint, Install: func(sdk.InstallRequest) error {
-		return connect.NewError(connect.CodeFailedPrecondition, "the node is installed and reboots")
+		return nodetest.Reasoned(connect.CodeFailedPrecondition, nodev1.ErrorReason_ERROR_REASON_INSTALLED_AND_REBOOTS, "the node is installed and reboots")
 	}})
 	if res := e.mustReconcile("w-1"); res.RequeueAfter == 0 {
 		t.Error("a rebooting machine is not reconciled again")
@@ -640,6 +641,24 @@ func TestRebootingMachineIsWaitedFor(t *testing.T) {
 	}
 	e.mustReconcile("w-1")
 	e.wantInstalls(addr, 1)
+}
+
+// A refusal that says the machine reboots but gives no reason is an install failure: only the
+// reason tells.
+func TestRebootMessageWithoutReasonIsAFailure(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, addr)
+	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint, Install: func(sdk.InstallRequest) error {
+		return connect.NewError(connect.CodeFailedPrecondition, "the node is installed and reboots")
+	}})
+	if _, err := e.reconcile("w-1"); err == nil {
+		t.Error("a refusal without a reason does not fail the reconcile")
+	}
+	c := e.config("w-1")
+	wantReason(t, c, metav1.ConditionFalse, bootstrapv1.InstallingReason)
+	if msg := conditions.GetMessage(c, bootstrapv1.ReadyCondition); !strings.Contains(msg, "The install failed") {
+		t.Errorf("message %q, want the install failure", msg)
+	}
 }
 
 // An install waits for a free install slot.
