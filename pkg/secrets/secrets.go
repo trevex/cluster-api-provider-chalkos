@@ -85,7 +85,7 @@ func Ensure(ctx context.Context, c client.Client, cluster client.ObjectKey, owne
 			},
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
-		Type: corev1.SecretTypeOpaque,
+		Type: clusterv1.ClusterSecretType,
 		Data: map[string][]byte{Key: data},
 	}
 	err = c.Create(ctx, secret)

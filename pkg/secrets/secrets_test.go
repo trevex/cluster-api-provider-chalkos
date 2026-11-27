@@ -32,6 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	"github.com/trevex/chalkos/pkg/clustersecrets"
 
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
@@ -80,8 +82,8 @@ func TestEnsureGeneratesOnce(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKey{Namespace: "lab", Name: "c1-chalkos-secrets"}, &secret); err != nil {
 		t.Fatal(err)
 	}
-	if secret.Type != corev1.SecretTypeOpaque {
-		t.Errorf("type %s, want Opaque", secret.Type)
+	if secret.Type != clusterv1.ClusterSecretType {
+		t.Errorf("type %s, want %s", secret.Type, clusterv1.ClusterSecretType)
 	}
 	if secret.Labels["cluster.x-k8s.io/cluster-name"] != "c1" {
 		t.Errorf("labels %v, want the cluster name", secret.Labels)
