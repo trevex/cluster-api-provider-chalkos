@@ -356,13 +356,13 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 	if s.initialized() {
 		return ctrl.Result{}, nil
 	}
-	if name := s.cp.Status.BootstrappedNode; name != "" && s.machine(name) == nil {
+	if name := s.cp.Status.BootstrappedMachine; name != "" && s.machine(name) == nil {
 		if s.isDeleting(name) {
 			// The Machines' watch reconciles again once it is gone.
 			s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("The bootstrapped Machine %s is being deleted", name))
 			return ctrl.Result{}, nil
 		}
-		s.cp.Status.BootstrappedNode = ""
+		s.cp.Status.BootstrappedMachine = ""
 		s.notInitialized(controlplanev1.BootstrappedMachineGoneReason, fmt.Sprintf("The bootstrapped Machine %s is gone; a new first Machine is bootstrapped", name))
 	}
 	if len(s.machines) == 0 {
@@ -370,14 +370,14 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 	}
 
 	var m *clusterv1.Machine
-	if s.cp.Status.BootstrappedNode == "" {
+	if s.cp.Status.BootstrappedMachine == "" {
 		m = &s.machines[0]
 		if ok, err := r.installed(ctx, m); err != nil || !ok {
 			// The ChalkosConfig's and the Machine's watches reconcile again once it is installed.
 			s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Waiting for the Machine %s to be installed", m.Name))
 			return ctrl.Result{}, err
 		}
-		s.cp.Status.BootstrappedNode = m.Name
+		s.cp.Status.BootstrappedMachine = m.Name
 		s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Bootstrapping the cluster on the Machine %s", m.Name))
 		if err := s.checkpoint(ctx); err != nil {
 			return ctrl.Result{}, err
@@ -388,7 +388,7 @@ func (r *ChalkosControlPlaneReconciler) initialize(ctx context.Context, s *scope
 			return res, err
 		}
 	} else {
-		m = s.machine(s.cp.Status.BootstrappedNode)
+		m = s.machine(s.cp.Status.BootstrappedMachine)
 		st, err := r.nodeStatus(ctx, s, m, sec)
 		if err == nil && st.GetPhase() == kubernetesv1.Phase_PHASE_WAITING {
 			// An earlier call failed before the node committed to the bootstrap, or was never made.

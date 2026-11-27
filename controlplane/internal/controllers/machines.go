@@ -139,7 +139,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 	switch {
 	case !s.initialized() && len(s.machines) > 0:
 		return ctrl.Result{}, nil
-	case !s.initialized() && s.isDeleting(s.cp.Status.BootstrappedNode):
+	case !s.initialized() && s.isDeleting(s.cp.Status.BootstrappedMachine):
 		// A new first Machine waits until the bootstrapped one, and its etcd, are gone.
 		return ctrl.Result{}, nil
 	case s.initialized():

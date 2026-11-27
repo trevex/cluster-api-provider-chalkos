@@ -267,9 +267,9 @@ spec:
                   Available condition is true.
                 format: int32
                 type: integer
-              bootstrappedNode:
+              bootstrappedMachine:
                 description: |-
-                  BootstrappedNode is the control-plane Machine that Bootstrap was called on, recorded
+                  BootstrappedMachine is the control-plane Machine that Bootstrap was called on, recorded
                   before the call so that a retry after a crash does not call Bootstrap on a second Machine.
                 type: string
               conditions:

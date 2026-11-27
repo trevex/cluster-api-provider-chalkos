@@ -185,10 +185,10 @@ type ChalkosControlPlaneStatus struct {
 	// +optional
 	Initialization ChalkosControlPlaneInitialization `json:"initialization,omitempty,omitzero"`
 
-	// BootstrappedNode is the control-plane Machine that Bootstrap was called on, recorded
+	// BootstrappedMachine is the control-plane Machine that Bootstrap was called on, recorded
 	// before the call so that a retry after a crash does not call Bootstrap on a second Machine.
 	// +optional
-	BootstrappedNode string `json:"bootstrappedNode,omitempty"`
+	BootstrappedMachine string `json:"bootstrappedMachine,omitempty"`
 
 	// KubeconfigExpiresAt is when the kubeconfig Secret's client certificate expires.
 	// +optional

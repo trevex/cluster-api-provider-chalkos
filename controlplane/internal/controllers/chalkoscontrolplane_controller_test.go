@@ -400,7 +400,7 @@ func TestBootstrapsOnceAcrossRestart(t *testing.T) {
 	e.mustReconcile()
 	m := e.wantMachines(1)[0]
 	e.mustReconcile()
-	if e.cp().Status.BootstrappedNode != "" {
+	if e.cp().Status.BootstrappedMachine != "" {
 		t.Fatal("bootstrapped before the Machine's config is ready")
 	}
 	e.provision(m, addr, kubernetesv1.Phase_PHASE_WAITING)
@@ -411,8 +411,8 @@ func TestBootstrapsOnceAcrossRestart(t *testing.T) {
 		}
 	})
 	e.mustReconcile()
-	if got := e.cp().Status.BootstrappedNode; got != m.Name {
-		t.Errorf("bootstrappedNode %q, want %s", got, m.Name)
+	if got := e.cp().Status.BootstrappedMachine; got != m.Name {
+		t.Errorf("bootstrappedMachine %q, want %s", got, m.Name)
 	}
 	e.mustReconcile()
 	e.r = e.reconciler()
@@ -464,7 +464,7 @@ func TestBootstrapRetriedWhileWaiting(t *testing.T) {
 		t.Errorf("%d bootstraps, want 2", n)
 	}
 	cp := e.cp()
-	if cp.Status.BootstrappedNode != m.Name || !ptr.Deref(cp.Status.Initialization.ControlPlaneInitialized, false) {
+	if cp.Status.BootstrappedMachine != m.Name || !ptr.Deref(cp.Status.Initialization.ControlPlaneInitialized, false) {
 		t.Errorf("status %+v, want %s bootstrapped and initialized", cp.Status, m.Name)
 	}
 }
@@ -896,14 +896,14 @@ func TestBootstrappedMachineGone(t *testing.T) {
 	if ms := e.wantMachines(1); ms[0].Name != m.Name {
 		t.Fatalf("a new Machine %s while the bootstrapped one is being deleted", ms[0].Name)
 	}
-	if got := e.cp().Status.BootstrappedNode; got != m.Name {
-		t.Fatalf("bootstrappedNode %q while its Machine is being deleted, want %s", got, m.Name)
+	if got := e.cp().Status.BootstrappedMachine; got != m.Name {
+		t.Fatalf("bootstrappedMachine %q while its Machine is being deleted, want %s", got, m.Name)
 	}
 	e.release(m.Name)
 	e.mustReconcile()
 	cp := e.cp()
-	if cp.Status.BootstrappedNode != "" {
-		t.Errorf("bootstrappedNode %q once its Machine is gone, want none", cp.Status.BootstrappedNode)
+	if cp.Status.BootstrappedMachine != "" {
+		t.Errorf("bootstrappedMachine %q once its Machine is gone, want none", cp.Status.BootstrappedMachine)
 	}
 	wantReason(t, cp, controlplanev1.BootstrappedMachineGoneReason, m.Name)
 	if ms := e.wantMachines(1); ms[0].Name == m.Name {
@@ -954,7 +954,7 @@ func TestCrashAfterCheckpoint(t *testing.T) {
 	e.provision(m, addr, kubernetesv1.Phase_PHASE_WAITING)
 	e.bootstrapsTo(addr)
 	cp := e.cp()
-	cp.Status.BootstrappedNode = m.Name
+	cp.Status.BootstrappedMachine = m.Name
 	if err := testClient.Status().Update(t.Context(), cp); err != nil {
 		t.Fatal(err)
 	}
@@ -1046,8 +1046,8 @@ func TestNoBootstrapWithoutAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.mustReconcile()
-	if got := e.cp().Status.BootstrappedNode; got != "" {
-		t.Errorf("bootstrappedNode %q without an InternalIP", got)
+	if got := e.cp().Status.BootstrappedMachine; got != "" {
+		t.Errorf("bootstrappedMachine %q without an InternalIP", got)
 	}
 }
 
