@@ -169,7 +169,8 @@ func (r *ChalkosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		setStatus(s)
 		conditionlog.Changes(ctrl.LoggerFrom(ctx), before, cp.Status.Conditions,
 			controlplanev1.InitializedCondition, controlplanev1.AvailableCondition,
-			controlplanev1.ScalingUpCondition, controlplanev1.MachinesReadyCondition)
+			controlplanev1.ScalingUpCondition, controlplanev1.MachinesReadyCondition,
+			controlplanev1.DeletingCondition)
 		if err := s.patch(ctx); err != nil {
 			rerr = kerrors.NewAggregate([]error{rerr, err})
 		}
@@ -198,6 +199,9 @@ type scope struct {
 	// waitingToJoin is the Machine whose join the next Machine's creation waits for; empty when
 	// it waits for none.
 	waitingToJoin string
+	// deletingReason and deletingMessage are the Deleting condition's reason and message while
+	// the ChalkosControlPlane is being deleted; empty before its Machines were listed.
+	deletingReason, deletingMessage string
 }
 
 // nodeStatus is a node's answer to KubernetesStatus.
@@ -219,6 +223,7 @@ func (s *scope) patch(ctx context.Context) error {
 		patch.WithOwnedConditions{Conditions: []string{
 			controlplanev1.AvailableCondition, controlplanev1.InitializedCondition,
 			controlplanev1.MachinesReadyCondition, controlplanev1.ScalingUpCondition,
+			controlplanev1.DeletingCondition,
 		}},
 		patch.WithStatusObservedGeneration{})
 }
@@ -315,14 +320,17 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 		}
 		ctrl.LoggerFrom(ctx).Info("Deleting the Machine", "machine", s.machines[i].Name)
 	}
-	if len(s.machines)+len(s.deleting) == 0 {
-		ctrl.LoggerFrom(ctx).Info("The Machines are gone; removing the finalizer")
-	}
 	if n := len(s.machines) + len(s.deleting); n > 0 {
+		s.deletingReason = controlplanev1.DeletingWaitingForMachineDeletionReason
+		s.deletingMessage = fmt.Sprintf("Deleting %d Machines", n)
+		if n == 1 {
+			s.deletingMessage = "Deleting 1 Machine"
+		}
 		// The Machines' watch reconciles again as they go; the requeue covers a missed event.
-		s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Deleting %d Machines", n))
 		return ctrl.Result{RequeueAfter: retryAfter}, nil
 	}
+	ctrl.LoggerFrom(ctx).Info("The Machines are gone; removing the finalizer")
+	s.deletingReason, s.deletingMessage = controlplanev1.DeletionCompletedReason, ""
 	controllerutil.RemoveFinalizer(s.cp, controlplanev1.ChalkosControlPlaneFinalizer)
 	return ctrl.Result{}, nil
 }

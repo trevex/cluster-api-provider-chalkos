@@ -195,7 +195,7 @@ type ChalkosControlPlaneStatus struct {
 	KubeconfigExpiresAt *metav1.Time `json:"kubeconfigExpiresAt,omitempty"`
 
 	// Conditions are the ChalkosControlPlane's current observations. Known condition types are
-	// Available, Initialized, MachinesReady, ScalingUp and Paused.
+	// Available, Initialized, MachinesReady, ScalingUp, Deleting and Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

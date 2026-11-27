@@ -44,6 +44,7 @@ func setStatus(s *scope) {
 	} else if !conditions.Has(s.cp, controlplanev1.InitializedCondition) {
 		s.notInitialized(controlplanev1.NotInitializedReason, "The control plane is not initialized yet")
 	}
+	setDeleting(s)
 	if !s.listed {
 		return
 	}
@@ -83,9 +84,15 @@ func setStatus(s *scope) {
 		st.Version = st.Versions[0].Version //nolint:staticcheck // See above.
 	}
 
-	if initialized && ready > 0 {
+	switch {
+	case !s.cp.DeletionTimestamp.IsZero():
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.AvailableCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotAvailableReason,
+			Message: "The control plane is being deleted",
+		})
+	case initialized && ready > 0:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.AvailableCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.AvailableReason})
-	} else {
+	default:
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.AvailableCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotAvailableReason,
 			Message: "The control plane is not initialized or has no ready Machine",
@@ -117,6 +124,26 @@ func setStatus(s *scope) {
 	default:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.MachinesReadyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.MachinesReadyReason})
 	}
+}
+
+// setDeleting sets the Deleting condition: false while the ChalkosControlPlane is not being
+// deleted, and otherwise true with the reason and message its deletion recorded. A deletion that
+// recorded none, as one whose Machines could not be listed, keeps an earlier Deleting condition.
+func setDeleting(s *scope) {
+	if s.cp.DeletionTimestamp.IsZero() {
+		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.DeletingCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotDeletingReason})
+		return
+	}
+	reason, message := s.deletingReason, s.deletingMessage
+	if reason == "" {
+		if conditions.IsTrue(s.cp, controlplanev1.DeletingCondition) {
+			return
+		}
+		reason = clusterv1.DeletingReason
+	}
+	conditions.Set(s.cp, metav1.Condition{
+		Type: controlplanev1.DeletingCondition, Status: metav1.ConditionTrue, Reason: reason, Message: message,
+	})
 }
 
 // compareVersions orders Kubernetes versions by semantic version, and those that are none after

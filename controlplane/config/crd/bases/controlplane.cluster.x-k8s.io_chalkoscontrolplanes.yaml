@@ -275,7 +275,7 @@ spec:
               conditions:
                 description: |-
                   Conditions are the ChalkosControlPlane's current observations. Known condition types are
-                  Available, Initialized, MachinesReady, ScalingUp and Paused.
+                  Available, Initialized, MachinesReady, ScalingUp, Deleting and Paused.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

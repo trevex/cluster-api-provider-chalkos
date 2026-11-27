@@ -823,6 +823,59 @@ func TestDeletionDeletesMachines(t *testing.T) {
 	}
 }
 
+// wantConditionReason fails the test unless the ChalkosControlPlane's condition of the type has
+// the status and reason and its message contains the text.
+func wantConditionReason(t *testing.T, cp *controlplanev1.ChalkosControlPlane, typ string, status metav1.ConditionStatus, reason, text string) {
+	t.Helper()
+	c := conditions.Get(cp, typ)
+	if c == nil || c.Status != status || c.Reason != reason || !strings.Contains(c.Message, text) {
+		t.Fatalf("%s = %+v, want %s with the reason %s and %q", typ, c, status, reason, text)
+	}
+}
+
+// A deleted ChalkosControlPlane reports its deletion in the Deleting condition and as not
+// available, and leaves its Initialized condition alone.
+func TestDeletingCondition(t *testing.T) {
+	e := newEnv(t, 3, true)
+	e.mustReconcile()
+	wantConditionReason(t, e.cp(), controlplanev1.DeletingCondition, metav1.ConditionFalse, controlplanev1.NotDeletingReason, "")
+	initialized := conditions.Get(e.cp(), controlplanev1.InitializedCondition)
+	m := e.hold(e.wantMachines(1)[0].Name)
+
+	// A second finalizer keeps the ChalkosControlPlane once the controller removed its own.
+	cp := e.cp()
+	controllerutil.AddFinalizer(cp, holdFinalizer)
+	if err := testClient.Update(t.Context(), cp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cp := &controlplanev1.ChalkosControlPlane{}
+		if err := testClient.Get(context.Background(), client.ObjectKey{Namespace: e.ns, Name: cpName}, cp); err == nil {
+			controllerutil.RemoveFinalizer(cp, holdFinalizer)
+			_ = testClient.Update(context.Background(), cp)
+		}
+	})
+	if err := testClient.Delete(t.Context(), cp); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	cp = e.cp()
+	wantConditionReason(t, cp, controlplanev1.DeletingCondition, metav1.ConditionTrue, controlplanev1.DeletingWaitingForMachineDeletionReason, "Deleting 1 Machine")
+	wantConditionReason(t, cp, controlplanev1.AvailableCondition, metav1.ConditionFalse, controlplanev1.NotAvailableReason, "being deleted")
+	if c := conditions.Get(cp, controlplanev1.InitializedCondition); c == nil || c.Status != initialized.Status || c.Reason != initialized.Reason || c.Message != initialized.Message {
+		t.Errorf("Initialized = %+v during the deletion, want %+v", c, initialized)
+	}
+
+	e.release(m.Name)
+	e.wantMachines(0)
+	e.mustReconcile()
+	cp = e.cp()
+	if controllerutil.ContainsFinalizer(cp, controlplanev1.ChalkosControlPlaneFinalizer) {
+		t.Error("the finalizer stays after the Machines are gone")
+	}
+	wantConditionReason(t, cp, controlplanev1.DeletingCondition, metav1.ConditionTrue, controlplanev1.DeletionCompletedReason, "")
+}
+
 // A bootstrapped Machine that is deleted before the control plane is initialized is waited for,
 // then forgotten, and a new first Machine is created.
 func TestBootstrappedMachineGone(t *testing.T) {

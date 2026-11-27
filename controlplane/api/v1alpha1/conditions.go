@@ -16,6 +16,8 @@ limitations under the License.
 
 package v1alpha1
 
+import clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 // ChalkosControlPlane's condition types.
 const (
 	// AvailableCondition reports whether the control plane passes all availability checks: at
@@ -34,6 +36,10 @@ const (
 	// ScalingUpCondition reports whether the control plane has fewer Machines than Spec.Replicas
 	// asks for.
 	ScalingUpCondition = "ScalingUp"
+
+	// DeletingCondition reports whether the ChalkosControlPlane is being deleted, and how far its
+	// deletion got.
+	DeletingCondition = clusterv1.DeletingCondition
 
 	// PausedCondition reports whether reconciliation of the ChalkosControlPlane is paused.
 	PausedCondition = "Paused"
@@ -102,4 +108,18 @@ const (
 	// BootstrapRefusedReason documents a ChalkosControlPlane whose first Machine refused the
 	// bootstrap, as one whose Kubernetes files are not prepared yet. The controller tries again.
 	BootstrapRefusedReason = "BootstrapRefused"
+)
+
+// Reasons for the Deleting condition.
+const (
+	// NotDeletingReason documents a ChalkosControlPlane that is not being deleted.
+	NotDeletingReason = clusterv1.NotDeletingReason
+
+	// DeletingWaitingForMachineDeletionReason documents a ChalkosControlPlane whose deletion waits
+	// for its Machines to be deleted.
+	DeletingWaitingForMachineDeletionReason = "WaitingForMachineDeletion"
+
+	// DeletionCompletedReason documents a ChalkosControlPlane whose Machines are deleted, so that
+	// its finalizer is removed.
+	DeletionCompletedReason = clusterv1.DeletionCompletedReason
 )
