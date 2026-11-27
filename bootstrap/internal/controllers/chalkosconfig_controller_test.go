@@ -875,3 +875,39 @@ func TestControlPlaneInitialized(t *testing.T) {
 		t.Error("an update of an initialized Cluster passes")
 	}
 }
+
+// The Cluster watch passes the updates that change the Cluster fields a refusal's inputs
+// include, and drops the others.
+func TestClusterInputsChanged(t *testing.T) {
+	base := &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{
+		ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "10.0.0.1", Port: 6443},
+		ClusterNetwork: clusterv1.ClusterNetwork{
+			Pods: clusterv1.NetworkRanges{CIDRBlocks: []string{"10.244.0.0/16"}},
+		},
+	}}
+	cases := map[string]struct {
+		edit func(*clusterv1.Cluster)
+		want bool
+	}{
+		"conditions": {func(c *clusterv1.Cluster) {
+			c.Status.Conditions = []metav1.Condition{{Type: clusterv1.ReadyCondition, Status: metav1.ConditionTrue}}
+		}, false},
+		"labels":               {func(c *clusterv1.Cluster) { c.Labels = map[string]string{"a": "b"} }, false},
+		"controlPlaneEndpoint": {func(c *clusterv1.Cluster) { c.Spec.ControlPlaneEndpoint.Port = 443 }, true},
+		"clusterNetwork": {func(c *clusterv1.Cluster) {
+			c.Spec.ClusterNetwork.Services.CIDRBlocks = []string{"10.96.0.0/12"}
+		}, true},
+		"controlPlaneRef": {func(c *clusterv1.Cluster) {
+			c.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1.GroupVersion.Group, Kind: "ChalkosControlPlane", Name: "cp",
+			}
+		}, true},
+	}
+	for name, c := range cases {
+		cur := base.DeepCopy()
+		c.edit(cur)
+		if got := clusterInputsChanged().Update(event.UpdateEvent{ObjectOld: base, ObjectNew: cur}); got != c.want {
+			t.Errorf("%s: the update passes %v, want %v", name, got, c.want)
+		}
+	}
+}

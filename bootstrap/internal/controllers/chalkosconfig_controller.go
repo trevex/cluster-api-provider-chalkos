@@ -34,6 +34,7 @@ import (
 	"connectrpc.com/connect/v2"
 	"github.com/google/go-containerregistry/pkg/authn"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -144,6 +145,7 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 			builder.WithPredicates(predicates.Any(mgr.GetScheme(), log,
 				predicates.ClusterPausedTransitions(mgr.GetScheme(), log),
 				controlPlaneInitialized(),
+				clusterInputsChanged(),
 			))).
 		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToConfigs),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
@@ -729,6 +731,27 @@ func controlPlaneInitialized() predicate.Funcs {
 	}
 	return predicate.Funcs{
 		UpdateFunc:  func(e event.UpdateEvent) bool { return !initialized(e.ObjectOld) && initialized(e.ObjectNew) },
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// clusterInputsChanged passes the updates of a Cluster that change the fields an install reads
+// of it: spec.controlPlaneEndpoint, spec.clusterNetwork and spec.controlPlaneRef. A refusal's
+// inputs include them, so such an update retries a refused install.
+func clusterInputsChanged() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok := e.ObjectOld.(*clusterv1.Cluster)
+			cur, ok2 := e.ObjectNew.(*clusterv1.Cluster)
+			if !ok || !ok2 {
+				return false
+			}
+			return old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint ||
+				old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef ||
+				!equality.Semantic.DeepEqual(old.Spec.ClusterNetwork, cur.Spec.ClusterNetwork)
+		},
 		CreateFunc:  func(event.CreateEvent) bool { return false },
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },
 		GenericFunc: func(event.GenericEvent) bool { return false },
