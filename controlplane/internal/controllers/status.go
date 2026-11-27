@@ -69,7 +69,8 @@ func setStatus(s *scope) {
 		counts[m.Spec.Version]++
 	}
 	st.Selector = labels.SelectorFromSet(selectorLabels(s.cp, s.cluster.Name)).String()
-	st.Replicas = ptr.To(n)
+	// As with Cluster API's own control plane, the Machines being deleted count as replicas.
+	st.Replicas = ptr.To(n + int32(len(s.deleting)))
 	st.ReadyReplicas = ptr.To(ready)
 	st.AvailableReplicas = ptr.To(available)
 	st.UpToDateReplicas = ptr.To(current)
@@ -92,10 +93,15 @@ func setStatus(s *scope) {
 		})
 	case initialized && ready > 0:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.AvailableCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.AvailableReason})
+	case initialized:
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.AvailableCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotAvailableReason,
+			Message: "The control plane has no ready Machine",
+		})
 	default:
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.AvailableCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotAvailableReason,
-			Message: "The control plane is not initialized or has no ready Machine",
+			Message: "The control plane is not initialized yet",
 		})
 	}
 

@@ -497,7 +497,7 @@ func TestInitializedOnAddonsApplied(t *testing.T) {
 		t.Fatal("not initialized once the add-ons were applied")
 	}
 	wantCondition(t, cp, controlplanev1.InitializedCondition, metav1.ConditionTrue)
-	wantCondition(t, cp, controlplanev1.AvailableCondition, metav1.ConditionFalse)
+	wantConditionReason(t, cp, controlplanev1.AvailableCondition, metav1.ConditionFalse, controlplanev1.NotAvailableReason, "The control plane has no ready Machine")
 
 	e.setStatus(addr, kubernetesv1.Phase_PHASE_BOOTSTRAPPED, false)
 	m = e.wantMachines(1)[0]
@@ -1001,7 +1001,8 @@ func TestFailedCreateCleansUp(t *testing.T) {
 	}
 }
 
-// A Machine being deleted is neither counted nor waited for to join: its replacement is created.
+// A Machine being deleted is neither counted towards the scale-up nor waited for to join: its
+// replacement is created. status.replicas counts it, as with Cluster API's own control plane.
 func TestDeletingMachinesNotCounted(t *testing.T) {
 	e := newEnv(t, 3, true)
 	first := e.initialize("10.0.0.1")
@@ -1009,8 +1010,8 @@ func TestDeletingMachinesNotCounted(t *testing.T) {
 	e.deleteHeld(second.Name)
 	e.mustReconcile()
 	e.wantMachines(3)
-	if got := ptr.Deref(e.cp().Status.Replicas, -1); got != 2 {
-		t.Errorf("replicas %d, want 2", got)
+	if got := ptr.Deref(e.cp().Status.Replicas, -1); got != 3 {
+		t.Errorf("replicas %d, want 3", got)
 	}
 }
 
