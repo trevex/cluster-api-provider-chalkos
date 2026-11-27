@@ -1,15 +1,48 @@
-# Prepares a runner to run the commands of the flake's ci development shell: installs Nix, wires
-# up the binary cache and restores the Go caches. The ci workflow runs it after the checkout.
+# Prepares a runner to run the commands of the flake's development shells: installs Nix, wires up
+# the binary cache and restores the Go caches. The e2e job also frees disk space and opens KVM and
+# user namespaces to the lab. The ci workflow runs it after the checkout.
 name: nix
 description: Install Nix with the binary cache and restore the Go caches
+
+inputs:
+  free-disk:
+    description: Whether to delete the runner's preinstalled toolchains that no job uses
+    required: false
+    default: "false"
+  kvm:
+    description: Whether to open /dev/kvm and unprivileged user namespaces to every user
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
+    # The lab's chalkos image, its containerDisk, the registry that holds both and the VMs' disks
+    # take more than the runner's free disk.
+    - name: Free disk space
+      if: inputs.free-disk == 'true'
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+        df -h /
+    # KubeVirt runs the lab's VMs on the kind node's /dev/kvm, which the runner opens to the kvm
+    # group alone. Ubuntu's AppArmor keeps unprivileged user namespaces from tools that sandbox
+    # themselves with them; the lab runs as on a workstation, without that restriction.
+    - name: Enable KVM and user namespaces
+      if: inputs.kvm == 'true'
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
     - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
     # The binary cache in the GitHub Actions cache: a job substitutes what main's runs and its
-    # pull request's earlier runs built, such as the ci shell's govulncheck, and uploads what it
-    # builds when it ends. Paths cache.nixos.org signs stay out of it.
+    # pull request's earlier runs built, such as the ci shell's govulncheck or the lab's chalkos
+    # image, and uploads what it builds when it ends. Paths cache.nixos.org signs stay out of it.
     - uses: Mic92/hestia@dfed9ced335d28978ba74e513939a10db1f71025 # v3.1.0
       with:
         version: v3.1.0

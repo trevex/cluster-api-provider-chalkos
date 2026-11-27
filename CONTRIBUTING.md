@@ -102,9 +102,10 @@ END_COMMIT_OVERRIDE
 ```
 
 Open the pull request as a draft while the change is in progress: a draft runs only the sign-off,
-title, lint and workflow checks. Mark it ready for review to run the full CI. Add the label `e2e` when the
-change touches the controllers, the lab or the Cluster API contract, which runs the end-to-end
-test on the pull request.
+title, lint and workflow checks. Mark it ready for review to run the full CI. Add the label `e2e`
+when the change touches the controllers, the lab or the Cluster API contract: CI then runs the
+end-to-end test on the pull request, on a runner with `/dev/kvm`. A push to `main` does not run
+it; the nightly workflow runs it on `main` and opens an issue labelled `ci-failure` when it fails.
 
 ## Licence
 
