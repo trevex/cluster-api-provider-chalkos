@@ -187,3 +187,9 @@ just -f lab/justfile destroy
 
 A run that stops early still deletes the cluster, after it logged the cluster's state on failure.
 `E2E_KEEP=1 make e2e` keeps the cluster of such a run to look at.
+
+## Contributing and security
+
+[CONTRIBUTING.md](CONTRIBUTING.md) describes the development setup, the tests and the rules for
+commits and pull requests. Report a vulnerability privately, as [SECURITY.md](SECURITY.md)
+describes.

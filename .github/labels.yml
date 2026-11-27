@@ -1,0 +1,27 @@
+# The repository's labels, which the labels workflow creates or updates on a push to main.
+- name: e2e
+  color: "5319e7"
+  description: Run the end-to-end test on this pull request
+- name: ci-failure
+  color: "b60205"
+  description: CI failed on main or in the nightly run
+- name: flaky
+  color: "fbca04"
+  description: A check failed on main or in the nightly run and passed on its retry
+- name: dependencies
+  color: "0366d6"
+  description: Updates a dependency
+- name: security
+  color: "d93f0b"
+  description: Fixes a known vulnerability
+- name: release
+  color: "0e8a16"
+  description: Prepares a release
+# release-please finds its open release pull request by autorelease: pending and e2e, and marks
+# it autorelease: tagged once it has tagged the release.
+- name: "autorelease: pending"
+  color: "ededed"
+  description: The release pull request, which release-please tags once it is merged
+- name: "autorelease: tagged"
+  color: "ededed"
+  description: A merged release pull request whose release release-please has tagged
