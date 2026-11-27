@@ -196,9 +196,12 @@ type scope struct {
 	// statuses are the Kubernetes statuses of the Machines' nodes read in this reconcile, by
 	// Machine name, so that each node is asked once.
 	statuses map[string]nodeStatus
-	// waitingToJoin is the Machine whose join the next Machine's creation waits for; empty when
-	// it waits for none.
-	waitingToJoin string
+	// scaleUpWaiting is what the next Machine's creation waits for, such as a Machine's join;
+	// empty when it waits for nothing.
+	scaleUpWaiting string
+	// scaleDownWaiting is why the next scale-down step may not start yet, for the ScalingDown
+	// condition; empty when it may.
+	scaleDownWaiting string
 	// removing and removingReason are what the pre-terminate hook of the Machine it removes waits
 	// on, for the ScalingDown and Deleting conditions; empty while no hook waits.
 	removing, removingReason string
@@ -321,6 +324,11 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 		return ctrl.Result{}, err
 	}
 	res = earliest(earliest(res, scale), hooks)
+	down, err := r.scaleDown(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	res = earliest(res, down)
 	if !s.initialized() {
 		return res, nil
 	}

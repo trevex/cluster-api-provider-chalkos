@@ -90,8 +90,9 @@ var errNoAddress = errors.New("the Machine has no InternalIP")
 // reconcileHooks runs the pre-terminate hook of the control plane's Machines being deleted, one
 // at a time, oldest deletion first. A Machine whose machine was never reached to be installed
 // loses its hook at once. Once Cluster API waits for the hook, a Machine leaves etcd and is
-// revoked through another control plane, unless it is the control plane's last Machine, and
-// loses its hook. Every step can be repeated; one that cannot finish keeps the hook and is tried
+// revoked through another control plane, and loses its hook. The last Machine of a control plane
+// being deleted, or not initialized, leaves no etcd and is not revoked; that of an initialized
+// control plane that stays waits for its replacement. Every step can be repeated; one that cannot finish keeps the hook and is tried
 // again after machineutil.HookRetry.
 func (r *ChalkosControlPlaneReconciler) reconcileHooks(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	pending := slices.DeleteFunc(slices.Clone(s.deleting), func(m clusterv1.Machine) bool { return !machineutil.HasHook(&m) })
@@ -126,6 +127,13 @@ func (r *ChalkosControlPlaneReconciler) reconcileHooks(ctx context.Context, s *s
 				peers = append(peers, p)
 			}
 		}
+	}
+	if len(peers) == 0 && s.initialized() && s.cp.DeletionTimestamp.IsZero() {
+		// The control plane's only Machine goes while the control plane stays: it keeps the
+		// cluster's etcd until its replacement, which scaleUp creates, joined it. The replacement's
+		// creation reconciles again.
+		s.removing = fmt.Sprintf("the Machine %s waits for its replacement control plane to join etcd", m.Name)
+		return ctrl.Result{}, nil
 	}
 	if len(peers) > 0 {
 		// The calls to the nodes share one deadline; the writes to the management cluster do not.

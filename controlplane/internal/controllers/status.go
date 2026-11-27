@@ -109,12 +109,12 @@ func setStatus(s *scope) {
 	switch want := ptr.Deref(s.cp.Spec.Replicas, 1); {
 	case n < want && s.cp.DeletionTimestamp.IsZero():
 		msg := fmt.Sprintf("Scaling up from %d to %d replicas", n, want)
-		if s.waitingToJoin != "" {
-			msg += fmt.Sprintf("; waiting for the Machine %s to join the cluster", s.waitingToJoin)
+		if s.scaleUpWaiting != "" {
+			msg += "; " + s.scaleUpWaiting
 		}
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.ScalingUpReason,
-			Message: msg,
+			Message: machineutil.Truncate(msg),
 		})
 	default:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason})
@@ -132,6 +132,11 @@ func setStatus(s *scope) {
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionTrue, Reason: reason,
 			Message: machineutil.Truncate("Removing a control plane: " + s.removing),
+		})
+	case n > want && s.scaleDownWaiting != "":
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.ScalingDownWaitingReason,
+			Message: machineutil.Truncate(s.scaleDownWaiting),
 		})
 	case n > want:
 		conditions.Set(s.cp, metav1.Condition{

@@ -1007,10 +1007,12 @@ func TestFailedCreateCleansUp(t *testing.T) {
 }
 
 // A Machine being deleted is neither counted towards the scale-up nor waited for to join: its
-// replacement is created. status.replicas counts it, as with Cluster API's own control plane.
+// replacement is created, as etcd lists the joined Machine only. status.replicas counts it, as
+// with Cluster API's own control plane.
 func TestDeletingMachinesNotCounted(t *testing.T) {
 	e := newEnv(t, 3, true)
 	first := e.initialize("10.0.0.1")
+	e.setMembers([]clusterv1.Machine{first}, map[string]string{first.Name: "10.0.0.1"})
 	second := other(e.wantMachines(2), first.Name)
 	e.deleteHeld(second.Name)
 	e.mustReconcile()

@@ -131,7 +131,10 @@ func (r *ChalkosControlPlaneReconciler) markUpToDate(ctx context.Context, s *sco
 
 // scaleUp creates the control plane's next Machine while it has fewer than it asks for: the first
 // at once, every other only once the control plane is initialized and each Machine it has joined
-// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted.
+// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted,
+// so that it is replaced, but while one is, etcd must list only healthy voting members of the
+// Machines: the replacement of a single control plane joins its etcd, while one of several that
+// is down and still a member keeps etcd from growing by a member it may lose quorum with.
 func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	if len(s.machines) >= int(ptr.Deref(s.cp.Spec.Replicas, 1)) {
 		return ctrl.Result{}, nil
@@ -146,8 +149,14 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 		for i := range s.machines {
 			ok, err := r.joined(ctx, s, &s.machines[i], sec)
 			if err != nil || !ok {
-				s.waitingToJoin = s.machines[i].Name
+				s.scaleUpWaiting = fmt.Sprintf("waiting for the Machine %s to join the cluster", s.machines[i].Name)
 				return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, err
+			}
+		}
+		if len(s.deleting) > 0 {
+			if why := r.etcdProblem(ctx, s, sec); why != "" {
+				s.scaleUpWaiting = "waiting while a Machine is deleted: " + why
+				return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 			}
 		}
 	}
