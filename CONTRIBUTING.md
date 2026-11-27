@@ -37,11 +37,13 @@ The generated files are committed. A change to an API type or a kubebuilder mark
 ## The lab and the end-to-end test
 
 The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK, KubeVirt and
-both providers, and boots chalkos VMs on it. `make e2e` creates the workload cluster `lab` there,
-checks it and deletes it:
+both providers, and boots chalkos VMs on it from chalkos's released images. `just -f lab/justfile
+up` installs the released providers; the tests run the providers of your checkout, which
+`providers-local` builds and installs. `make e2e` creates the workload cluster `lab` there, checks
+it and deletes it:
 
 ```sh
-just -f lab/justfile registry create kubevirt images providers
+just -f lab/justfile create kubevirt providers-local
 make e2e
 just -f lab/justfile destroy
 ```
@@ -118,7 +120,7 @@ days before Renovate proposes it.
 
 | Group | What it updates | Labels | Merge |
 | --- | --- | --- | --- |
-| `chalkos` | The chalkos release of `go.mod` and of the flake input, as soon as chalkos publishes it | `dependencies`, `e2e` | by hand |
+| `chalkos` | The chalkos release of `go.mod` and of the flake input, whose images the lab boots, as soon as chalkos publishes it | `dependencies`, `e2e` | by hand |
 | `go-kubernetes` | The modules `k8s.io/*` and `sigs.k8s.io/*`, Cluster API and controller-runtime among them | `dependencies`, `e2e` | by hand |
 | `go-x` | The modules `golang.org/x/*` | `dependencies` | by hand |
 | `go-deps` | Every other Go module's patch and minor releases | `dependencies` | by hand |

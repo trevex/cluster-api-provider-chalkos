@@ -1,12 +1,9 @@
-# CDI imports each VM's DataVolume from the lab's registry, which serves plain HTTP.
+# CDI imports each VM's DataVolume from chalkos's containerDisk on ghcr.io.
 apiVersion: cdi.kubevirt.io/v1beta1
 kind: CDI
 metadata:
   name: cdi
 spec:
-  config:
-    insecureRegistries:
-    - kind-registry:5000
   imagePullPolicy: IfNotPresent
   workload:
     nodeSelector:

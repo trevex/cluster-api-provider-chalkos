@@ -7,7 +7,7 @@ the API-driven, immutable NixOS-based Linux distribution. The bootstrap provider
 Machine's chalkos node over chalkd's API. The control-plane provider creates a cluster's
 control-plane Machines one at a time, bootstraps the cluster on the first, and keeps the cluster's
 kubeconfig Secret current. See [`lab/`](lab/) for a KubeVirt-based lab that runs both providers
-against chalkos virtual machines end to end.
+against chalkos virtual machines end to end, from released images without building anything.
 
 ## Status and limitations
 
@@ -85,7 +85,9 @@ providers:
 ```
 
 The URLs take the form clusterctl expects of a GitHub repository, without the `download/` of a
-browser's link. Then install both providers of the same release with an infrastructure provider:
+browser's link. The lab passes the same entries to clusterctl as
+[`lab/clusterctl.yaml`](lab/clusterctl.yaml). Then install both providers of the same release with
+an infrastructure provider:
 
 <!-- x-release-please-start-version -->
 ```sh
@@ -128,25 +130,41 @@ GitHub attestations on its digest; the release notes show how to fetch it.
 ## Quick start
 
 The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK, KubeVirt, CDI
-and both providers, and creates the workload cluster `lab` of chalkos VMs on it. It needs Nix with
-flakes and Docker. The two VMs take 5 GiB of memory on top of the kind cluster. With `/dev/kvm`
-the VMs run hardware-accelerated; without it, KubeVirt emulates them. All state lives in `.lab/`
-of the repository.
+and both providers, and creates the workload cluster `lab` of chalkos VMs on it. It builds
+nothing: the VMs boot chalkos's released images from `ghcr.io`, and the providers are the latest
+release. It needs Nix with flakes, Docker and internet access. The two VMs take 5 GiB of memory on
+top of the kind cluster. With `/dev/kvm` the VMs run hardware-accelerated; without it, KubeVirt
+emulates them. All state lives in `.lab/` of the repository.
 
-From the devshell (`nix develop`), run the recipes in order:
+From the devshell (`nix develop`), create the lab and the workload cluster, then look at it:
 
 ```sh
-just -f lab/justfile registry create kubevirt images providers cluster
+just -f lab/justfile up
 just -f lab/justfile describe
 just -f lab/justfile kt get nodes
 ```
 
-`registry` and `create` start a local registry and the kind cluster. `kubevirt` installs KubeVirt
-and CDI. `images` builds the chalkos image and the VMs' containerDisk and pushes both. `providers`
-builds and installs the chalkos providers with Cluster API, cert-manager and CAPK. `cluster`
-creates the workload cluster from [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl). `describe`
-shows its state, and `kt` runs kubectl against it. `just -f lab/justfile destroy` deletes the
-kind cluster and the registry with its storage.
+`up` runs four recipes in order. `create` starts the kind cluster. `kubevirt` installs KubeVirt
+and CDI. `providers` installs the chalkos providers of the release that `provider_version` in
+[`lab/justfile`](lab/justfile) names, with Cluster API, cert-manager and CAPK, from the GitHub
+release that [`lab/clusterctl.yaml`](lab/clusterctl.yaml) points clusterctl at. `cluster` creates
+the workload cluster from [`lab/cluster.yaml.tmpl`](lab/cluster.yaml.tmpl). `describe` shows its
+state, and `kt` runs kubectl against it. `just -f lab/justfile destroy` deletes the kind cluster
+with the workload cluster.
+
+The VMs boot `ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm` of the chalkos release that `go.mod`
+requires, for the Kubernetes minor that `kubernetes_minor` in the justfile names. CDI imports each
+VM's disk from its containerDisk, `ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm-disk`, and the
+providers install the nodes in place from the image itself. `cluster` resolves both tags to
+digests, and sets the cluster's Kubernetes version to the one the image carries.
+
+To run the providers of your checkout instead, run `providers-local` in place of `providers`. It
+builds both managers' images, loads them into the kind node and installs them from a local
+clusterctl repository; on a lab whose providers run already, it rolls them out to the new images:
+
+```sh
+just -f lab/justfile create kubevirt providers-local cluster
+```
 
 The lab installs the Cluster API core release that `go.mod` builds the providers against. The
 devshell's `clusterctl` runs `go tool clusterctl`, a tool that `go.mod` names, so it is of the same
@@ -242,10 +260,11 @@ clusterctl init \
 `make e2e` runs the lab's scenario against a running lab: it creates the workload cluster `lab`
 of one control plane and one worker, waits for the control plane to become available and both
 nodes to become Ready, checks the providers' statuses and the kubeconfig's certificate, and then
-deletes the cluster and waits until its Machines and VMs are gone. It skips unless the lab runs:
+deletes the cluster and waits until its Machines and VMs are gone. It skips unless the lab runs.
+The test is for the providers of the checkout, so start the lab with `providers-local`:
 
 ```sh
-just -f lab/justfile registry create kubevirt images providers
+just -f lab/justfile create kubevirt providers-local
 make e2e
 just -f lab/justfile destroy
 ```

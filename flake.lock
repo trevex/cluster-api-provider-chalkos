@@ -28,16 +28,16 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1795776124,
-        "narHash": "sha256-mvIuBPTDbphQXFHHTFbBIt7Les2n8xDyNm6PGpGKurU=",
+        "lastModified": 1795791846,
+        "narHash": "sha256-EMl3Kj763WR4UuN2YFfs/NPTf9l6mdUR2HV8JB1/2l0=",
         "owner": "trevex",
         "repo": "chalkos",
-        "rev": "61a8a2836d4bec5e1da6408e5be07df5c334546b",
+        "rev": "163b652e8dfd883a169f47e461c9028a5e7cc22c",
         "type": "github"
       },
       "original": {
         "owner": "trevex",
-        "ref": "v0.8.0",
+        "ref": "v0.9.0",
         "repo": "chalkos",
         "type": "github"
       }

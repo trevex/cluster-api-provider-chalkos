@@ -1,7 +1,8 @@
 # The lab's workload cluster: one control plane and one worker, each a KubeVirt VM that boots the
 # chalkos Kubernetes image from its own DataVolume and is installed in place over chalkd.
-# The justfile's cluster recipe replaces @IMAGE@ with the chalkos image by digest and @REGISTRY@
-# with the host the nodes pull it from.
+# The justfile's cluster recipe replaces @IMAGE@ with chalkos's released image by digest, @DISK@
+# with its containerDisk by digest and @VERSION@ with the Kubernetes release the image carries.
+# CDI, the providers and the nodes pull them from ghcr.io.
 #
 # The workload cluster's pod and service ranges stay clear of kind's, 10.244.0.0/16 and
 # 10.96.0.0/16: the VMs' own addresses are kind pod addresses, and the API server's endpoint is a
@@ -60,7 +61,8 @@ spec:
             spec:
               source:
                 registry:
-                  url: docker://kind-registry:5000/chalkos-kvm-disk:dev
+                  url: "docker://@DISK@"
+              # At least the containerDisk's virtual size, 7554 MiB.
               storage:
                 accessModes: [ReadWriteOnce]
                 resources:
@@ -125,7 +127,7 @@ spec:
             spec:
               source:
                 registry:
-                  url: docker://kind-registry:5000/chalkos-kvm-disk:dev
+                  url: "docker://@DISK@"
               storage:
                 accessModes: [ReadWriteOnce]
                 resources:
@@ -171,7 +173,7 @@ metadata:
   namespace: default
 spec:
   replicas: 1
-  version: v1.37.2
+  version: "@VERSION@"
   image: "@IMAGE@"
   machineTemplate:
     spec:
@@ -206,13 +208,6 @@ spec:
     spec:
       match: {name: "en*"}
       network: {dhcp: ipv4}
-  # The lab's registry serves the chalkos image over plain HTTP.
-  - apiVersion: oci.chalkos.dev/v1alpha1
-    kind: Registry
-    metadata: {name: lab}
-    spec:
-      host: "@REGISTRY@"
-      insecure: true
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1alpha1
 kind: ChalkosConfigTemplate
@@ -241,7 +236,7 @@ spec:
         cluster.x-k8s.io/deployment-name: lab-workers
     spec:
       clusterName: lab
-      version: v1.37.2
+      version: "@VERSION@"
       bootstrap:
         configRef:
           apiGroup: bootstrap.cluster.x-k8s.io

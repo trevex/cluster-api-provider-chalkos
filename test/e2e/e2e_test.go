@@ -20,7 +20,7 @@ limitations under the License.
 // lab of one control plane and one worker, checks that its nodes join and that the providers
 // report them installed, and deletes it again. The lab must run already, as after
 //
-//	just -f lab/justfile registry create kubevirt images providers
+//	just -f lab/justfile create kubevirt providers-local
 //
 // and the test skips otherwise. A run that stops early deletes the cluster too, unless E2E_KEEP=1.
 package e2e
@@ -259,7 +259,7 @@ func newLab(t *testing.T) *lab {
 	kubeconfig := filepath.Join(root, ".lab", "kind.kubeconfig")
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		t.Skipf("the lab does not run (%v); run: just -f lab/justfile registry create kubevirt images providers", err)
+		t.Skipf("the lab does not run (%v); run: just -f lab/justfile create kubevirt providers-local", err)
 	}
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, clusterv1.AddToScheme, bootstrapv1.AddToScheme, controlplanev1.AddToScheme} {
@@ -275,7 +275,7 @@ func newLab(t *testing.T) *lab {
 		var d appsv1.Deployment
 		err := c.Get(t.Context(), client.ObjectKey{Namespace: p[0], Name: p[1]}, &d)
 		if err != nil || !deploymentAvailable(&d) {
-			t.Skipf("the lab's provider %s/%s is not available (%v); run: just -f lab/justfile registry create kubevirt images providers", p[0], p[1], err)
+			t.Skipf("the lab's provider %s/%s is not available (%v); run: just -f lab/justfile create kubevirt providers-local", p[0], p[1], err)
 		}
 	}
 	return &lab{t: t, root: root, kubeconfig: kubeconfig, c: c}

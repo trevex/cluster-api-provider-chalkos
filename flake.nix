@@ -5,14 +5,13 @@
   # chalkos builds for itself, and both repositories move together when chalkos's pin is bumped.
   # The input names the chalkos release that go.mod requires, and Renovate bumps both together.
   inputs = {
-    chalkos.url = "github:trevex/chalkos/v0.8.0";
+    chalkos.url = "github:trevex/chalkos/v0.9.0";
     nixpkgs.follows = "chalkos/nixpkgs";
     go-overlay.follows = "chalkos/go-overlay";
   };
 
   outputs =
     {
-      chalkos,
       nixpkgs,
       go-overlay,
       ...
@@ -24,11 +23,8 @@
       go = (go-overlay.lib.mkGoBin pkgs).fromGoModStrict ./go.mod;
     in
     {
-      # The images of the KubeVirt lab in lab/: lab-image, lab-image-oci and lab-disk.
-      packages.${system} = import ./nix/lab-images.nix { inherit chalkos pkgs; };
-
       devShells.${system} = rec {
-        # The tools of CI's Go jobs, without the lab's, whose chalkbuild builds from source.
+        # The tools of CI's Go jobs, without the lab's.
         ci = pkgs.mkShell {
           packages = [
             go
@@ -66,10 +62,9 @@
             (pkgs.writeShellScriptBin "clusterctl" ''exec go tool clusterctl "$@"'')
             pkgs.kubevirt # virtctl
             pkgs.just
+            # Resolve chalkos's released images to their digests and read their annotations.
             pkgs.crane
-            pkgs.qemu # qemu-img
-            # Pushes the lab's chalkos image to the lab's registry.
-            chalkos.packages.${system}.chalkbuild
+            pkgs.jq
           ];
         };
       };
