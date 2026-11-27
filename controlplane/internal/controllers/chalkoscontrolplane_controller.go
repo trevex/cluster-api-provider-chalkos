@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -95,6 +96,8 @@ type ChalkosControlPlaneReconciler struct {
 	// Clock tells the time the cluster's secrets and kubeconfig certificates are issued at; nil is
 	// the real clock.
 	Clock clock.PassiveClock
+	// Recorder records the events of the control planes' pre-terminate hooks; nil records none.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes,verbs=get;list;watch;update;patch
@@ -108,6 +111,7 @@ type ChalkosControlPlaneReconciler struct {
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;create;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // SetupWithManager registers the reconciler with mgr.
 func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
@@ -123,6 +127,7 @@ func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 			builder.WithPredicates(predicates.Any(scheme, log,
 				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(scheme, log),
 				clusterEndpointOrControlPlaneChanged(),
+				machineutil.ClusterDeletionStarted(),
 			))).
 		Complete(r)
 }
@@ -273,6 +278,13 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err := r.markUpToDate(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
+	if !s.cluster.DeletionTimestamp.IsZero() {
+		if err := r.removeAllHooks(ctx, s); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if err := r.addHooks(ctx, s); err != nil {
+		return ctrl.Result{}, err
+	}
 	if !s.cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		// The Cluster's watch reconciles again once the endpoint is set.
 		s.notInitialized(controlplanev1.NotInitializedReason, "The Cluster has no controlPlaneEndpoint yet")
@@ -310,6 +322,11 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result, error) {
 	if err := r.listMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
+	}
+	if !s.cluster.DeletionTimestamp.IsZero() {
+		if err := r.removeAllHooks(ctx, s); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	var renew time.Duration
 	if s.initialized() {
@@ -517,7 +534,6 @@ func earliest(a, b ctrl.Result) ctrl.Result {
 	return b
 }
 
-
 // uncached is a client that reads with reader and writes with its Client: secrets.Ensure must not
 // read the Secret from a cache that does not hold it yet, or it would generate the secrets again,
 // and an infrastructure template is read without an informer for its kind.
@@ -530,7 +546,6 @@ type uncached struct {
 func (u uncached) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	return u.reader.Get(ctx, key, obj, opts...)
 }
-
 
 // isControlPlaneRef tells whether ref names a ChalkosControlPlane.
 func isControlPlaneRef(ref metav1.OwnerReference) bool {

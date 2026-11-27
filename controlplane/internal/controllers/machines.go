@@ -207,10 +207,19 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 		return nil, r.cleanUp(ctx, fmt.Errorf("create the ChalkosConfig: %w", err), infra)
 	}
 
+	// Only the Machine carries the pre-terminate hook; a Machine created while the Cluster is being
+	// deleted needs none.
+	machineAnnotations := maps.Clone(annotations)
+	if s.cluster.DeletionTimestamp.IsZero() {
+		if machineAnnotations == nil {
+			machineAnnotations = map[string]string{}
+		}
+		machineAnnotations[machineutil.HookAnnotation] = machineutil.ControlPlaneHookOwner
+	}
 	deletion := cp.Spec.MachineTemplate.Spec.Deletion
 	m := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: annotations,
+			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: machineAnnotations,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cp, controlPlaneKind)},
 		},
 		Spec: clusterv1.MachineSpec{

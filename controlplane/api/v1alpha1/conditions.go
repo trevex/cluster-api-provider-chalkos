@@ -127,3 +127,22 @@ const (
 	// its finalizer is removed.
 	DeletionCompletedReason = clusterv1.DeletionCompletedReason
 )
+
+// ScalingDownCondition reports whether the control plane removes a Machine: it has more Machines
+// than Spec.Replicas asks for, or a Machine is being deleted and its pre-terminate hook runs.
+const ScalingDownCondition = "ScalingDown"
+
+// Reasons for the ScalingDown condition.
+const (
+	// ScalingDownReason documents a ChalkosControlPlane that removes a Machine; the message names
+	// the Machine and the step it waits on.
+	ScalingDownReason = "ScalingDown"
+
+	// ScalingDownWaitingReason documents a ChalkosControlPlane with more Machines than
+	// Spec.Replicas asks for that may not start a step yet, as while a Machine has not joined or
+	// etcd is not healthy; the message says why.
+	ScalingDownWaitingReason = "WaitingToScaleDown"
+
+	// NotScalingDownReason documents a ChalkosControlPlane that removes no Machine.
+	NotScalingDownReason = "NotScalingDown"
+)

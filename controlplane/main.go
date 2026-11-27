@@ -53,6 +53,7 @@ func main() {
 			BootstrapTimeout:        bootstrapTimeout,
 			MaxConcurrentReconciles: concurrency,
 			WatchFilterValue:        opts.WatchFilter,
+			Recorder:                mgr.GetEventRecorder("control-plane-chalkos"),
 		}
 		return r.SetupWithManager(ctx, mgr)
 	})

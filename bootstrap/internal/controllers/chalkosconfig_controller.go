@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -120,6 +121,8 @@ type ChalkosConfigReconciler struct {
 	// WatchFilterValue, when set, limits the controller to objects whose
 	// cluster.x-k8s.io/watch-filter label has this value.
 	WatchFilterValue string
+	// Recorder records the events of the workers' pre-terminate hooks; nil records none.
+	Recorder events.EventRecorder
 
 	slotsOnce sync.Once
 	slots     chan struct{}
@@ -130,9 +133,11 @@ type ChalkosConfigReconciler struct {
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigtemplates,verbs=get;list;watch
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machines,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // SetupWithManager registers the reconciler with mgr.
 func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
@@ -147,6 +152,7 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 			builder.WithPredicates(predicates.Any(mgr.GetScheme(), log,
 				predicates.ClusterPausedTransitions(mgr.GetScheme(), log),
 				controlPlaneInitialized(),
+				machineutil.ClusterDeletionStarted(),
 				clusterInputsChanged(),
 			))).
 		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToConfigs),
@@ -206,7 +212,7 @@ func (s *scope) track() error {
 // patch writes the ChalkosConfig's changes.
 func (s *scope) patch(ctx context.Context) error {
 	return s.helper.Patch(ctx, s.cfg,
-		patch.WithOwnedConditions{Conditions: []string{bootstrapv1.ReadyCondition, bootstrapv1.InstalledCondition}},
+		patch.WithOwnedConditions{Conditions: []string{bootstrapv1.ReadyCondition, bootstrapv1.InstalledCondition, bootstrapv1.NodeRemovedCondition}},
 		patch.WithStatusObservedGeneration{})
 }
 
@@ -230,6 +236,11 @@ func (s *scope) setReady(status metav1.ConditionStatus, reason, message string) 
 	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.ReadyCondition, Status: status, Reason: reason, Message: machineutil.Truncate(message)})
 }
 
+// nodeRemoved sets the NodeRemoved condition.
+func (s *scope) nodeRemoved(status metav1.ConditionStatus, reason, message string) {
+	conditions.Set(s.cfg, metav1.Condition{Type: bootstrapv1.NodeRemovedCondition, Status: status, Reason: reason, Message: machineutil.Truncate(message)})
+}
+
 // refuse reports that the config or the image was refused, as reason says, for the inputs, which
 // a retry does not change.
 func (s *scope) refuse(reason, message, inputs string) {
@@ -248,6 +259,11 @@ func (s *scope) bootImageRefused() bool {
 func (r *ChalkosConfigReconciler) reconcile(ctx context.Context, s *scope) (ctrl.Result, error) {
 	if err := r.ensureDataSecret(ctx, s); err != nil {
 		return ctrl.Result{}, err
+	}
+	if !util.IsControlPlaneMachine(s.machine) {
+		if res, done, err := r.reconcileHook(ctx, s); done {
+			return res, err
+		}
 	}
 	installed := ptr.Deref(s.cfg.Status.Installed, false)
 	if !installed && !s.machine.DeletionTimestamp.IsZero() {
@@ -600,7 +616,6 @@ func machineOf(m *clusterv1.Machine, cluster *clusterv1.Cluster) documents.Machi
 	}
 }
 
-
 // recordFingerprint appends the fingerprint seen at now unless it is the last one recorded,
 // keeping the newest maxFingerprints. It tells whether it appended the fingerprint.
 func recordFingerprint(cfg *bootstrapv1.ChalkosConfig, fingerprint string, now time.Time) bool {
@@ -612,7 +627,6 @@ func recordFingerprint(cfg *bootstrapv1.ChalkosConfig, fingerprint string, now t
 	cfg.Status.MaintenanceFingerprints = slices.Clone(fps[max(0, len(fps)-maxFingerprints):])
 	return true
 }
-
 
 // machineToConfig maps a Machine to its ChalkosConfig.
 func machineToConfig(_ context.Context, o client.Object) []ctrl.Request {
@@ -694,8 +708,8 @@ func (c *imageCache) add(key string, a *ociimage.Artifact) {
 
 // machineChanged passes the creation and deletion of a Machine, and the updates that change what
 // a reconcile reads of it: its providerID, addresses, version, labels, bootstrap data Secret,
-// infrastructure's readiness and deletion. The periodic verify of an installed machine covers
-// any other change.
+// infrastructure's readiness, deletion, pre-terminate hook and Deleting condition's reason. The
+// periodic verify of an installed machine covers any other change.
 func machineChanged() predicate.Funcs {
 	return predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -710,7 +724,9 @@ func machineChanged() predicate.Funcs {
 				!maps.Equal(old.Labels, cur.Labels) ||
 				!ptr.Equal(old.Spec.Bootstrap.DataSecretName, cur.Spec.Bootstrap.DataSecretName) ||
 				!ptr.Equal(old.Status.Initialization.InfrastructureProvisioned, cur.Status.Initialization.InfrastructureProvisioned) ||
-				!old.DeletionTimestamp.Equal(cur.DeletionTimestamp)
+				!old.DeletionTimestamp.Equal(cur.DeletionTimestamp) ||
+				old.Annotations[machineutil.HookAnnotation] != cur.Annotations[machineutil.HookAnnotation] ||
+				machineutil.DeletingReason(old) != machineutil.DeletingReason(cur)
 		},
 	}
 }
