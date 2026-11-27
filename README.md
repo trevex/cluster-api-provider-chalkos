@@ -57,3 +57,6 @@ just -f lab/justfile registry create kubevirt images providers
 make e2e
 just -f lab/justfile destroy
 ```
+
+A run that stops early still deletes the cluster, after it logged the cluster's state on failure.
+`E2E_KEEP=1 make e2e` keeps the cluster of such a run to look at.

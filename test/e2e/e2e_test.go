@@ -22,7 +22,7 @@ limitations under the License.
 //
 //	just -f lab/justfile registry create kubevirt images providers
 //
-// and the test skips otherwise.
+// and the test skips otherwise. A run that stops early deletes the cluster too, unless E2E_KEEP=1.
 package e2e
 
 import (
@@ -99,26 +99,32 @@ func TestLab(t *testing.T) {
 	l := newLab(t)
 	ctx := t.Context()
 	start := time.Now()
-	t.Cleanup(func() {
-		if t.Failed() {
-			l.diagnose()
-		}
-	})
 
+	clusterKey := client.ObjectKey{Namespace: namespace, Name: clusterName}
 	var existing clusterv1.Cluster
-	switch err := l.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: clusterName}, &existing); {
+	switch err := l.c.Get(ctx, clusterKey, &existing); {
 	case err == nil:
 		t.Fatalf("the Cluster %s/%s exists already; delete it first", namespace, clusterName)
 	case !apierrors.IsNotFound(err):
 		t.Fatal(err)
 	}
+	// Cleanups run last first: a failed run is diagnosed before its Cluster is deleted. Both run
+	// after t.Context() is cancelled, so they bring their own.
+	t.Cleanup(l.deleteCluster)
+	t.Cleanup(func() {
+		if t.Failed() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			l.diagnose(ctx)
+		}
+	})
 	l.just("cluster")
 	t.Logf("applied the cluster after %s", since(start))
 
 	// 1. The control plane is initialized and available.
 	cp := &controlplanev1.ChalkosControlPlane{}
-	l.waitFor("the control plane to be initialized and available", 20*time.Minute, func() (bool, string, error) {
-		if err := l.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: clusterName}, cp); err != nil {
+	l.waitFor(ctx, "the control plane to be initialized and available", 20*time.Minute, func(ctx context.Context) (bool, string, error) {
+		if err := l.c.Get(ctx, clusterKey, cp); err != nil {
 			return false, "", err
 		}
 		return conditions.IsTrue(cp, controlplanev1.InitializedCondition) && conditions.IsTrue(cp, controlplanev1.AvailableCondition),
@@ -129,14 +135,14 @@ func TestLab(t *testing.T) {
 	// 2. The kubeconfig Secret reaches the cluster, whose nodes are the Machines, Ready and named
 	// by their providerID.
 	var machines clusterv1.MachineList
-	l.waitFor("both nodes to be Ready", 15*time.Minute, func() (bool, string, error) {
+	l.waitFor(ctx, "both nodes to be Ready", 15*time.Minute, func(ctx context.Context) (bool, string, error) {
 		if err := l.c.List(ctx, &machines, client.InNamespace(namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
 			return false, "", err
 		}
 		if len(machines.Items) != 2 {
 			return false, fmt.Sprintf("%d Machines", len(machines.Items)), nil
 		}
-		return l.nodesReady(machines.Items)
+		return l.nodesReady(ctx, machines.Items)
 	})
 	t.Logf("both nodes are Ready after %s", since(start))
 
@@ -154,34 +160,51 @@ func TestLab(t *testing.T) {
 		}
 	}
 
-	// 4. The kubeconfig's client certificate expires within its TTL.
+	// 4. The kubeconfig's client certificate expires within its TTL. The control plane is read
+	// again: the kubeconfig may have been issued after the first wait read it.
+	if err := l.c.Get(ctx, clusterKey, cp); err != nil {
+		t.Fatal(err)
+	}
 	l.checkKubeconfigCert(cp)
 	if t.Failed() {
 		t.FailNow()
 	}
 
-	// 5. Deleting the Cluster deletes the Machines, their infrastructure and VMs, and the control
-	// plane once its finalizer is removed.
+	// 5. Deleting the Cluster deletes the Machines, their infrastructure and VMs, the control plane
+	// once its finalizer is removed, and the Cluster itself.
 	deleted := time.Now()
 	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: clusterName}}
 	if err := l.c.Delete(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
-	l.waitFor("the cluster's objects to be gone", 10*time.Minute, func() (bool, string, error) {
+	l.waitFor(ctx, "the cluster's objects to be gone", 10*time.Minute, func(ctx context.Context) (bool, string, error) {
 		left := map[string]int{}
 		for kind, list := range map[string]client.ObjectList{
 			"Machines":         &clusterv1.MachineList{},
 			"KubevirtMachines": unstructuredList(kubevirtMachineList),
 			"VirtualMachines":  unstructuredList(virtualMachineList),
 		} {
-			if err := l.c.List(ctx, list, client.InNamespace(namespace)); err != nil {
+			opts := []client.ListOption{client.InNamespace(namespace)}
+			if kind == "Machines" {
+				opts = append(opts, client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName})
+			}
+			if err := l.c.List(ctx, list, opts...); err != nil {
 				return false, "", err
 			}
 			left[kind] = meta.LenList(list)
 		}
-		switch err := l.c.Get(ctx, client.ObjectKeyFromObject(cp), &controlplanev1.ChalkosControlPlane{}); {
+		var deleting string
+		var gone controlplanev1.ChalkosControlPlane
+		switch err := l.c.Get(ctx, clusterKey, &gone); {
 		case err == nil:
 			left["ChalkosControlPlanes"] = 1
+			deleting = conditionsSummary(gone.Status.Conditions, controlplanev1.DeletingCondition)
+		case !apierrors.IsNotFound(err):
+			return false, "", err
+		}
+		switch err := l.c.Get(ctx, clusterKey, &clusterv1.Cluster{}); {
+		case err == nil:
+			left["Clusters"] = 1
 		case !apierrors.IsNotFound(err):
 			return false, "", err
 		}
@@ -191,9 +214,37 @@ func TestLab(t *testing.T) {
 				parts = append(parts, fmt.Sprintf("%d %s", left[kind], kind))
 			}
 		}
-		return len(parts) == 0, strings.Join(parts, ", "), nil
+		state := strings.Join(parts, ", ")
+		if deleting != "" {
+			state += "; " + deleting
+		}
+		return len(parts) == 0, state, nil
 	})
 	t.Logf("the cluster was deleted in %s; the whole run took %s", since(deleted), since(start))
+}
+
+// deleteCluster deletes the Cluster lab, unless E2E_KEEP=1 keeps it to look at, and waits up to
+// ten minutes until it is gone. It runs as a cleanup, so that no run leaves its VMs behind.
+func (l *lab) deleteCluster() {
+	if os.Getenv("E2E_KEEP") == "1" {
+		l.t.Logf("E2E_KEEP=1: keeping the Cluster %s/%s", namespace, clusterName)
+		return
+	}
+	ctx := context.Background()
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: clusterName}}
+	if err := l.c.Delete(ctx, cluster); err != nil {
+		if !apierrors.IsNotFound(err) {
+			l.t.Errorf("deleting the Cluster: %v", err)
+		}
+		return
+	}
+	l.waitFor(ctx, "the Cluster to be gone", 10*time.Minute, func(ctx context.Context) (bool, string, error) {
+		err := l.c.Get(ctx, client.ObjectKeyFromObject(cluster), &clusterv1.Cluster{})
+		if apierrors.IsNotFound(err) {
+			return true, "", nil
+		}
+		return false, "the Cluster exists", err
+	})
 }
 
 // newLab connects to the lab's management cluster and skips the test unless the lab runs with all
@@ -242,8 +293,8 @@ func deploymentAvailable(d *appsv1.Deployment) bool {
 
 // nodesReady tells whether the workload cluster, reached with the kubeconfig the lab's kubeconfig
 // recipe writes, has one Ready node per Machine, of the Machine's name and with its providerID.
-func (l *lab) nodesReady(machines []clusterv1.Machine) (bool, string, error) {
-	if _, err := l.run("just", "-f", filepath.Join(l.root, "lab", "justfile"), "kubeconfig"); err != nil {
+func (l *lab) nodesReady(ctx context.Context, machines []clusterv1.Machine) (bool, string, error) {
+	if _, err := l.run(ctx, "just", "-f", filepath.Join(l.root, "lab", "justfile"), "kubeconfig"); err != nil {
 		return false, fmt.Sprintf("no kubeconfig yet: %v", err), nil
 	}
 	cfg, err := clientcmd.BuildConfigFromFlags("", filepath.Join(l.root, ".lab", "lab.kubeconfig"))
@@ -256,7 +307,7 @@ func (l *lab) nodesReady(machines []clusterv1.Machine) (bool, string, error) {
 		return false, "", err
 	}
 	var nodes corev1.NodeList
-	if err := c.List(l.t.Context(), &nodes); err != nil {
+	if err := c.List(ctx, &nodes); err != nil {
 		return false, fmt.Sprintf("listing the nodes: %v", err), nil
 	}
 	byName := map[string]corev1.Node{}
@@ -269,6 +320,9 @@ func (l *lab) nodesReady(machines []clusterv1.Machine) (bool, string, error) {
 		switch {
 		case !ok:
 			waiting = append(waiting, m.Name+" has no node")
+		case n.Spec.ProviderID == "":
+			// The kubelet or the cloud provider sets the providerID a moment after the node registers.
+			waiting = append(waiting, m.Name+" has no providerID yet")
 		case n.Spec.ProviderID != "kubevirt://"+m.Name:
 			return false, "", fmt.Errorf("the node %s has the providerID %q, want %q", n.Name, n.Spec.ProviderID, "kubevirt://"+m.Name)
 		case !nodeReady(&n):
@@ -331,21 +385,21 @@ func (l *lab) checkKubeconfigCert(cp *controlplanev1.ChalkosControlPlane) {
 }
 
 // waitFor calls check every poll until it is done, fails or timeout passes, and logs what check
-// reports whenever that changes.
-func (l *lab) waitFor(what string, timeout time.Duration, check func() (done bool, state string, err error)) {
+// reports whenever that changes. check gets a context that ends with the timeout.
+func (l *lab) waitFor(ctx context.Context, what string, timeout time.Duration, check func(context.Context) (done bool, state string, err error)) {
 	l.t.Helper()
-	ctx, cancel := context.WithTimeout(l.t.Context(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var last string
 	for {
-		done, state, err := check()
-		if err != nil {
+		done, state, err := check(ctx)
+		if err != nil && ctx.Err() == nil {
 			l.t.Fatalf("waiting for %s: %v", what, err)
 		}
 		if done {
 			return
 		}
-		if state != last {
+		if state != last && err == nil {
 			l.t.Logf("waiting for %s: %s", what, state)
 			last = state
 		}
@@ -360,14 +414,14 @@ func (l *lab) waitFor(what string, timeout time.Duration, check func() (done boo
 // just runs the lab's recipe and fails the test when it fails.
 func (l *lab) just(recipe string) {
 	l.t.Helper()
-	if out, err := l.run("just", "-f", filepath.Join(l.root, "lab", "justfile"), recipe); err != nil {
+	if out, err := l.run(l.t.Context(), "just", "-f", filepath.Join(l.root, "lab", "justfile"), recipe); err != nil {
 		l.t.Fatalf("just %s: %v\n%s", recipe, err, out)
 	}
 }
 
 // run runs the command against the lab's management cluster and returns its combined output.
-func (l *lab) run(name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(l.t.Context(), name, args...)
+func (l *lab) run(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = l.root
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+l.kubeconfig)
 	out, err := cmd.CombinedOutput()
@@ -375,7 +429,7 @@ func (l *lab) run(name string, args ...string) (string, error) {
 }
 
 // diagnose logs the cluster's state and the providers' recent logs.
-func (l *lab) diagnose() {
+func (l *lab) diagnose(ctx context.Context) {
 	const conds = `{{range .items}}{{.kind}}/{{.metadata.name}}{{"\n"}}{{range .status.conditions}}  {{.type}}={{.status}} {{.reason}}: {{.message}}{{"\n"}}{{end}}{{end}}`
 	cmds := [][]string{
 		{"clusterctl", "describe", "cluster", clusterName, "--show-conditions", "all"},
@@ -385,7 +439,7 @@ func (l *lab) diagnose() {
 		{"kubectl", "-n", "control-plane-chalkos-system", "logs", "deployment/control-plane-chalkos-controller-manager", "--tail", "200"},
 	}
 	for _, c := range cmds {
-		out, err := l.run(c[0], c[1:]...)
+		out, err := l.run(ctx, c[0], c[1:]...)
 		if err != nil {
 			out += "\n" + err.Error()
 		}
@@ -423,4 +477,3 @@ func conditionsSummary(conds []metav1.Condition, types ...string) string {
 func since(start time.Time) time.Duration {
 	return time.Since(start).Round(time.Second)
 }
-
