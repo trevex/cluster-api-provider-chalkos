@@ -305,10 +305,23 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 // reconcileDelete waits for the cluster's workers to be deleted, then deletes the control plane's
 // Machines and, once they are gone, removes the finalizer. The Machines' own finalizers delete
 // their infrastructure and nodes first. The workers go first, as with Cluster API's own control
-// plane, so that their nodes are drained while the cluster's API server still answers.
+// plane, so that their nodes are drained while the cluster's API server still answers. The
+// kubeconfig is renewed while the deletion waits, since draining the workers needs it.
 func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result, error) {
 	if err := r.listMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
+	}
+	var renew time.Duration
+	if s.initialized() {
+		sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if ok {
+			if renew, err = r.reconcileKubeconfig(ctx, s, sec); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 	workers, pools, err := r.countWorkers(ctx, s)
 	if err != nil {
@@ -318,7 +331,7 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 		s.deletingReason = controlplanev1.DeletingWaitingForWorkersDeletionReason
 		s.deletingMessage = waitingForWorkersMessage(workers, pools)
 		// No watch reports the workers' deletion; the requeue does.
-		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
+		return earliest(ctrl.Result{RequeueAfter: machineutil.RetryAfter}, ctrl.Result{RequeueAfter: renew}), nil
 	}
 	for i := range s.machines {
 		err := r.Client.Delete(ctx, &s.machines[i])

@@ -51,6 +51,7 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
 )
@@ -1156,4 +1157,42 @@ func TestDeletionWaitsForWorkers(t *testing.T) {
 	}
 	e.mustReconcile()
 	e.wantMachines(0)
+}
+
+// A deletion that waits for workers keeps renewing the kubeconfig, which draining them needs.
+func TestDeletionWaitingForWorkersRenewsKubeconfig(t *testing.T) {
+	e := newEnv(t, 1, true)
+	e.initialize("10.0.0.1")
+	key := client.ObjectKey{Namespace: e.ns, Name: clusterName + "-kubeconfig"}
+	var s corev1.Secret
+	if err := testClient.Get(t.Context(), key, &s); err != nil {
+		t.Fatal(err)
+	}
+	cert := clientCert(t, &s)
+	e.create(&clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: "worker", Labels: map[string]string{clusterv1.ClusterNameLabel: clusterName}},
+		Spec: clusterv1.MachineSpec{
+			ClusterName: clusterName,
+			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("worker")},
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: builder.InfrastructureGroupVersion.Group, Kind: builder.GenericInfrastructureMachineKind, Name: "worker",
+			},
+		},
+	})
+	if err := testClient.Delete(t.Context(), e.cp()); err != nil {
+		t.Fatal(err)
+	}
+
+	e.clock.Step(16*time.Hour + time.Minute)
+	if res := e.mustReconcile(); res.RequeueAfter <= 0 || res.RequeueAfter > machineutil.RetryAfter {
+		t.Errorf("requeue after %s, want by %s", res.RequeueAfter, machineutil.RetryAfter)
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.DeletingCondition, metav1.ConditionTrue, controlplanev1.DeletingWaitingForWorkersDeletionReason,
+		"Waiting for 1 worker Machine to be deleted")
+	if err := testClient.Get(t.Context(), key, &s); err != nil {
+		t.Fatal(err)
+	}
+	if renewed := clientCert(t, &s); !renewed.NotAfter.After(cert.NotAfter) {
+		t.Errorf("certificate until %s while the deletion waits, want after %s", renewed.NotAfter, cert.NotAfter)
+	}
 }
