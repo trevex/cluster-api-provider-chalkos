@@ -203,6 +203,7 @@ func TestRemovalCallsCheckTheName(t *testing.T) {
 func TestTryNextControlPlane(t *testing.T) {
 	for err, want := range map[error]bool{
 		nodetest.Unreachable("10.0.0.1"):          true,
+		nodetest.EtcdUnavailable():                true,
 		nodetest.NotEtcdMember():                  true,
 		nodetest.QuorumRefused("cp2"):             false,
 		nodetest.RevokedListFull("w1"):            false,
@@ -219,11 +220,38 @@ func TestTryNextControlPlane(t *testing.T) {
 	}
 }
 
+// A node that answers was reached, also when it answers that its own etcd is unavailable.
+func TestUnreachable(t *testing.T) {
+	for err, want := range map[error]bool{
+		nodetest.Unreachable("10.0.0.1"):          true,
+		nodetest.EtcdUnavailable():                false,
+		context.DeadlineExceeded:                  true,
+		fmt.Errorf("x: %w", sdk.ErrNotInstalled):  true,
+		fmt.Errorf("x: %w", sdk.ErrOtherNode):     true,
+		nodetest.NotEtcdMember():                  false,
+		errors.New("the image has no such layer"): false,
+	} {
+		if got := node.Unreachable(err); got != want {
+			t.Errorf("Unreachable(%v) = %v, want %v", err, got, want)
+		}
+	}
+}
+
 // A machine whose image trusts another OS CA refuses the controllers' certificate.
 func TestMaintenanceAtAMachineOfAnotherCluster(t *testing.T) {
 	s, other := generate(t), generate(t)
 	n := serveMaintenance(t, other, sdktest.Maintenance())
 	if _, err := node.New().Maintenance(context.Background(), n.Addr, s); !errors.Is(err, sdk.ErrOSCARefused) {
 		t.Errorf("Maintenance = %v, want ErrOSCARefused", err)
+	}
+}
+
+// A removal that names no member is refused before any call, at the node and at the Fake.
+func TestRemoveNoMember(t *testing.T) {
+	var s clustersecrets.Secrets
+	for name, c := range map[string]node.Client{"node": node.New(), "fake": nodetest.New()} {
+		if err := c.EtcdRemoveMember(t.Context(), "127.0.0.1:1", s, "cp1", ""); !errors.Is(err, node.ErrNoMember) {
+			t.Errorf("%s: EtcdRemoveMember of no member = %v, want ErrNoMember", name, err)
+		}
 	}
 }

@@ -51,6 +51,12 @@ func RevokedListFull(node string) error {
 		fmt.Sprintf("revoking %s would make the admission policy's map of the revoked nodes too long; make room: drop the expired revocations with chalkctl node prune-revoked, or rotate the OS CA and the Kubernetes CA", node))
 }
 
+// EtcdUnavailable is a control plane's answer that its etcd did not answer in time: the node
+// itself was reached.
+func EtcdUnavailable() error {
+	return refusal(connect.CodeUnavailable, "etcdserver: request timed out")
+}
+
 // QuorumRefused is a control plane's refusal to remove member while the voters left would have no
 // healthy quorum.
 func QuorumRefused(member string) error {

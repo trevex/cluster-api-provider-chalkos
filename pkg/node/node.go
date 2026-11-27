@@ -65,16 +65,19 @@ type Client interface {
 	// left would have no healthy quorum; a node that is no etcd member, or left etcd already,
 	// refuses with the NotEtcdMember detail, which sdkkubernetes.NotEtcdMember tells. Only that
 	// node can leave: another control plane answering in its place would be wrong, so callers
-	// do not move on to the next control plane.
+	// do not move on to the next control plane. The node waits for etcd without a bound of its
+	// own, so ctx needs a deadline.
 	EtcdLeave(ctx context.Context, addr string, s clustersecrets.Secrets, name string) error
 	// EtcdRemoveMember removes the etcd member, a node's name or a member's ID in hex, through
-	// the control plane name at addr. It is refused while the voters left would have no healthy
-	// quorum, and with connect.CodeFailedPrecondition when the member went while the call ran. A
-	// member etcd does not list fails with connect.CodeNotFound; a learner that has not started
-	// has no name yet, and is found only by its ID.
+	// the control plane name at addr, which refuses to remove its own member. It is refused while
+	// the voters left would have no healthy quorum, and with connect.CodeFailedPrecondition when
+	// the member went while the call ran. A member etcd does not list fails with
+	// connect.CodeNotFound; a learner that has not started has no name yet, and is found only by
+	// its ID. An empty member fails with ErrNoMember before any call. The node waits for etcd
+	// without a bound of its own, so ctx needs a deadline.
 	EtcdRemoveMember(ctx context.Context, addr string, s clustersecrets.Secrets, name, member string) error
 	// EtcdMembers lists etcd's members, with their health, as the control plane name at addr sees
-	// them.
+	// them. A node that is no etcd member refuses with the NotEtcdMember detail.
 	EtcdMembers(ctx context.Context, addr string, s clustersecrets.Secrets, name string) ([]*kubernetesv1.EtcdMember, error)
 	// RevokeNode revokes node through the control plane name at addr. Unless allowControlPlane, it
 	// refuses an etcd member with *sdkkubernetes.EtcdMemberError; a full list of revoked nodes
@@ -95,6 +98,10 @@ type Maintenance interface {
 	// Close closes the connection.
 	Close()
 }
+
+// ErrNoMember is the error of an EtcdRemoveMember that names no member: etcd would find none, and
+// the NotFound it answers would read as the member removed.
+var ErrNoMember = errors.New("no etcd member to remove")
 
 // New returns the Client that reaches nodes over the network.
 func New() Client { return remote{} }
@@ -159,6 +166,9 @@ func (remote) EtcdLeave(ctx context.Context, addr string, s clustersecrets.Secre
 }
 
 func (remote) EtcdRemoveMember(ctx context.Context, addr string, s clustersecrets.Secrets, name, member string) error {
+	if member == "" {
+		return ErrNoMember
+	}
 	conn, _, err := dialInstalled(ctx, addr, s, name)
 	if err != nil {
 		return err
@@ -200,10 +210,13 @@ func (remote) PruneRevoked(ctx context.Context, addr string, s clustersecrets.Se
 }
 
 // Unreachable tells whether err says the node could not be reached as itself: it did not answer
-// in time, runs in maintenance mode, or is another node.
+// or not in time, runs in maintenance mode, or is another node. A node that answers Unavailable
+// itself, as when its own etcd does not answer, was reached and is not unreachable.
 func Unreachable(err error) bool {
 	switch connect.CodeOf(err) {
-	case connect.CodeUnavailable, connect.CodeDeadlineExceeded:
+	case connect.CodeUnavailable:
+		return !client.FromNode(err)
+	case connect.CodeDeadlineExceeded:
 		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sdk.ErrNotInstalled) || errors.Is(err, sdk.ErrOtherNode)

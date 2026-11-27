@@ -59,16 +59,24 @@ type Node struct {
 	// Status is the node's Kubernetes status, which KubernetesStatus answers a copy of; nil answers
 	// an empty one.
 	Status *kubernetesv1.StatusResponse
-	// EtcdLeave, when set, answers an EtcdLeave of the node, which succeeds otherwise. The Fake
-	// calls it without holding its lock.
+	// EtcdLeave, when set, answers an EtcdLeave of the node in place of the Fake's model of etcd.
+	// The Fake calls it without holding its lock.
 	EtcdLeave func() error
 	// EtcdRemoveMember, when set, answers an EtcdRemoveMember through the node in place of the
 	// Fake's model of etcd. The Fake calls it without holding its lock.
 	EtcdRemoveMember func(member string) error
-	// Members are the etcd members the node lists. Without an EtcdRemoveMember hook, a removal
-	// finds the member here by name or by ID in hex, as etcd does, drops it, and fails with
-	// connect.CodeNotFound when there is none; a learner that has not started has no name.
+	// Members are the etcd members the node lists; nil when the node is no etcd member, which
+	// then refuses EtcdMembers and EtcdRemoveMember with NotEtcdMember, as chalkd does.
+	//
+	// Without hooks, the Fake models etcd with them: a removal finds the member by name or by ID
+	// in hex, as etcd does, refuses the node's own, drops it from every node's Members, and fails
+	// with connect.CodeNotFound when there is none; a learner that has not started has no name. A
+	// leave drops the node's member from every node's Members, sets Left, and clears the node's
+	// own Members.
 	Members []*kubernetesv1.EtcdMember
+	// Left is set once the node left etcd; a later EtcdLeave is refused with NotEtcdMember, as
+	// chalkd refuses it.
+	Left bool
 	// RevokeNode, when set, answers a RevokeNode through the node, which otherwise succeeds unless
 	// the node to revoke is among Members and allowControlPlane is false. The Fake calls it without
 	// holding its lock.
@@ -252,16 +260,25 @@ func (f *Fake) EtcdLeave(_ context.Context, addr string, _ clustersecrets.Secret
 	}
 	n.Leaves++
 	hook := n.EtcdLeave
-	f.mu.Unlock()
-	if hook != nil {
-		return hook()
+	if hook == nil {
+		defer f.mu.Unlock()
+		if n.Left {
+			return NotEtcdMember()
+		}
+		f.dropMembers(func(m *kubernetesv1.EtcdMember) bool { return m.GetName() == name })
+		n.Left, n.Members = true, nil
+		return nil
 	}
-	return nil
+	f.mu.Unlock()
+	return hook()
 }
 
 // EtcdRemoveMember removes member through the machine at addr installed as name and records it;
 // a refused removal is not recorded.
 func (f *Fake) EtcdRemoveMember(_ context.Context, addr string, _ clustersecrets.Secrets, name, member string) error {
+	if member == "" {
+		return node.ErrNoMember
+	}
 	f.mu.Lock()
 	n, err := f.installed(addr, name)
 	if err != nil {
@@ -271,13 +288,20 @@ func (f *Fake) EtcdRemoveMember(_ context.Context, addr string, _ clustersecrets
 	hook := n.EtcdRemoveMember
 	if hook == nil {
 		defer f.mu.Unlock()
+		if n.Members == nil {
+			return NotEtcdMember()
+		}
 		i := slices.IndexFunc(n.Members, func(m *kubernetesv1.EtcdMember) bool {
 			return m.GetName() == member || fmt.Sprintf("%x", m.GetId()) == strings.ToLower(member)
 		})
-		if i < 0 {
+		switch {
+		case i < 0:
 			return refusal(connect.CodeNotFound, "etcd has no member %s", member)
+		case n.Members[i].GetName() == name:
+			return refusal(connect.CodeFailedPrecondition, "%s is this node's own member; chalkctl etcd leave %s takes the node out of etcd", name, name)
 		}
-		n.Members = slices.Delete(slices.Clone(n.Members), i, i+1)
+		id := n.Members[i].GetId()
+		f.dropMembers(func(m *kubernetesv1.EtcdMember) bool { return m.GetId() == id })
 		n.Removed = append(n.Removed, member)
 		return nil
 	}
@@ -289,13 +313,26 @@ func (f *Fake) EtcdRemoveMember(_ context.Context, addr string, _ clustersecrets
 	return nil
 }
 
-// EtcdMembers returns a copy of the members of the machine at addr installed as name.
+// dropMembers drops the members gone from etcd from every node's Members. The caller holds f.mu.
+func (f *Fake) dropMembers(gone func(*kubernetesv1.EtcdMember) bool) {
+	for _, n := range f.nodes {
+		if n.Members != nil {
+			n.Members = slices.DeleteFunc(slices.Clone(n.Members), gone)
+		}
+	}
+}
+
+// EtcdMembers returns a copy of the members of the machine at addr installed as name; a node
+// without Members is no etcd member.
 func (f *Fake) EtcdMembers(_ context.Context, addr string, _ clustersecrets.Secrets, name string) ([]*kubernetesv1.EtcdMember, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	n, err := f.installed(addr, name)
 	if err != nil {
 		return nil, err
+	}
+	if n.Members == nil {
+		return nil, NotEtcdMember()
 	}
 	return cloneMembers(n.Members), nil
 }
