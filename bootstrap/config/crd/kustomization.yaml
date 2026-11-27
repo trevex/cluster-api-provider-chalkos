@@ -1,0 +1,13 @@
+# Labels the chalkos bootstrap CRDs with the v1beta2 contract version they satisfy, so the
+# core Cluster API controllers resolve the right contract fields from this CRD.
+labels:
+- includeSelectors: true
+  pairs:
+    cluster.x-k8s.io/v1beta2: v1alpha1
+
+# This kustomization.yaml is not intended to be run by itself, since it depends on resources
+# that are out of this kustomize package. It should be run by config/default.
+resources:
+- bases/bootstrap.cluster.x-k8s.io_chalkosconfigs.yaml
+- bases/bootstrap.cluster.x-k8s.io_chalkosconfigtemplates.yaml
+#+kubebuilder:scaffold:crdkustomizeresource

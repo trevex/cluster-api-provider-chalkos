@@ -1,0 +1,125 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: chalkosconfigtemplates.bootstrap.cluster.x-k8s.io
+spec:
+  group: bootstrap.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: ChalkosConfigTemplate
+    listKind: ChalkosConfigTemplateList
+    plural: chalkosconfigtemplates
+    singular: chalkosconfigtemplate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Time since creation of ChalkosConfigTemplate
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ChalkosConfigTemplate is the ChalkosConfig a MachineDeployment or MachineSet clones for each
+          Machine it creates.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec is the desired state of ChalkosConfigTemplate.
+            properties:
+              template:
+                description: |-
+                  Template is the ChalkosConfig that MachineDeployments and MachineSets clone for each
+                  Machine.
+                minProperties: 1
+                properties:
+                  metadata:
+                    description: ObjectMeta is the metadata the cloned ChalkosConfig
+                      starts with.
+                    minProperties: 1
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          annotations is an unstructured key value map stored with a resource that may be
+                          set by external tools to store and retrieve arbitrary metadata. They are not
+                          queryable and should be preserved when modifying objects.
+                          More info: http://kubernetes.io/docs/user-guide/annotations
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          labels is a map of string keys and values that can be used to organize and categorize
+                          (scope and select) objects. May match selectors of replication controllers
+                          and services.
+                          More info: http://kubernetes.io/docs/user-guide/labels
+                        type: object
+                    type: object
+                  spec:
+                    description: Spec is the cloned ChalkosConfig's spec.
+                    properties:
+                      files:
+                        description: |-
+                          Files are chalkos config documents of the machine's pool, such as a Node's labels and taints.
+                          A Cluster document belongs in the ChalkosControlPlane's files and is refused here. Fields the
+                          controllers own are refused: the Node's type and providerID, the Cluster's endpoint, and its
+                          ipFamilies, podCIDRs and serviceCIDRs when the Cluster's clusterNetwork gives ranges.
+                        items:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                        type: array
+                        x-kubernetes-preserve-unknown-fields: true
+                      image:
+                        description: 'Image is the chalkos image the machine installs,
+                          by digest: repository@sha256:….'
+                        pattern: ^.+@sha256:[a-f0-9]{64}$
+                        type: string
+                      imagePullSecretRef:
+                        description: |-
+                          ImagePullSecretRef names a Secret of type kubernetes.io/dockerconfigjson in the
+                          ChalkosConfig's namespace whose credentials the controller reads the image with. The node
+                          pulls with the Registry documents among Files.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                type: object
+            required:
+            - template
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources: {}

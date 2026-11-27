@@ -1,0 +1,11 @@
+# Labels every resource of the bootstrap provider's installation with the provider label
+# clusterctl uses to find and lifecycle it.
+labels:
+- includeSelectors: true
+  pairs:
+    cluster.x-k8s.io/provider: bootstrap-chalkos
+
+resources:
+- ../crd
+- ../rbac
+#+kubebuilder:scaffold:defaultresource

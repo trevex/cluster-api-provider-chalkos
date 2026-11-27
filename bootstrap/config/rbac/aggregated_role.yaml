@@ -1,0 +1,23 @@
+# Grants full read/write access to ChalkosConfig and ChalkosConfigTemplate, labelled so the
+# Cluster API core and control-plane managers' aggregated roles pick it up: the canonical way a
+# bootstrap provider's contract docs ask for RBAC on its own API group.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chalkos-bootstrap-config
+  labels:
+    cluster.x-k8s.io/aggregate-to-manager: "true"
+rules:
+- apiGroups:
+  - bootstrap.cluster.x-k8s.io
+  resources:
+  - chalkosconfigs
+  - chalkosconfigtemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
