@@ -218,7 +218,8 @@ jobs:
           if-no-files-found: ignore
 
   # The workflows and the composite action pass actionlint, with shellcheck for their scripts; the
-  # scripts of .github/scripts pass shellcheck, and their test passes.
+  # scripts of .github/scripts pass shellcheck, and their test passes; Renovate's configuration
+  # passes its validator.
   workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -233,9 +234,11 @@ jobs:
       - uses: ./.github/actions/nix
       - name: Lint the workflows and the scripts
         run: |
-          nix develop .#ci --command sh -c '
+          nix develop .#workflows --command sh -c '
             actionlint -shellcheck shellcheck .github/workflows/*.yml &&
             shellcheck .github/scripts/*.sh'
+      - name: Validate the Renovate configuration
+        run: nix develop .#workflows --command renovate-config-validator --strict
       - name: Test the scripts
         run: bash .github/scripts/test.sh
 

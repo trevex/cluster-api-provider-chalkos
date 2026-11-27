@@ -107,6 +107,35 @@ when the change touches the controllers, the lab or the Cluster API contract: CI
 end-to-end test on the pull request, on a runner with `/dev/kvm`. A push to `main` does not run
 it; the nightly workflow runs it on `main` and opens an issue labelled `ci-failure` when it fails.
 
+## Dependency updates
+
+Renovate keeps the dependencies current, configured in
+[`.github/renovate.json5`](.github/renovate.json5). It opens a pull request per group each Monday
+before 06:00 Europe/Berlin, labelled `dependencies`, and lists every pending and open update on
+its Dependency Dashboard issue. A release of a Go module, an action or a base image waits seven
+days before Renovate proposes it.
+
+| Group | What it updates | Labels | Merge |
+| --- | --- | --- | --- |
+| `chalkos` | The chalkos release of `go.mod` and of the flake input, as soon as chalkos publishes it | `dependencies`, `e2e` | by hand |
+| `go-kubernetes` | The modules `k8s.io/*` and `sigs.k8s.io/*`, Cluster API and controller-runtime among them | `dependencies`, `e2e` | by hand |
+| `go-x` | The modules `golang.org/x/*` | `dependencies` | by hand |
+| `go-deps` | Every other Go module's patch and minor releases | `dependencies` | by hand |
+| `go-toolchain` | The `go` directive of `go.mod` and the Dockerfile's `golang` release | `dependencies`, `e2e` | by hand |
+| `dockerfile` | The digests of the Dockerfile's base images, which stay pinned by digest | `dependencies` | by hand |
+| `github-actions` | The actions' patch and minor releases and digests, pinned by digest | `dependencies` | automerge |
+| `github-actions-release` | The same for the actions of the jobs that hold `id-token: write` | `dependencies` | by hand |
+
+Renovate bumps chalkos in `flake.nix` but leaves `flake.lock` alone. The workflow
+`renovate-fixup.yml` runs `nix flake update chalkos` on Renovate's branch and pushes the new lock
+file as a commit of the release App's bot. Renovate finds the flake input only when it names a
+release tag, such as `github:trevex/chalkos/v0.8.0`. If you pin a chalkos commit between
+releases, set it in both `go.mod` and `flake.nix` and run `nix flake update chalkos`.
+
+A major release of a Go module waits on the Dependency Dashboard until you approve it, and a
+major release of an action gets a pull request of its own. A fix for a known vulnerability comes
+at any time, outside its group, labelled `security`.
+
 ## Licence
 
 The providers are licensed under the [Apache License 2.0](LICENSE). A contribution is licensed

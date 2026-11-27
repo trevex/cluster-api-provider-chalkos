@@ -1,0 +1,230 @@
+// Renovate's configuration: the Mend Renovate App opens a pull request per group each Monday
+// morning, and one for a chalkos release when it is published. CONTRIBUTING.md describes the
+// groups and the automerge rules. renovate-fixup.yml updates flake.lock after Renovate's commit
+// to a chalkos release.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended', 'helpers:pinGitHubActionDigests'],
+  // Go modules, the actions of the workflows, the Dockerfile's base images, and chalkos's release
+  // in flake.nix and Hestia's version beside its action, which the custom managers below find.
+  // The nix manager stays off: flake.lock follows chalkos's.
+  enabledManagers: ['gomod', 'github-actions', 'dockerfile', 'custom.regex'],
+  timezone: 'Europe/Berlin',
+  schedule: ['before 6am on monday'],
+  prHourlyLimit: 0,
+  dependencyDashboard: { enabled: true },
+  labels: ['dependencies'],
+  semanticCommits: 'enabled',
+  // deps is release-please's patch-releasing type: an update of what the providers ship (Go
+  // modules, chalkos, the base images) releases. CI's own dependencies stay ci(deps), which do
+  // not.
+  semanticCommitType: 'deps',
+  semanticCommitScope: null,
+  rebaseWhen: 'behind-base-branch',
+  // The commits of renovate-fixup.yml, made as the release App's bot, leave a branch Renovate's
+  // own, so Renovate still rebases it.
+  gitIgnoredAuthors: ['359050260+chalkreleaser[bot]@users.noreply.github.com'],
+  // After a Go module's major update, Renovate rewrites the import paths of the code to the new
+  // major's.
+  postUpdateOptions: ['gomodTidy', 'gomodUpdateImportPaths'],
+  // An update that fixes a known vulnerability, from the repository's Dependabot alerts or the
+  // OSV database, comes at any time in a pull request of its own, outside the groups below,
+  // labelled security, without waiting for the release age.
+  vulnerabilityAlerts: {
+    addLabels: ['security'],
+    schedule: ['at any time'],
+    minimumReleaseAge: null,
+  },
+  osvVulnerabilityAlerts: true,
+  // Automerge enables GitHub's auto-merge, which waits for the checks branch protection requires.
+  // Where GitHub's auto-merge is unavailable, Renovate merges once every check of the branch has
+  // passed, never without checks.
+  automergeType: 'pr',
+  platformAutomerge: true,
+  automergeStrategy: 'squash',
+  ignoreTests: false,
+  customManagers: [
+    {
+      // The chalkos release the flake input names, which go.mod's github.com/trevex/chalkos
+      // matches.
+      customType: 'regex',
+      description: "chalkos's release in flake.nix",
+      managerFilePatterns: ['/^flake\\.nix$/'],
+      matchStrings: ['chalkos\\.url = "github:trevex/chalkos/(?<currentValue>v\\d+\\.\\d+\\.\\d+)";'],
+      depNameTemplate: 'trevex/chalkos',
+      datasourceTemplate: 'github-releases',
+      versioningTemplate: 'semver',
+    },
+    {
+      // Hestia's version input, which names the release of the action's own tag.
+      customType: 'regex',
+      description: "Hestia's version beside its action",
+      managerFilePatterns: ['/^\\.github/actions/nix/action\\.yml$/'],
+      matchStrings: [
+        'uses: Mic92/hestia@[0-9a-f]+ # v\\S+\\n\\s+with:\\n\\s+version: (?<currentValue>v\\S+)',
+      ],
+      depNameTemplate: 'Mic92/hestia',
+      datasourceTemplate: 'github-releases',
+    },
+    // The lab will boot chalkos's released images, ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm
+    // and ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm-disk, pinned by digest. A regex manager
+    // with the docker datasource then keeps their tags and digests at the release flake.nix names,
+    // in the chalkos group:
+    //
+    // {
+    //   customType: 'regex',
+    //   description: "chalkos's lab images",
+    //   managerFilePatterns: ['/^lab/images\\.env$/'],
+    //   matchStrings: ['(?<depName>ghcr\\.io/trevex/chalkos/\\S+):(?<currentValue>v\\S+)@(?<currentDigest>sha256:[0-9a-f]+)'],
+    //   datasourceTemplate: 'docker',
+    // },
+  ],
+  packageRules: [
+    {
+      // deps, over config:recommended's fix and chore.
+      matchPackageNames: ['*'],
+      semanticCommitType: 'deps',
+    },
+    {
+      // A Go module's or a base image's release waits seven days before Renovate proposes it,
+      // like an action's.
+      matchManagers: ['gomod', 'dockerfile'],
+      minimumReleaseAge: '7 days',
+    },
+    {
+      // Actions' patch and minor releases and digests in one pull request, merged once CI
+      // passes; a major release gets a pull request of its own, merged by hand. A release waits
+      // seven days before Renovate proposes it, time for a compromised one to be found and
+      // pulled.
+      matchManagers: ['github-actions'],
+      semanticCommitType: 'ci',
+      semanticCommitScope: 'deps',
+      minimumReleaseAge: '7 days',
+    },
+    {
+      matchDepNames: ['Mic92/hestia'],
+      semanticCommitType: 'ci',
+      semanticCommitScope: 'deps',
+      minimumReleaseAge: '7 days',
+    },
+    {
+      matchManagers: ['github-actions', 'custom.regex'],
+      matchDepNames: ['!trevex/chalkos'],
+      matchUpdateTypes: ['minor', 'patch', 'digest', 'pin', 'pinDigest'],
+      groupName: 'the GitHub Actions',
+      groupSlug: 'github-actions',
+      automerge: true,
+    },
+    {
+      // The actions of the jobs that hold id-token: write, which can sign as their workflow: those
+      // of the nix composite, the release jobs' and Scorecard's, and the first-party actions
+      // beside them. Their updates get a pull request of their own, which a maintainer merges
+      // after reading the diff.
+      matchManagers: ['github-actions', 'custom.regex'],
+      matchDepNames: [
+        'cachix/install-nix-action',
+        'Mic92/hestia',
+        'sigstore/cosign-installer',
+        'docker/setup-buildx-action',
+        'docker/login-action',
+        'docker/build-push-action',
+        'docker/metadata-action',
+        'ossf/scorecard-action',
+        'github/codeql-action',
+        'actions/checkout',
+        'actions/cache',
+        'actions/upload-artifact',
+        'actions/download-artifact',
+        'actions/attest',
+        'actions/attest-build-provenance',
+      ],
+      matchUpdateTypes: ['minor', 'patch', 'digest', 'pin', 'pinDigest'],
+      groupName: "the signing jobs' actions",
+      groupSlug: 'github-actions-release',
+      automerge: false,
+    },
+    {
+      // The Kubernetes modules with Cluster API and controller-runtime, which follow Cluster
+      // API's release.
+      matchManagers: ['gomod'],
+      matchPackageNames: ['k8s.io/**', 'sigs.k8s.io/**'],
+      groupName: 'the Kubernetes Go modules',
+      groupSlug: 'go-kubernetes',
+      addLabels: ['e2e'],
+    },
+    {
+      matchManagers: ['gomod'],
+      matchPackageNames: ['golang.org/x/**'],
+      groupName: 'the golang.org/x modules',
+      groupSlug: 'go-x',
+    },
+    {
+      // Every other Go module's patch and minor releases and pseudo-versions together; a major
+      // release gets a pull request of its own.
+      matchManagers: ['gomod'],
+      matchDepTypes: ['require', 'indirect'],
+      matchPackageNames: ['!k8s.io/**', '!sigs.k8s.io/**', '!golang.org/x/**', '!github.com/trevex/chalkos'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'the Go modules',
+      groupSlug: 'go-deps',
+    },
+    {
+      // The go directive and the toolchain line, which go-overlay builds the dev shell's Go from,
+      // with the Dockerfile's golang image, which builds the managers' images.
+      matchManagers: ['gomod'],
+      matchDepTypes: ['golang', 'toolchain'],
+      groupName: 'Go',
+      groupSlug: 'go-toolchain',
+      rangeStrategy: 'bump',
+      addLabels: ['e2e'],
+    },
+    {
+      // The Dockerfile's base images, pinned by digest with the tag beside it: the builder's
+      // golang and the distroless image the managers run on.
+      matchManagers: ['dockerfile'],
+      pinDigests: true,
+      groupName: 'the Dockerfile base images',
+      groupSlug: 'dockerfile',
+    },
+    {
+      // A new Go release of the golang image goes with go.mod's.
+      matchManagers: ['dockerfile'],
+      matchDepNames: ['golang'],
+      matchUpdateTypes: ['major', 'minor'],
+      groupName: 'Go',
+      groupSlug: 'go-toolchain',
+      addLabels: ['e2e'],
+    },
+    {
+      // A Go module's major release usually changes its API, which the code must be ported to by
+      // hand, so it waits on the Dependency Dashboard. Approving it opens a pull request with the
+      // import paths rewritten, to port the code on.
+      matchManagers: ['gomod'],
+      matchUpdateTypes: ['major'],
+      dependencyDashboardApproval: true,
+    },
+    {
+      // Nothing but actions merges by itself.
+      matchManagers: ['gomod', 'dockerfile', 'custom.regex'],
+      matchDepNames: ['!Mic92/hestia'],
+      automerge: false,
+    },
+    {
+      matchUpdateTypes: ['major'],
+      automerge: false,
+    },
+    {
+      // A chalkos release, in go.mod and flake.nix together, as soon as it is published: the
+      // providers follow chalkos's releases, and renovate-fixup.yml updates flake.lock. The
+      // end-to-end test runs on it, and a maintainer merges it.
+      matchPackageNames: ['github.com/trevex/chalkos', 'trevex/chalkos'],
+      groupName: 'chalkos',
+      groupSlug: 'chalkos',
+      schedule: ['at any time'],
+      minimumReleaseAge: null,
+      dependencyDashboardApproval: false,
+      addLabels: ['e2e'],
+      automerge: false,
+    },
+  ],
+}
