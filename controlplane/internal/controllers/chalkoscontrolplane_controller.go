@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -56,6 +57,7 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
 )
@@ -162,8 +164,12 @@ func (r *ChalkosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err := s.track(); err != nil {
 		return ctrl.Result{}, err
 	}
+	before := slices.Clone(cp.Status.Conditions)
 	defer func() {
 		setStatus(s)
+		conditionlog.Changes(ctrl.LoggerFrom(ctx), before, cp.Status.Conditions,
+			controlplanev1.InitializedCondition, controlplanev1.AvailableCondition,
+			controlplanev1.ScalingUpCondition, controlplanev1.MachinesReadyCondition)
 		if err := s.patch(ctx); err != nil {
 			rerr = kerrors.NewAggregate([]error{rerr, err})
 		}
@@ -189,6 +195,9 @@ type scope struct {
 	// statuses are the Kubernetes statuses of the Machines' nodes read in this reconcile, by
 	// Machine name, so that each node is asked once.
 	statuses map[string]nodeStatus
+	// waitingToJoin is the Machine whose join the next Machine's creation waits for; empty when
+	// it waits for none.
+	waitingToJoin string
 }
 
 // nodeStatus is a node's answer to KubernetesStatus.
@@ -304,6 +313,10 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 		if err := r.Client.Delete(ctx, &s.machines[i]); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, fmt.Errorf("delete the Machine %s: %w", s.machines[i].Name, err)
 		}
+		ctrl.LoggerFrom(ctx).Info("Deleting the Machine", "machine", s.machines[i].Name)
+	}
+	if len(s.machines)+len(s.deleting) == 0 {
+		ctrl.LoggerFrom(ctx).Info("The Machines are gone; removing the finalizer")
 	}
 	if n := len(s.machines) + len(s.deleting); n > 0 {
 		// The Machines' watch reconciles again as they go; the requeue covers a missed event.
@@ -394,13 +407,20 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	log := ctrl.LoggerFrom(ctx).WithValues("machine", m.Name)
+	log.Info("Bootstrapping the cluster")
 	err = r.Node.Bootstrap(callCtx, internalIP(m), sec, m.Name)
 	delete(s.statuses, m.Name)
 	switch {
-	case err == nil || bootstrappedAlready(err):
+	case err == nil:
+		log.Info("The machine bootstrapped the cluster")
+		return ctrl.Result{}, true, nil
+	case bootstrappedAlready(err):
+		log.Info("The machine is bootstrapped already")
 		return ctrl.Result{}, true, nil
 	case ctx.Err() == nil && (connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded)):
 		// A node that did not commit to the bootstrap still waits for it, and is called again.
+		log.Info("The bootstrap call timed out; following the node's status")
 		return ctrl.Result{}, true, nil
 	case connect.CodeOf(err) == connect.CodeFailedPrecondition:
 		s.notInitialized(controlplanev1.BootstrapRefusedReason, fmt.Sprintf("The Machine %s refused the bootstrap: %v", m.Name, err))

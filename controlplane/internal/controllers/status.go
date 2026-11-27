@@ -94,9 +94,13 @@ func setStatus(s *scope) {
 
 	switch want := ptr.Deref(s.cp.Spec.Replicas, 1); {
 	case n < want && s.cp.DeletionTimestamp.IsZero():
+		msg := fmt.Sprintf("Scaling up from %d to %d replicas", n, want)
+		if s.waitingToJoin != "" {
+			msg += fmt.Sprintf("; waiting for the Machine %s to join the cluster", s.waitingToJoin)
+		}
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.ScalingUpReason,
-			Message: fmt.Sprintf("Scaling up from %d to %d replicas", n, want),
+			Message: msg,
 		})
 	default:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason})

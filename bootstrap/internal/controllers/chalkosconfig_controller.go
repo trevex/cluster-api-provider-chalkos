@@ -63,6 +63,7 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/documents"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
@@ -172,7 +173,9 @@ func (r *ChalkosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := s.track(); err != nil {
 		return ctrl.Result{}, err
 	}
+	before := slices.Clone(cfg.Status.Conditions)
 	defer func() {
+		conditionlog.Changes(ctrl.LoggerFrom(ctx), before, cfg.Status.Conditions, bootstrapv1.ReadyCondition)
 		if err := s.patch(ctx); err != nil {
 			rerr = kerrors.NewAggregate([]error{rerr, err})
 		}
@@ -295,7 +298,10 @@ func (r *ChalkosConfigReconciler) ensureDataSecret(ctx context.Context, s *scope
 		if err := controllerutil.SetControllerReference(s.cfg, secret, r.Client.Scheme()); err != nil {
 			return err
 		}
-		if err := r.Client.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		switch err := r.Client.Create(ctx, secret); {
+		case err == nil:
+			ctrl.LoggerFrom(ctx).Info("Created the bootstrap data Secret", "secret", key.Name)
+		case !apierrors.IsAlreadyExists(err):
 			return err
 		}
 	}
@@ -370,7 +376,10 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		return ctrl.Result{RequeueAfter: retryAfter}, nil
 	}
 	defer conn.Close()
-	recordFingerprint(s.cfg, conn.Fingerprint(), time.Now())
+	log := ctrl.LoggerFrom(ctx).WithValues("address", addr)
+	if recordFingerprint(s.cfg, conn.Fingerprint(), time.Now()) {
+		log.Info("Reached the machine in maintenance mode", "fingerprint", conn.Fingerprint())
+	}
 	s.cfg.Status.RefusedInputs = ""
 	s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, "The machine is installing")
 	if err := s.checkpoint(ctx); err != nil {
@@ -383,6 +392,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 	}
 	installCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	log.Info("Installing the machine", "image", s.cfg.Spec.Image)
 	err = conn.Install(installCtx, sdk.InstallRequest{
 		Node:      s.machine.Name,
 		Documents: docs,
@@ -406,6 +416,7 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, fmt.Sprintf("The install failed: %v", err))
 		return ctrl.Result{}, err
 	}
+	log.Info("The machine accepted the install and reboots into it")
 	s.cfg.Status.LastInstallTime = ptr.To(metav1.Now())
 	return r.verify(ctx, s, addr, sec, false)
 }
@@ -598,14 +609,15 @@ func internalIP(m *clusterv1.Machine) string {
 }
 
 // recordFingerprint appends the fingerprint seen at now unless it is the last one recorded,
-// keeping the newest maxFingerprints.
-func recordFingerprint(cfg *bootstrapv1.ChalkosConfig, fingerprint string, now time.Time) {
+// keeping the newest maxFingerprints. It tells whether it appended the fingerprint.
+func recordFingerprint(cfg *bootstrapv1.ChalkosConfig, fingerprint string, now time.Time) bool {
 	fps := cfg.Status.MaintenanceFingerprints
 	if len(fps) > 0 && fps[len(fps)-1].SHA256 == fingerprint {
-		return
+		return false
 	}
 	fps = append(fps, bootstrapv1.Fingerprint{SHA256: fingerprint, SeenAt: metav1.NewTime(now)})
 	cfg.Status.MaintenanceFingerprints = slices.Clone(fps[max(0, len(fps)-maxFingerprints):])
+	return true
 }
 
 // truncate shortens a condition's message to maxMessage bytes, at a character's boundary. The

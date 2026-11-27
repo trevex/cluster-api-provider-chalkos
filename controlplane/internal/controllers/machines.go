@@ -142,6 +142,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 		for i := range s.machines {
 			ok, err := r.joined(ctx, s, &s.machines[i], sec)
 			if err != nil || !ok {
+				s.waitingToJoin = s.machines[i].Name
 				return ctrl.Result{RequeueAfter: retryAfter}, err
 			}
 		}
@@ -150,6 +151,8 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	ctrl.LoggerFrom(ctx).Info("Created a control-plane Machine", "machine", m.Name,
+		"infrastructure", m.Spec.InfrastructureRef.Kind+"/"+m.Spec.InfrastructureRef.Name, "config", m.Spec.Bootstrap.ConfigRef.Name)
 	s.machines = append(s.machines, *m)
 	return ctrl.Result{}, nil
 }

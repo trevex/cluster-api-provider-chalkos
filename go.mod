@@ -4,6 +4,7 @@ go 1.27.4
 
 require (
 	connectrpc.com/connect/v2 v2.0.2
+	github.com/go-logr/logr v1.4.4
 	github.com/google/go-containerregistry v0.22.1
 	github.com/trevex/chalkos v0.7.3-0.20261127072722-46f275276f65
 	google.golang.org/protobuf v1.36.12
@@ -38,7 +39,6 @@ require (
 	github.com/foxboron/go-uefi v0.0.0-20261004203234-c7f1f57bdc6e // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.3 // indirect
-	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v1.0.0 // indirect

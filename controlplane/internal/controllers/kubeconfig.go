@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/cluster-api/util"
@@ -104,6 +105,7 @@ func (r *ChalkosControlPlaneReconciler) reconcileKubeconfig(ctx context.Context,
 	if err != nil {
 		return 0, err
 	}
+	ctrl.LoggerFrom(ctx).Info("Issued the kubeconfig", "secret", key.Name, "renewed", existing != nil, "expiresAt", cert.NotAfter.UTC())
 	s.cp.Status.KubeconfigExpiresAt = ptr.To(metav1.NewTime(cert.NotAfter))
 	return pki.RenewAt(cert).Sub(now), nil
 }

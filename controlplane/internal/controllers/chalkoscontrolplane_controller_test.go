@@ -616,6 +616,10 @@ func TestJoinsOneAtATime(t *testing.T) {
 	e.provision(second, "10.0.0.2", kubernetesv1.Phase_PHASE_JOINING)
 	e.mustReconcile()
 	e.wantMachines(2)
+	waiting := "Scaling up from 2 to 3 replicas; waiting for the Machine " + second.Name + " to join the cluster"
+	if got := conditions.Get(e.cp(), controlplanev1.ScalingUpCondition); got == nil || got.Message != waiting {
+		t.Errorf("ScalingUp = %+v, want the message %q", got, waiting)
+	}
 
 	e.setStatus("10.0.0.2", kubernetesv1.Phase_PHASE_BOOTSTRAPPED, false)
 	e.mustReconcile()
