@@ -29,6 +29,7 @@ import (
 	"connectrpc.com/connect/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -1194,5 +1196,30 @@ func TestDeletionWaitingForWorkersRenewsKubeconfig(t *testing.T) {
 	}
 	if renewed := clientCert(t, &s); !renewed.NotAfter.After(cert.NotAfter) {
 		t.Errorf("certificate until %s while the deletion waits, want after %s", renewed.NotAfter, cert.NotAfter)
+	}
+}
+
+// A management cluster without the MachinePool CRD has no MachinePools, and its worker Machines
+// are still counted.
+func TestCountWorkersWithoutMachinePoolCRD(t *testing.T) {
+	labels := map[string]string{clusterv1.ClusterNameLabel: clusterName}
+	worker := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "worker", Labels: labels}}
+	reader := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(worker).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*clusterv1.MachinePoolList); ok {
+					return &meta.NoKindMatchError{GroupKind: clusterv1.GroupVersion.WithKind("MachinePool").GroupKind()}
+				}
+				return c.List(ctx, list, opts...)
+			},
+		}).Build()
+	r := &ChalkosControlPlaneReconciler{APIReader: reader}
+	s := &scope{
+		cp:      &controlplanev1.ChalkosControlPlane{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: cpName}},
+		cluster: &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: clusterName}},
+	}
+	machines, pools, err := r.countWorkers(t.Context(), s)
+	if err != nil || machines != 1 || pools != 0 {
+		t.Errorf("countWorkers = %d, %d, %v; want 1, 0 and no error", machines, pools, err)
 	}
 }
