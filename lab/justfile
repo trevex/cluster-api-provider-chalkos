@@ -126,7 +126,8 @@ cluster:
     disk="$chalkos_image-disk@$(crane digest "$chalkos_image-disk:$chalkos_version")"
     version=v$(crane manifest "$image" | jq -er '.annotations["dev.chalkos.kubernetes.version"]')
     echo "chalkos $chalkos_version with Kubernetes $version: $image"
-    sed -e "s|@IMAGE@|$image|g" -e "s|@DISK@|$disk|g" -e "s|@VERSION@|$version|g" \
+    # Comment lines keep their placeholders, so the rendered file's header still reads.
+    sed -e "/^[[:space:]]*#/!{s|@IMAGE@|$image|g;s|@DISK@|$disk|g;s|@VERSION@|$version|g}" \
       lab/cluster.yaml.tmpl > {{lab}}/cluster.yaml
     # CAPK's webhook may refuse connections for a moment after clusterctl init returns.
     for attempt in $(seq 12); do
