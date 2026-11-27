@@ -11,7 +11,9 @@ set working-directory := ".."
 export kind_name := "chalkos-lab"
 export kubevirt_version := "v1.10.0"
 export cdi_version := "v1.66.1"
-export capi_version := "v1.14.4"
+# Cluster API core is the release go.mod builds the providers against, and clusterctl, a go.mod
+# tool, is of the same release.
+export capi_version := `go list -m sigs.k8s.io/cluster-api | cut -d" " -f2`
 export capk_version := "v0.11.2"
 
 lab := justfile_directory() / ".." / ".lab"

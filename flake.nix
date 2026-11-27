@@ -35,7 +35,9 @@
           pkgs.setup-envtest
           pkgs.kind
           pkgs.kubectl
-          pkgs.clusterctl
+          # clusterctl of the Cluster API release go.mod names, built as a go.mod tool, so the lab
+          # installs the core release the providers build against. It runs inside the repository.
+          (pkgs.writeShellScriptBin "clusterctl" ''exec go tool clusterctl "$@"'')
           pkgs.kubevirt # virtctl
           pkgs.just
           pkgs.crane
