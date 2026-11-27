@@ -57,6 +57,12 @@ func EtcdUnavailable() error {
 	return refusal(connect.CodeUnavailable, "etcdserver: request timed out")
 }
 
+// EtcdTimedOut is a control plane's answer that a call of its own, such as to its etcd, ran out of
+// time: the node itself was reached.
+func EtcdTimedOut() error {
+	return refusal(connect.CodeDeadlineExceeded, "context deadline exceeded")
+}
+
 // QuorumRefused is a control plane's refusal to remove member while the voters left would have no
 // healthy quorum.
 func QuorumRefused(member string) error {

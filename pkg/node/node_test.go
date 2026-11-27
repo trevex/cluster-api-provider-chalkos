@@ -220,11 +220,13 @@ func TestTryNextControlPlane(t *testing.T) {
 	}
 }
 
-// A node that answers was reached, also when it answers that its own etcd is unavailable.
+// A node that answers was reached, also when it answers that its own etcd is unavailable or that
+// a call of its own ran out of time.
 func TestUnreachable(t *testing.T) {
 	for err, want := range map[error]bool{
 		nodetest.Unreachable("10.0.0.1"):          true,
 		nodetest.EtcdUnavailable():                false,
+		nodetest.EtcdTimedOut():                   false,
 		context.DeadlineExceeded:                  true,
 		fmt.Errorf("x: %w", sdk.ErrNotInstalled):  true,
 		fmt.Errorf("x: %w", sdk.ErrOtherNode):     true,

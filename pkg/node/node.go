@@ -211,13 +211,12 @@ func (remote) PruneRevoked(ctx context.Context, addr string, s clustersecrets.Se
 
 // Unreachable tells whether err says the node could not be reached as itself: it did not answer
 // or not in time, runs in maintenance mode, or is another node. A node that answers Unavailable
-// itself, as when its own etcd does not answer, was reached and is not unreachable.
+// or DeadlineExceeded itself, as when its own etcd does not answer or a slow leave runs out of
+// time on the node, was reached and is not unreachable.
 func Unreachable(err error) bool {
 	switch connect.CodeOf(err) {
-	case connect.CodeUnavailable:
+	case connect.CodeUnavailable, connect.CodeDeadlineExceeded:
 		return !client.FromNode(err)
-	case connect.CodeDeadlineExceeded:
-		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sdk.ErrNotInstalled) || errors.Is(err, sdk.ErrOtherNode)
 }
