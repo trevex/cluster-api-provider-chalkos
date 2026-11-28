@@ -95,21 +95,13 @@ func (c *Cache) get(key string) (*ociimage.Artifact, bool) {
 func (c *Cache) add(key string, a *ociimage.Artifact) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.artifacts == nil {
-		c.artifacts = map[string]*ociimage.Artifact{}
-	}
-	if len(c.artifacts) >= maxArtifacts {
-		for k := range c.artifacts {
-			delete(c.artifacts, k)
-			break
-		}
-	}
-	c.artifacts[key] = a
+	hold(&c.artifacts, key, a)
 }
 
 // Contract is the contract, with chalkos's layers, of the image ref, read through n with the
 // credentials of the image pull Secret pull of the namespace, which r reads, as Image reads it. An
-// image named by digest keeps its contract, which is built from its schemas once.
+// image named by digest keeps its contract, which is built from its schemas once; two reconciles
+// that miss it at once may both build it.
 func (c *Cache) Contract(ctx context.Context, r client.Reader, n node.Client, ref, namespace string, pull *corev1.LocalObjectReference) (sdk.Contract, error) {
 	kc, err := Keychain(ctx, r, namespace, pull)
 	if err != nil {
@@ -120,17 +112,33 @@ func (c *Cache) Contract(ctx context.Context, r client.Reader, n node.Client, re
 		return sdk.Contract{}, fmt.Errorf("reading the image: %w", err)
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ct, ok := c.contracts[a.Reference]; ok {
+	ct, ok := c.contracts[a.Reference]
+	c.mu.Unlock()
+	if ok {
 		return ct, nil
 	}
-	ct, err := sdk.ArtifactContract(layers.All(), a)
+	// Compiling the schemas takes long, so the cache is not locked meanwhile.
+	ct, err = sdk.ArtifactContract(layers.All(), a)
 	if err != nil {
 		return sdk.Contract{}, err
 	}
-	if c.contracts == nil || len(c.contracts) >= maxArtifacts {
-		c.contracts = map[string]sdk.Contract{}
-	}
-	c.contracts[a.Reference] = ct
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	hold(&c.contracts, a.Reference, ct)
 	return ct, nil
+}
+
+// hold holds v under key in m, dropping another entry when m is full. The caller holds the
+// cache's lock.
+func hold[V any](m *map[string]V, key string, v V) {
+	if *m == nil {
+		*m = map[string]V{}
+	}
+	if _, ok := (*m)[key]; !ok && len(*m) >= maxArtifacts {
+		for k := range *m {
+			delete(*m, k)
+			break
+		}
+	}
+	(*m)[key] = v
 }

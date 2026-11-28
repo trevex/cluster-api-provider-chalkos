@@ -297,3 +297,23 @@ func TestControlPlaneStatusChanged(t *testing.T) {
 		}
 	}
 }
+
+// A status change of the ChalkosControlPlane reaches only the ChalkosConfigs that are not
+// installed; a change of its spec reaches every one.
+func TestControlPlaneStatusReachesUninstalledConfigs(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, "")
+	e.machine("w-2", false, "")
+	c := e.config("w-1")
+	c.Status.Installed = ptr.To(true)
+	if err := testClient.Status().Update(e.ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	cp := e.controlPlane()
+	if reqs := e.r.controlPlaneToUninstalled(e.ctx, cp); len(reqs) != 1 || reqs[0].Name != "w-2" {
+		t.Errorf("a status change maps to %v, want w-2", reqs)
+	}
+	if reqs := e.r.controlPlaneToConfigs(e.ctx, cp); len(reqs) != 2 {
+		t.Errorf("a spec change maps to %v, want w-1 and w-2", reqs)
+	}
+}

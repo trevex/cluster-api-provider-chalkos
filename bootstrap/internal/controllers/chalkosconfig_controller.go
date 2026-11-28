@@ -163,7 +163,9 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 				clusterInputsChanged(),
 			))).
 		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToConfigs),
-			builder.WithPredicates(predicate.Or[client.Object](predicate.GenerationChangedPredicate{}, controlPlaneStatusChanged()))).
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToUninstalled),
+			builder.WithPredicates(controlPlaneStatusChanged())).
 		Complete(r)
 }
 
@@ -626,6 +628,19 @@ func (r *ChalkosConfigReconciler) controlPlaneToConfigs(ctx context.Context, o c
 		}
 	}
 	return nil
+}
+
+// controlPlaneToUninstalled maps a ChalkosControlPlane to the ChalkosConfigs of its owner Cluster's
+// Machines that are not installed: only an install waits for its status, and an installed
+// machine is verified on its own schedule.
+func (r *ChalkosConfigReconciler) controlPlaneToUninstalled(ctx context.Context, o client.Object) []ctrl.Request {
+	return slices.DeleteFunc(r.controlPlaneToConfigs(ctx, o), func(req ctrl.Request) bool {
+		var cfg bootstrapv1.ChalkosConfig
+		if err := r.Client.Get(ctx, req.NamespacedName, &cfg); err != nil {
+			return apierrors.IsNotFound(err)
+		}
+		return ptr.Deref(cfg.Status.Installed, false)
+	})
 }
 
 // configsOf are the ChalkosConfigs of the Machines of the cluster.
