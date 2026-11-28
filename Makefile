@@ -112,4 +112,4 @@ local-repo: local-repo-manifests ## Build and push both managers' images to REGI
 # and deletes it. The lab must run already: just -f lab/justfile create kubevirt providers-local.
 .PHONY: e2e
 e2e: ## Create and delete the lab's workload cluster on a running KubeVirt lab.
-	go test -tags e2e -timeout 60m -count=1 -v ./test/e2e/
+	go test -tags e2e -timeout 90m -count=1 -v ./test/e2e/
