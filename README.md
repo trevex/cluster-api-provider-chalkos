@@ -387,8 +387,8 @@ an infrastructure provider:
 <!-- x-release-please-start-version -->
 ```sh
 clusterctl init \
-  --bootstrap chalkos:v0.3.0 \
-  --control-plane chalkos:v0.3.0 \
+  --bootstrap chalkos:v0.3.1 \
+  --control-plane chalkos:v0.3.1 \
   --infrastructure <provider>
 ```
 <!-- x-release-please-end -->
@@ -399,7 +399,7 @@ before you install it, download them with their signatures and verify both:
 
 <!-- x-release-please-start-version -->
 ```sh
-gh release download v0.3.0 --repo trevex/cluster-api-provider-chalkos \
+gh release download v0.3.1 --repo trevex/cluster-api-provider-chalkos \
   --pattern '*-components.yaml*' --pattern SHA256SUMS
 for file in bootstrap-components.yaml control-plane-components.yaml; do
   cosign verify-blob "$file" --bundle "$file.sigstore.json" \
@@ -523,7 +523,7 @@ release:
 
 <!-- x-release-please-start-version -->
 ```sh
-make local-repo REGISTRY=localhost:5001 IMG_TAG=dev VERSION=v0.3.0
+make local-repo REGISTRY=localhost:5001 IMG_TAG=dev VERSION=v0.3.1
 ```
 <!-- x-release-please-end -->
 
