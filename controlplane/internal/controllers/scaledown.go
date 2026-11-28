@@ -36,42 +36,51 @@ import (
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
 
-// scaleDown deletes the control plane's oldest Machine while it has more than Spec.Replicas asks
-// for, one at a time. A step starts only once the control plane is initialized, no Machine is
-// being deleted, every Machine joined, and a control plane's etcd lists one healthy voting member
-// per Machine. The Machine's pre-terminate hook takes it out of etcd and revokes it; the next step
-// waits until it is gone. Spec.Replicas is at least one, so the last Machine is never deleted.
+// scaleDown deletes the control plane's oldest Machine that is not up to date, or else its oldest
+// Machine, while it has more than Spec.Replicas asks for, one at a time. A step starts only once
+// the control plane is initialized, no Machine is being deleted or was created or deleted in this
+// reconcile, and stepProblem finds nothing. The Machine's pre-terminate hook takes it out of etcd
+// and revokes it; the next step waits until it is gone. Spec.Replicas is at least one, so the
+// last Machine is never deleted.
 func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	n, want := len(s.machines), max(1, int(ptr.Deref(s.cp.Spec.Replicas, 1)))
-	if n <= want || !s.initialized() || len(s.deleting) > 0 {
-		// A Machine being deleted is reported by its hook; its deletion reconciles again.
+	if n <= want || !s.initialized() || len(s.deleting) > 0 || s.stepped {
+		// A Machine being deleted is reported by its hook; its deletion reconciles again, as does
+		// a Machine's creation.
 		return ctrl.Result{}, nil
 	}
-	for i := range s.machines {
-		ok, err := r.joined(ctx, s, &s.machines[i], sec)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !ok {
-			s.scaleDownWaiting = fmt.Sprintf("Waiting for the Machine %s to join the cluster before scaling down from %d to %d replicas", s.machines[i].Name, n, want)
-			return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
-		}
+	why, err := r.stepProblem(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if why := r.etcdProblem(ctx, s, sec); why != "" {
+	if why != "" {
 		s.scaleDownWaiting = fmt.Sprintf("Not scaling down from %d to %d replicas yet: %s", n, want, why)
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
-	m := &s.machines[0]
-	// The UID keeps another Machine of the same name, created since the list, from being deleted.
-	if err := r.Client.Delete(ctx, m, client.Preconditions{UID: &m.UID}); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete the Machine %s: %w", m.Name, err)
+	// A Machine that is not up to date goes first, which a roll with maxSurge 1 relies on.
+	m := s.oldestOutdated()
+	if m == nil {
+		m = &s.machines[0]
 	}
-	ctrl.LoggerFrom(ctx).Info("Scaling down: deleting the oldest Machine", "machine", m.Name, "replicas", n, "want", want)
+	if err := r.deleteMachine(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	ctrl.LoggerFrom(ctx).Info("Scaling down: deleting a Machine", "machine", m.Name, "outOfDate", s.outOfDate(m) != "", "replicas", n, "want", want)
 	machineutil.Event(r.Recorder, s.cp, m, corev1.EventTypeNormal, "ScalingDown", "DeleteMachine",
 		"Deleting the Machine %s to scale down from %d to %d replicas", m.Name, n, want)
 	s.removing = fmt.Sprintf("the Machine %s is deleted", m.Name)
+	s.stepped = true
 	// The Machine's deletion reconciles again.
 	return ctrl.Result{}, nil
+}
+
+// deleteMachine deletes the Machine m, which its pre-terminate hook then takes out of etcd. The
+// UID keeps another Machine of the same name, created since the list, from being deleted.
+func (r *ChalkosControlPlaneReconciler) deleteMachine(ctx context.Context, m *clusterv1.Machine) error {
+	if err := r.Client.Delete(ctx, m, client.Preconditions{UID: &m.UID}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete the Machine %s: %w", m.Name, err)
+	}
+	return nil
 }
 
 // etcdProblem says why etcd may not gain or lose a member now, as the first of the control

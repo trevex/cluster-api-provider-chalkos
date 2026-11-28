@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilversion "k8s.io/apimachinery/pkg/util/version"
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 
+	"github.com/trevex/chalkos/pkg/clustersecrets"
 	"github.com/trevex/chalkos/pkg/sdk"
 	"github.com/trevex/chalkos/pkg/sdk/layers"
 
@@ -384,4 +386,127 @@ func (c *contractCache) of(ref string, build func() (sdk.Contract, error)) (sdk.
 	}
 	c.contracts[ref] = ct
 	return ct, nil
+}
+
+// stepProblem says why etcd may not gain or lose a member by a scale-down or roll step now: a
+// Machine that has not joined the cluster, or etcd's members as etcdProblem reads them; empty when
+// nothing does.
+func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets) (string, error) {
+	for i := range s.machines {
+		ok, err := r.joined(ctx, s, &s.machines[i], sec)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return fmt.Sprintf("waiting for the Machine %s to join the cluster", s.machines[i].Name), nil
+		}
+	}
+	return r.etcdProblem(ctx, s, sec), nil
+}
+
+// oldestOutdated is the oldest of the control plane's Machines that is neither being deleted nor
+// up to date; nil when every one is up to date.
+func (s *scope) oldestOutdated() *clusterv1.Machine {
+	for i := range s.machines {
+		if s.outOfDate(&s.machines[i]) != "" {
+			return &s.machines[i]
+		}
+	}
+	return nil
+}
+
+// rollOut takes the roll's next step while a Machine is not up to date and the control plane has
+// as many Machines as spec.replicas asks for, none being deleted. With maxSurge 1 it creates an
+// up-to-date Machine; once that one joined, scaleDown deletes the oldest Machine that is not up to
+// date. With maxSurge 0 it deletes that Machine first; scaleUp creates its replacement once it is
+// gone. A step starts only when the control plane is initialized, no guard holds, no other step
+// was taken in this reconcile, stepProblem finds nothing and the image accepts the documents the
+// new Machine installs with.
+func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
+	old := s.oldestOutdated()
+	want := int(ptr.Deref(s.cp.Spec.Replicas, 1))
+	switch {
+	case old == nil || s.held != "" || s.stepped || !s.initialized():
+		// RollingOut reports a guard; a step taken and the initialization reconcile again.
+		return ctrl.Result{}, nil
+	case len(s.machines) < want:
+		s.rollWaiting = s.scaleUpWaiting
+		return ctrl.Result{}, nil
+	case len(s.deleting) > 0:
+		// The Machine's deletion reconciles again.
+		s.rollWaiting = fmt.Sprintf("waiting for the Machine %s, being deleted, to go", s.deleting[0].Name)
+		return ctrl.Result{}, nil
+	case len(s.machines) > want:
+		s.rollWaiting = s.scaleDownWaiting
+		return ctrl.Result{}, nil
+	}
+	why, err := r.stepProblem(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if why != "" {
+		s.rollWaiting = why
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
+	}
+	if res := r.checkReplacement(ctx, s, old); s.held != "" {
+		return res, nil
+	}
+	log := ctrl.LoggerFrom(ctx)
+	if surge(s.cp) > 0 {
+		m, err := r.createMachine(ctx, s)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("Rolling out: created an up-to-date Machine", "machine", m.Name, "replaces", old.Name)
+		machineutil.Event(r.Recorder, s.cp, m, corev1.EventTypeNormal, "RollingOut", "CreateMachine",
+			"Creating the Machine %s to replace %s, which is not up to date", m.Name, old.Name)
+		s.machines = append(s.machines, *m)
+		s.stepped = true
+		return ctrl.Result{}, nil
+	}
+	if err := r.deleteMachine(ctx, old); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("Rolling out: deleting the oldest Machine that is not up to date", "machine", old.Name)
+	machineutil.Event(r.Recorder, s.cp, old, corev1.EventTypeNormal, "RollingOut", "DeleteMachine",
+		"Deleting the Machine %s, which is not up to date; its replacement is created once it is gone", old.Name)
+	s.removing = fmt.Sprintf("the Machine %s is deleted to be replaced", old.Name)
+	s.stepped = true
+	// The Machine's deletion reconciles again.
+	return ctrl.Result{}, nil
+}
+
+// checkReplacement holds the roll, in s.held, unless spec.image accepts the documents that the
+// Machine replacing old installs with, as the image's contract checks them before an install:
+// with maxSurge 0 old goes first, and must not go while no replacement can install. A refusal
+// holds with InvalidFilesReason until the files or the image change; a check that could not be
+// made, as while the image cannot be read, holds without a reason and returns when to try again.
+func (r *ChalkosControlPlaneReconciler) checkReplacement(ctx context.Context, s *scope, old *clusterv1.Machine) ctrl.Result {
+	log := ctrl.LoggerFrom(ctx)
+	c, err := r.contract(ctx, s.cp)
+	if err != nil {
+		log.V(1).Info("Not rolling out yet: reading the image's contract", "reason", err.Error())
+		// The message stays alike at every attempt; the error itself is logged.
+		s.held = fmt.Sprintf("the image %s cannot be read, so the documents of the Machine to replace %s with are not checked against it yet", s.cp.Spec.Image, old.Name)
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
+	}
+	// The replacement is checked under the name of the Machine it replaces: its own is made at
+	// its creation.
+	docs, err := documents.For(documents.ClusterMachine(s.cluster, old.Name, documents.ControlPlane, s.cp.Spec.Version), s.cp.Spec.Files, nil)
+	if err != nil {
+		s.held, s.heldReason = "spec.files cannot be made into a control-plane Machine's documents: "+err.Error(), controlplanev1.InvalidFilesReason
+		return ctrl.Result{}
+	}
+	_, err = sdk.Check(ctx, c, old.Name, sdk.NodeDocuments(layers.All(), docs))
+	switch {
+	case err == nil:
+	case sdk.Refused(err):
+		s.held = fmt.Sprintf("the image %s refuses the documents the Machine to replace %s with would install with: %v", s.cp.Spec.Image, old.Name, err)
+		s.heldReason = controlplanev1.InvalidFilesReason
+	default:
+		log.V(1).Info("Not rolling out yet: checking the documents against the image", "reason", err.Error())
+		s.held = fmt.Sprintf("the documents of the Machine to replace %s with could not be checked against the image %s yet", old.Name, s.cp.Spec.Image)
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
+	}
+	return ctrl.Result{}
 }

@@ -234,6 +234,9 @@ type scope struct {
 	// rollWaiting is what the roll's next step waits for, for the RollingOut condition; empty
 	// when nothing.
 	rollWaiting string
+	// stepped is set once this reconcile created or deleted a Machine; no other Machine is
+	// created or deleted until the next.
+	stepped bool
 	// imageWaiting is why status.observedFiles is not recorded yet, as while the image cannot be
 	// read; empty when nothing.
 	imageWaiting string
@@ -358,7 +361,11 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	res = earliest(earliest(res, down), earliest(guarded, earliest(r.untilRolloutAfter(s), r.observeFiles(ctx, s))))
+	roll, err := r.rollOut(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	res = earliest(earliest(earliest(res, down), roll), earliest(guarded, earliest(r.untilRolloutAfter(s), r.observeFiles(ctx, s))))
 	if !s.initialized() {
 		return res, nil
 	}

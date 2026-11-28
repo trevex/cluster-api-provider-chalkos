@@ -163,6 +163,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 	ctrl.LoggerFrom(ctx).Info("Created a control-plane Machine", "machine", m.Name,
 		"infrastructure", m.Spec.InfrastructureRef.Kind+"/"+m.Spec.InfrastructureRef.Name, "config", m.Spec.Bootstrap.ConfigRef.Name)
 	s.machines = append(s.machines, *m)
+	s.stepped = true
 	return ctrl.Result{}, nil
 }
 
