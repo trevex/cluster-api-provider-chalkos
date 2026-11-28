@@ -37,9 +37,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/labels/format"
-	"sigs.k8s.io/cluster-api/util/patch"
 
 	"github.com/trevex/chalkos/pkg/clustersecrets"
 
@@ -95,37 +93,6 @@ func (r *ChalkosControlPlaneReconciler) listMachines(ctx context.Context, s *sco
 		}
 	}
 	s.listed = true
-	return nil
-}
-
-// upToDate tells whether the Machine is of the control plane's spec: of its Kubernetes version,
-// the one field a Machine is not created with again yet.
-func upToDate(cp *controlplanev1.ChalkosControlPlane, m *clusterv1.Machine) bool {
-	return m.Spec.Version == cp.Spec.Version
-}
-
-// markUpToDate sets the UpToDate condition of each Machine that is not being deleted, through the
-// Machine's status.
-func (r *ChalkosControlPlaneReconciler) markUpToDate(ctx context.Context, s *scope) error {
-	for i := range s.machines {
-		m := &s.machines[i]
-		want := metav1.Condition{Type: clusterv1.MachineUpToDateCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineUpToDateReason}
-		if !upToDate(s.cp, m) {
-			want.Status, want.Reason = metav1.ConditionFalse, clusterv1.MachineNotUpToDateReason
-			want.Message = fmt.Sprintf("The Machine is of version %s, the control plane of %s", m.Spec.Version, s.cp.Spec.Version)
-		}
-		if got := conditions.Get(m, want.Type); got != nil && got.Status == want.Status && got.Reason == want.Reason && got.Message == want.Message {
-			continue
-		}
-		h, err := patch.NewHelper(m, r.Client)
-		if err != nil {
-			return err
-		}
-		conditions.Set(m, want)
-		if err := h.Patch(ctx, m, patch.WithOwnedConditions{Conditions: []string{clusterv1.MachineUpToDateCondition}}); err != nil {
-			return fmt.Errorf("set the UpToDate condition of the Machine %s: %w", m.Name, err)
-		}
-	}
 	return nil
 }
 
@@ -205,9 +172,15 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 		return nil, fmt.Errorf("clone the machine template's infrastructure: %w", err)
 	}
 
+	// The ChalkosConfig and the Machine carry the spec hash they are made from.
+	cfgAnnotations := maps.Clone(annotations)
+	if cfgAnnotations == nil {
+		cfgAnnotations = map[string]string{}
+	}
+	cfgAnnotations[controlplanev1.SpecHashAnnotation] = s.hash
 	cfg := &bootstrapv1.ChalkosConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: annotations,
+			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: cfgAnnotations,
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Spec: bootstrapv1.ChalkosConfigSpec{Image: cp.Spec.Image, ImagePullSecretRef: cp.Spec.ImagePullSecretRef.DeepCopy()},
@@ -217,10 +190,7 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 	}
 
 	// Only the Machine carries the pre-terminate hook.
-	machineAnnotations := maps.Clone(annotations)
-	if machineAnnotations == nil {
-		machineAnnotations = map[string]string{}
-	}
+	machineAnnotations := maps.Clone(cfgAnnotations)
 	machineAnnotations[machineutil.HookAnnotation] = machineutil.ControlPlaneHookOwner
 	deletion := cp.Spec.MachineTemplate.Spec.Deletion
 	m := &clusterv1.Machine{

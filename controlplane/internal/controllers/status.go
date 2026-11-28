@@ -64,7 +64,7 @@ func setStatus(s *scope) {
 		if conditions.IsTrue(m, clusterv1.MachineAvailableCondition) {
 			available++
 		}
-		if upToDate(s.cp, m) {
+		if s.outOfDate(m) == "" {
 			current++
 		}
 		counts[m.Spec.Version]++
