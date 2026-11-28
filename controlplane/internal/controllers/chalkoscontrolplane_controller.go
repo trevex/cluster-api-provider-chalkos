@@ -103,11 +103,9 @@ type ChalkosControlPlaneReconciler struct {
 	// the revoked nodes; nil records none.
 	Recorder events.EventRecorder
 
-	// artifacts holds the images read before, whose contracts default status.observedFiles and
-	// mark the fields the guard compares.
+	// artifacts holds the images read before and their contracts, which default
+	// status.observedFiles and mark the fields the guard compares.
 	artifacts images.Cache
-	// contracts holds the contracts of the images read before.
-	contracts contractCache
 }
 
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes,verbs=get;list;watch;update;patch

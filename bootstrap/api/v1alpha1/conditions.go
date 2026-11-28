@@ -115,6 +115,12 @@ const (
 	// would get change a field every node of the cluster holds alike against the
 	// ChalkosControlPlane's status.observedFiles. It installs once the change is reverted.
 	FixedFieldChangedReason = "FixedFieldChanged"
+
+	// ObservedFilesInvalidReason documents a Machine that waits to install because the
+	// ChalkosControlPlane's status.observedFiles cannot be compared with the cluster-wide documents,
+	// for which the control plane holds its own new Machines with InvalidFiles too. It installs once
+	// the record is cleared or the files change.
+	ObservedFilesInvalidReason = "ObservedFilesInvalid"
 )
 
 // VersionSkewCondition reports, on a worker's ChalkosConfig, whether the worker's Kubernetes

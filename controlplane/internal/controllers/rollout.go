@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -45,7 +44,6 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
-	"github.com/trevex/cluster-api-provider-chalkos/internal/images"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/documents"
 )
@@ -347,45 +345,7 @@ func surge(cp *controlplanev1.ChalkosControlPlane) int {
 // contract is the contract of the ChalkosControlPlane's image, which the Machines are built from,
 // read with its image pull Secret.
 func (r *ChalkosControlPlaneReconciler) contract(ctx context.Context, cp *controlplanev1.ChalkosControlPlane) (sdk.Contract, error) {
-	kc, err := images.Keychain(ctx, r.APIReader, cp.Namespace, cp.Spec.ImagePullSecretRef)
-	if err != nil {
-		return sdk.Contract{}, err
-	}
-	a, err := r.artifacts.Image(ctx, r.Node, string(cp.Spec.Image), cp.Namespace, cp.Spec.ImagePullSecretRef, kc)
-	if err != nil {
-		return sdk.Contract{}, fmt.Errorf("reading the image: %w", err)
-	}
-	return r.contracts.of(a.Reference, func() (sdk.Contract, error) { return sdk.ArtifactContract(layers.All(), a) })
-}
-
-// maxContracts is how many contracts a contractCache holds.
-const maxContracts = 64
-
-// contractCache holds the contracts of images read before, by reference: an image named by digest
-// keeps its contract, which is built from its schemas once. It is safe for concurrent use; its
-// zero value is empty.
-type contractCache struct {
-	mu        sync.Mutex
-	contracts map[string]sdk.Contract
-}
-
-// of returns the contract held for ref, or builds it with build and holds it, dropping the others
-// when the cache is full.
-func (c *contractCache) of(ref string, build func() (sdk.Contract, error)) (sdk.Contract, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ct, ok := c.contracts[ref]; ok {
-		return ct, nil
-	}
-	ct, err := build()
-	if err != nil {
-		return sdk.Contract{}, err
-	}
-	if c.contracts == nil || len(c.contracts) >= maxContracts {
-		c.contracts = map[string]sdk.Contract{}
-	}
-	c.contracts[ref] = ct
-	return ct, nil
+	return r.artifacts.Contract(ctx, r.APIReader, r.Node, string(cp.Spec.Image), cp.Namespace, cp.Spec.ImagePullSecretRef)
 }
 
 // stepProblem says why etcd may not gain or lose a member by a scale-down or roll step now: a

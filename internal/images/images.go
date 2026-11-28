@@ -29,6 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/trevex/chalkos/pkg/ociimage"
+	"github.com/trevex/chalkos/pkg/sdk"
+	"github.com/trevex/chalkos/pkg/sdk/layers"
 
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
@@ -36,7 +38,7 @@ import (
 // Timeout bounds the read of an image's header and contract from its registry.
 const Timeout = 2 * time.Minute
 
-// maxArtifacts is how many image artifacts a Cache holds.
+// maxArtifacts is how many image artifacts, and how many contracts, a Cache holds.
 const maxArtifacts = 64
 
 // Keychain returns the credentials of the image pull Secret ref names in the namespace, read with
@@ -52,11 +54,12 @@ func Keychain(ctx context.Context, r client.Reader, namespace string, ref *corev
 	return KeychainOf(&s)
 }
 
-// Cache holds the artifacts of images read before, by reference and pull Secret. It is safe for
-// concurrent use; its zero value is empty.
+// Cache holds the artifacts of images read before, by reference and pull Secret, and the contracts
+// built from them, by reference. It is safe for concurrent use; its zero value is empty.
 type Cache struct {
 	mu        sync.Mutex
 	artifacts map[string]*ociimage.Artifact
+	contracts map[string]sdk.Contract
 }
 
 // Image reads the image ref, by digest, through n with the credentials kc, or answers it from the
@@ -102,4 +105,32 @@ func (c *Cache) add(key string, a *ociimage.Artifact) {
 		}
 	}
 	c.artifacts[key] = a
+}
+
+// Contract is the contract, with chalkos's layers, of the image ref, read through n with the
+// credentials of the image pull Secret pull of the namespace, which r reads, as Image reads it. An
+// image named by digest keeps its contract, which is built from its schemas once.
+func (c *Cache) Contract(ctx context.Context, r client.Reader, n node.Client, ref, namespace string, pull *corev1.LocalObjectReference) (sdk.Contract, error) {
+	kc, err := Keychain(ctx, r, namespace, pull)
+	if err != nil {
+		return sdk.Contract{}, err
+	}
+	a, err := c.Image(ctx, n, ref, namespace, pull, kc)
+	if err != nil {
+		return sdk.Contract{}, fmt.Errorf("reading the image: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ct, ok := c.contracts[a.Reference]; ok {
+		return ct, nil
+	}
+	ct, err := sdk.ArtifactContract(layers.All(), a)
+	if err != nil {
+		return sdk.Contract{}, err
+	}
+	if c.contracts == nil || len(c.contracts) >= maxArtifacts {
+		c.contracts = map[string]sdk.Contract{}
+	}
+	c.contracts[a.Reference] = ct
+	return ct, nil
 }

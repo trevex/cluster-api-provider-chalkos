@@ -163,7 +163,7 @@ func (r *ChalkosConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 				clusterInputsChanged(),
 			))).
 		Watches(&controlplanev1.ChalkosControlPlane{}, handler.EnqueueRequestsFromMapFunc(r.controlPlaneToConfigs),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			builder.WithPredicates(predicate.Or[client.Object](predicate.GenerationChangedPredicate{}, controlPlaneStatusChanged()))).
 		Complete(r)
 }
 
@@ -219,7 +219,7 @@ func (s *scope) track() error {
 // patch writes the ChalkosConfig's changes.
 func (s *scope) patch(ctx context.Context) error {
 	return s.helper.Patch(ctx, s.cfg,
-		patch.WithOwnedConditions{Conditions: []string{bootstrapv1.ReadyCondition, bootstrapv1.InstalledCondition, bootstrapv1.NodeRemovedCondition}},
+		patch.WithOwnedConditions{Conditions: []string{bootstrapv1.ReadyCondition, bootstrapv1.InstalledCondition, bootstrapv1.NodeRemovedCondition, bootstrapv1.VersionSkewCondition}},
 		patch.WithStatusObservedGeneration{})
 }
 
@@ -351,9 +351,13 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		s.set(metav1.ConditionFalse, bootstrapv1.WaitingForInfrastructureReason, "The Cluster has no controlPlaneEndpoint yet")
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
-	clusterFiles, cpErr := r.clusterFiles(ctx, s.cluster)
+	cp, cpErr := r.controlPlane(ctx, s.cluster)
 	if cpErr != nil && !errors.Is(cpErr, errNoChalkosControlPlane) {
 		return ctrl.Result{}, cpErr
+	}
+	var clusterFiles []runtime.RawExtension
+	if cp != nil {
+		clusterFiles = cp.Spec.Files
 	}
 	m := machineOf(s.machine, s.cluster)
 	in, err := inputsDigest(m, s.cluster.Spec.ControlPlaneRef, clusterFiles, s.cfg.Spec.Files, string(s.cfg.Spec.Image), sec.OSCA.Certificate)
@@ -367,6 +371,9 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 	case cpErr != nil:
 		s.refuse(bootstrapv1.ConfigRefusedReason, cpErr.Error(), in)
 		return ctrl.Result{}, nil
+	}
+	if res, wait := r.holdForControlPlane(ctx, s, cp, in); wait {
+		return res, nil
 	}
 	kc, err := images.Keychain(ctx, r.APIReader, s.cfg.Namespace, s.cfg.Spec.ImagePullSecretRef)
 	if err != nil {
@@ -505,9 +512,9 @@ func (r *ChalkosConfigReconciler) takeSlot() (release func(), ok bool) {
 	}
 }
 
-// clusterFiles are the spec.files of the Cluster's ChalkosControlPlane: the cluster-wide
-// documents. A Cluster with another control plane fails with errNoChalkosControlPlane.
-func (r *ChalkosConfigReconciler) clusterFiles(ctx context.Context, cluster *clusterv1.Cluster) ([]runtime.RawExtension, error) {
+// controlPlane is the Cluster's ChalkosControlPlane, which holds the cluster-wide documents in
+// spec.files. A Cluster with another control plane fails with errNoChalkosControlPlane.
+func (r *ChalkosConfigReconciler) controlPlane(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1.ChalkosControlPlane, error) {
 	ref := cluster.Spec.ControlPlaneRef
 	if ref.APIGroup != controlplanev1.GroupVersion.Group || ref.Kind != "ChalkosControlPlane" {
 		return nil, errNoChalkosControlPlane
@@ -516,7 +523,7 @@ func (r *ChalkosConfigReconciler) clusterFiles(ctx context.Context, cluster *clu
 	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: ref.Name}, &cp); err != nil {
 		return nil, fmt.Errorf("the Cluster's ChalkosControlPlane: %w", err)
 	}
-	return cp.Spec.Files, nil
+	return &cp, nil
 }
 
 // inputsDigest is the SHA-256, in hex, of the canonical JSON of what an install of the machine is
@@ -695,6 +702,23 @@ func clusterInputsChanged() predicate.Funcs {
 			return old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint ||
 				old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef ||
 				!equality.Semantic.DeepEqual(old.Spec.ClusterNetwork, cur.Spec.ClusterNetwork)
+		},
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// controlPlaneStatusChanged passes the updates of a ChalkosControlPlane whose status.versions or
+// status.observedFiles changed, which a Machine that waits for the control plane's upgrade or for
+// a pending change of a fixed field to be resolved waits for.
+func controlPlaneStatusChanged() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok := e.ObjectOld.(*controlplanev1.ChalkosControlPlane)
+			cur, ok2 := e.ObjectNew.(*controlplanev1.ChalkosControlPlane)
+			return ok && ok2 && (old.Status.ObservedFiles != cur.Status.ObservedFiles ||
+				!equality.Semantic.DeepEqual(old.Status.Versions, cur.Status.Versions))
 		},
 		CreateFunc:  func(event.CreateEvent) bool { return false },
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },
