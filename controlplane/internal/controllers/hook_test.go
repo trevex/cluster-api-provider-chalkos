@@ -457,7 +457,7 @@ func TestControlPlaneRevocationOfAFullList(t *testing.T) {
 	}
 	gone := ms[2].Name
 	prunes := e.prunes(addrs[ms[0].Name])
-	e.clock.Step(fullListPruneInterval)
+	e.clock.Step(machineutil.FullListPruneInterval)
 	e.atHook(gone)
 	e.mustReconcile()
 	if !e.hooked(gone) {
@@ -481,15 +481,15 @@ func TestControlPlaneRevocationOfAFullList(t *testing.T) {
 		}
 	}
 	if got := e.prunes(addrs[ms[0].Name]); got != prunes+1 {
-		t.Errorf("%d prunes within %s, want %d", got, fullListPruneInterval, prunes+1)
+		t.Errorf("%d prunes within %s, want %d", got, machineutil.FullListPruneInterval, prunes+1)
 	}
 	if e.cp().ResourceVersion != cpVersion || e.machine(gone).ResourceVersion != mVersion {
 		t.Error("a waiting pass wrote the ChalkosControlPlane or the Machine")
 	}
-	e.clock.Step(fullListPruneInterval)
+	e.clock.Step(machineutil.FullListPruneInterval)
 	e.mustReconcile()
 	if got := e.prunes(addrs[ms[0].Name]); got != prunes+2 {
-		t.Errorf("%d prunes after %s, want %d", got, fullListPruneInterval, prunes+2)
+		t.Errorf("%d prunes after %s, want %d", got, machineutil.FullListPruneInterval, prunes+2)
 	}
 }
 
@@ -511,7 +511,7 @@ func TestControlPlaneRevokedAfterAPrune(t *testing.T) {
 		}
 	})
 	gone := ms[2].Name
-	e.clock.Step(fullListPruneInterval)
+	e.clock.Step(machineutil.FullListPruneInterval)
 	e.atHook(gone)
 	e.mustReconcile()
 	if n, _ := e.fake.Node(addrs[ms[0].Name]); !slices.Equal(n.Revoked, []string{gone}) {

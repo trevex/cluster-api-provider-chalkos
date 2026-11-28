@@ -221,6 +221,20 @@ func Unreachable(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sdk.ErrNotInstalled) || errors.Is(err, sdk.ErrOtherNode)
 }
 
+// ConditionError is err as a condition's message tells it. A message that changes from one pass
+// to the next writes the status, which reconciles again at once; the text of the client's own
+// error for a node it cannot reach, and of a node's own Unavailable or DeadlineExceeded, varies
+// with how the call failed, so these read only as what they mean. The caller logs err in full.
+func ConditionError(err error) string {
+	switch code := connect.CodeOf(err); {
+	case Unreachable(err):
+		return "unreachable"
+	case code == connect.CodeUnavailable || code == connect.CodeDeadlineExceeded:
+		return "the node answers " + code.String()
+	}
+	return err.Error()
+}
+
 // TryNextControlPlane tells whether another control plane may answer a request for the cluster,
 // such as EtcdRemoveMember or RevokeNode, where one failed with err: it is unreachable or no etcd
 // member.

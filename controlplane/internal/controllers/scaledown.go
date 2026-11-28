@@ -98,9 +98,9 @@ func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scop
 			case err == nil:
 				return membersProblem(members, s.machines, s.deleting)
 			case node.TryNextControlPlane(err):
-				tried = append(tried, fmt.Sprintf("%s: %s", m.Name, conditionError(err)))
+				tried = append(tried, fmt.Sprintf("%s: %s", m.Name, node.ConditionError(err)))
 			default:
-				return fmt.Sprintf("listing etcd's members through %s: %s", m.Name, conditionError(err))
+				return fmt.Sprintf("listing etcd's members through %s: %s", m.Name, node.ConditionError(err))
 			}
 		}
 	}

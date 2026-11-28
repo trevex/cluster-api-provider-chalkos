@@ -20,9 +20,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -141,13 +143,15 @@ func everReached(st *bootstrapv1.ChalkosConfigStatus) bool {
 // and returns that control plane's name and its answer. One that cannot be reached, or is no
 // etcd member, such as one that left etcd, is passed over, and so is one that refuses otherwise;
 // when none revokes the node, it returns the reason and message the hook waits with. A full list
-// is pruned through the control plane that refused it and the revocation tried once more; when
-// the list stays full, no other control plane is asked, as the list is the cluster's. A pass
-// prunes once at most.
+// is pruned through the control plane that refused it, unless a hook of the Cluster's workers
+// pruned it less than machineutil.FullListPruneInterval ago, and the revocation tried once more;
+// when the list stays full, no other control plane is asked, as the list is the cluster's. The
+// message tells each error as node.ConditionError does, so that a pass that waits as the one
+// before writes nothing; the log has the errors in full.
 func (r *ChalkosConfigReconciler) revokeWorker(ctx context.Context, s *scope, cps []clusterv1.Machine, sec clustersecrets.Secrets) (string, *kubernetesv1.RevokeNodeResponse, string, string) {
 	worker := s.machine.Name
 	var tried []string
-	refused, pruned := false, ""
+	refused, pruned := false, false
 	for i := range cps {
 		cp := &cps[i]
 		addr := machineutil.InternalIP(cp)
@@ -155,24 +159,28 @@ func (r *ChalkosConfigReconciler) revokeWorker(ctx context.Context, s *scope, cp
 			continue
 		}
 		resp, err := r.revoke(ctx, addr, sec, cp.Name, worker)
-		if sdkkubernetes.RevokedListFull(err) && pruned == "" {
+		if sdkkubernetes.RevokedListFull(err) && !pruned && r.claimPrune(client.ObjectKeyFromObject(s.cluster)) {
 			// A full list may hold entries nothing lets back in any more: drop them and try once
 			// more.
-			pruned = r.prune(ctx, s, addr, sec, cp.Name)
+			r.prune(ctx, s, addr, sec, cp.Name)
+			pruned = true
 			resp, err = r.revoke(ctx, addr, sec, cp.Name, worker)
 		}
 		switch {
 		case err == nil:
 			return cp.Name, resp, "", ""
 		case sdkkubernetes.RevokedListFull(err):
+			// The message leaves out the prune, which only some passes make, so that it stays the
+			// same.
 			return "", nil, bootstrapv1.RevokedListFullReason, fmt.Sprintf(
-				"%v; %s; the Machine waits until there is room: rotate the cluster's CAs with chalkctl rotate os-ca and chalkctl rotate kubernetes-ca, "+
+				"%s; PruneRevoked made too little room; the Machine waits until there is room: rotate the cluster's CAs with chalkctl rotate os-ca and chalkctl rotate kubernetes-ca, "+
 					"after which PruneRevoked drops the nodes revoked before them, or remove the annotation %s to delete the Machine without revoking its node",
-				err, pruned, machineutil.HookAnnotation)
+				node.ConditionError(err), machineutil.HookAnnotation)
 		case !node.TryNextControlPlane(err):
 			refused = true
 		}
-		tried = append(tried, fmt.Sprintf("%s: %v", cp.Name, err))
+		ctrl.LoggerFrom(ctx).Info("A control plane did not revoke the node", "controlPlane", cp.Name, "error", err.Error())
+		tried = append(tried, fmt.Sprintf("%s: %s", cp.Name, node.ConditionError(err)))
 	}
 	switch {
 	case len(tried) == 0:
@@ -181,6 +189,33 @@ func (r *ChalkosConfigReconciler) revokeWorker(ctx context.Context, s *scope, cp
 		return "", nil, bootstrapv1.RevokingReason, "No control plane revoked the node: " + strings.Join(tried, "; ")
 	}
 	return "", nil, bootstrapv1.WaitingForControlPlaneReason, "No control plane revoked the node: " + strings.Join(tried, "; ")
+}
+
+// claimPrune tells whether a worker's hook that finds the Cluster's list of revoked nodes full
+// prunes it, and if so records the prune: no hook of the Cluster's workers pruned it in the last
+// machineutil.FullListPruneInterval. A full list stays full until the cluster's CAs are rotated,
+// which takes longer than that; between prunes, the hook only retries the revocation. The control
+// plane prunes the list too, daily and when its own hooks find it full.
+func (r *ChalkosConfigReconciler) claimPrune(cluster client.ObjectKey) bool {
+	now := r.clock().Now()
+	r.prunesMu.Lock()
+	defer r.prunesMu.Unlock()
+	if last, ok := r.prunes[cluster]; ok && now.Before(last.Add(machineutil.FullListPruneInterval)) {
+		return false
+	}
+	if r.prunes == nil {
+		r.prunes = map[client.ObjectKey]time.Time{}
+	}
+	r.prunes[cluster] = now
+	return true
+}
+
+// clock is the reconciler's clock.
+func (r *ChalkosConfigReconciler) clock() clock.PassiveClock {
+	if r.Clock == nil {
+		return clock.RealClock{}
+	}
+	return r.Clock
 }
 
 // revoke revokes the node worker through the control plane name at addr, within
@@ -192,20 +227,19 @@ func (r *ChalkosConfigReconciler) revoke(ctx context.Context, addr string, sec c
 }
 
 // prune has the control plane name at addr prune its list of revoked nodes, within
-// machineutil.HookCallTimeout, and describes the outcome. A failure is reported, not returned:
-// the revocation that follows tells whether there is room.
-func (r *ChalkosConfigReconciler) prune(ctx context.Context, s *scope, addr string, sec clustersecrets.Secrets, name string) string {
+// machineutil.HookCallTimeout. A failure is logged and recorded as an event, not returned: the
+// revocation that follows tells whether there is room.
+func (r *ChalkosConfigReconciler) prune(ctx context.Context, s *scope, addr string, sec clustersecrets.Secrets, name string) {
 	callCtx, cancel := context.WithTimeout(ctx, machineutil.HookCallTimeout)
 	defer cancel()
 	resp, err := r.Node.PruneRevoked(callCtx, addr, sec, name)
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Info("Pruning the revoked nodes failed", "controlPlane", name, "error", err.Error())
 		machineutil.Event(r.Recorder, s.cfg, s.machine, corev1.EventTypeWarning, "PruneRevokedFailed", "PruneRevoked", "%s",
-			machineutil.Truncate(fmt.Sprintf("Pruning the revoked nodes through %s: %v", name, err)))
-		return fmt.Sprintf("pruning the list through %s failed: %v", name, err)
+			machineutil.Truncate(fmt.Sprintf("Pruning the revoked nodes through %s: %s", name, node.ConditionError(err))))
+		return
 	}
 	ctrl.LoggerFrom(ctx).Info("Pruned the revoked nodes", "controlPlane", name, "pruned", resp.GetPruned())
-	return fmt.Sprintf("pruning the list through %s dropped %d nodes, which made too little room", name, len(resp.GetPruned()))
 }
 
 // hookWaits reports a hook pass that could not finish: the hook stays, a Warning event is

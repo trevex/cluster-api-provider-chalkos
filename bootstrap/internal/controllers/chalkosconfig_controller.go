@@ -41,6 +41,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -123,10 +124,18 @@ type ChalkosConfigReconciler struct {
 	WatchFilterValue string
 	// Recorder records the events of the workers' pre-terminate hooks; nil records none.
 	Recorder events.EventRecorder
+	// Clock tells when a worker's hook last pruned a full list of revoked nodes; nil is the real
+	// clock.
+	Clock clock.PassiveClock
 
 	slotsOnce sync.Once
 	slots     chan struct{}
 	images    imageCache
+
+	// prunes holds, per Cluster, when a worker's hook last had a control plane prune the full
+	// list of revoked nodes. It lives only in memory: a restarted controller prunes once more.
+	prunesMu sync.Mutex
+	prunes   map[client.ObjectKey]time.Time
 }
 
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigs,verbs=get;list;watch;update;patch

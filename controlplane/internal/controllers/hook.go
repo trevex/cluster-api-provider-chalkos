@@ -79,11 +79,6 @@ func (r *ChalkosControlPlaneReconciler) removeAllHooks(ctx context.Context, s *s
 // when no hook revoked one meanwhile.
 const pruneInterval = 24 * time.Hour
 
-// fullListPruneInterval is how long after the last prune a hook that finds the list of revoked
-// nodes full prunes it again before it retries the revocation. Within it, the hook only waits:
-// each prune records its time in the status, whose write would reconcile again at once.
-const fullListPruneInterval = 5 * time.Minute
-
 // errNoAddress is the error of a Machine without an InternalIP to reach it at.
 var errNoAddress = errors.New("the Machine has no InternalIP")
 
@@ -221,7 +216,7 @@ func (r *ChalkosControlPlaneReconciler) votingPeer(ctx context.Context, s *scope
 		cancel()
 		if err != nil {
 			ctrl.LoggerFrom(ctx).Info("Listing etcd's members failed", "machine", m.Name, "through", c.Name, "error", err.Error())
-			tried = append(tried, fmt.Sprintf("%s: %s", c.Name, conditionError(err)))
+			tried = append(tried, fmt.Sprintf("%s: %s", c.Name, node.ConditionError(err)))
 			continue
 		}
 		return slices.ContainsFunc(members, func(mem *kubernetesv1.EtcdMember) bool {
@@ -248,22 +243,6 @@ func lastVoterMessage(s *scope, m *clusterv1.Machine, why string) string {
 		return fmt.Sprintf("the Machine %s waits for its replacement control plane to join etcd; %s", m.Name, breakGlass)
 	}
 	return fmt.Sprintf("the Machine %s is etcd's last voter and leaves after the other Machines", m.Name)
-}
-
-// conditionError is err as a condition's message tells it. A message that changes from one pass
-// to the next writes the status, which reconciles again at once; the text of the client's own
-// error for a node it cannot reach, and of a node's own Unavailable or DeadlineExceeded, varies
-// with how the call failed, so these read only as what they mean. The log has them in full.
-func conditionError(err error) string {
-	switch code := connect.CodeOf(err); {
-	case errors.Is(err, errNoAddress):
-		return err.Error()
-	case node.Unreachable(err):
-		return "unreachable"
-	case code == connect.CodeUnavailable || code == connect.CodeDeadlineExceeded:
-		return "the node answers " + code.String()
-	}
-	return err.Error()
 }
 
 // everReached tells whether the bootstrap provider ever reached the Machine's machine to install
@@ -302,7 +281,7 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 		// whose own etcd member does not answer refuses to leave through the other members alone;
 		// once someone removed that member through them, the node is no member and the leave done.
 		ctrl.LoggerFrom(ctx).Info("The node does not leave etcd", "machine", m.Name, "error", err.Error())
-		msg := fmt.Sprintf("the Machine %s does not leave etcd: %s", m.Name, conditionError(err))
+		msg := fmt.Sprintf("the Machine %s does not leave etcd: %s", m.Name, node.ConditionError(err))
 		if connect.CodeOf(err) == connect.CodeFailedPrecondition {
 			msg += fmt.Sprintf("; when its own etcd member does not answer, remove the member through another control plane with chalkctl etcd remove-member %s, and the hook goes on", m.Name)
 		}
@@ -321,7 +300,7 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 			return true
 		}
 		ctrl.LoggerFrom(ctx).Info("A control plane did not remove the etcd member", "machine", m.Name, "through", p.Name, "error", perr.Error())
-		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, conditionError(perr)))
+		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, node.ConditionError(perr)))
 		if connect.CodeOf(perr) == connect.CodeFailedPrecondition && !sdkkubernetes.NotEtcdMember(perr) {
 			// An etcd member refused the removal, as for etcd's quorum: every other member guards
 			// it the same way.
@@ -332,7 +311,7 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 		tried = append(tried, "no other control-plane Machine has an InternalIP")
 	}
 	return r.hookWaits(s, m, "EtcdRemoveMember", controlplanev1.ScalingDownReason, fmt.Sprintf(
-		"the Machine %s cannot be reached (%s), and no other control plane removes its etcd member: %s", m.Name, conditionError(err), strings.Join(tried, "; ")))
+		"the Machine %s cannot be reached (%s), and no other control plane removes its etcd member: %s", m.Name, node.ConditionError(err), strings.Join(tried, "; ")))
 }
 
 // removeMember removes the etcd member of the Machine's node through the control plane via at
@@ -377,8 +356,8 @@ func (r *ChalkosControlPlaneReconciler) removeMember(ctx context.Context, addr s
 
 // revokeControlPlane revokes the Machine's node, a control plane, through the first peer that
 // does, and then has that peer prune the list of revoked nodes. A full list is pruned, unless the
-// last prune was less than fullListPruneInterval ago, and the revocation tried again. It tells
-// whether the node is revoked; otherwise s says what the step waits on.
+// last prune was less than machineutil.FullListPruneInterval ago, and the revocation tried again.
+// It tells whether the node is revoked; otherwise s says what the step waits on.
 func (r *ChalkosControlPlaneReconciler) revokeControlPlane(ctx context.Context, s *scope, m *clusterv1.Machine, peers []clusterv1.Machine, sec clustersecrets.Secrets) bool {
 	var tried []string
 	for i := range peers {
@@ -407,12 +386,12 @@ func (r *ChalkosControlPlaneReconciler) revokeControlPlane(ctx context.Context, 
 			// The list is the cluster's: another control plane has no more room. The message
 			// leaves out the prune, which only some passes make, so that it stays the same.
 			return r.hookWaits(s, m, "RevokeNode", controlplanev1.RevokedListFullReason, fmt.Sprintf(
-				"the node of the Machine %s is not revoked: %v; PruneRevoked made too little room; rotate the cluster's CAs with chalkctl rotate os-ca and chalkctl rotate kubernetes-ca, "+
+				"the node of the Machine %s is not revoked: %s; PruneRevoked made too little room; rotate the cluster's CAs with chalkctl rotate os-ca and chalkctl rotate kubernetes-ca, "+
 					"after which PruneRevoked drops the nodes revoked before them, or remove the annotation %s to delete the Machine without revoking its node",
-				m.Name, err, machineutil.HookAnnotation))
+				m.Name, node.ConditionError(err), machineutil.HookAnnotation))
 		}
 		ctrl.LoggerFrom(ctx).Info("A control plane did not revoke the node", "machine", m.Name, "through", p.Name, "error", err.Error())
-		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, conditionError(err)))
+		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, node.ConditionError(err)))
 	}
 	if len(tried) == 0 {
 		tried = append(tried, "no other control-plane Machine has an InternalIP")
@@ -430,10 +409,12 @@ func (r *ChalkosControlPlaneReconciler) revoke(ctx context.Context, addr string,
 }
 
 // mayPruneFullList tells whether a hook that finds the list of revoked nodes full prunes it: the
-// last prune, if any, was at least fullListPruneInterval ago.
+// last prune, if any, was at least machineutil.FullListPruneInterval ago. Each prune records its
+// time in the status, whose write reconciles again at once: without the interval, a full list
+// would be pruned at every pass.
 func (r *ChalkosControlPlaneReconciler) mayPruneFullList(s *scope) bool {
 	last := s.cp.Status.LastRevokedPruneTime
-	return last == nil || !r.clock().Now().Before(last.Add(fullListPruneInterval))
+	return last == nil || !r.clock().Now().Before(last.Add(machineutil.FullListPruneInterval))
 }
 
 // prune has the control plane name at addr prune the list of revoked nodes, within

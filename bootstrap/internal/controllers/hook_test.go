@@ -21,12 +21,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect/v2"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -314,6 +316,61 @@ func TestWorkerRevocationAfterAPrune(t *testing.T) {
 	e.mustReconcile("w-1")
 	if n, _ := e.fake.Node(cpAddr); !slices.Equal(n.Revoked, []string{"w-1"}) || n.Prunes != 1 || machineutil.HasHook(e.machineObj("w-1")) {
 		t.Errorf("revoked %v after %d prunes", n.Revoked, n.Prunes)
+	}
+}
+
+// A full list is pruned at most once per FullListPruneInterval for the Cluster's workers: a pass
+// within it only retries the revocation and writes nothing, and one after it prunes again.
+func TestWorkerHookPrunesAFullListOncePerInterval(t *testing.T) {
+	e, _ := revokableWorker(t)
+	clk := clocktesting.NewFakeClock(time.Now())
+	e.r.Clock = clk
+	e.fake.Update(cpAddr, func(n *nodetest.Node) {
+		n.RevokeNode = func(node string, _ bool) (*kubernetesv1.RevokeNodeResponse, error) {
+			return nil, nodetest.RevokedListFull(node)
+		}
+	})
+	e.atHook("w-1")
+	e.mustReconcile("w-1")
+	cfgVersion := e.config("w-1").ResourceVersion
+	clk.Step(machineutil.HookRetry)
+	e.mustReconcile("w-1")
+	if n, _ := e.fake.Node(cpAddr); n.Prunes != 1 {
+		t.Errorf("%d prunes within %s, want 1", n.Prunes, machineutil.FullListPruneInterval)
+	}
+	if e.config("w-1").ResourceVersion != cfgVersion {
+		t.Error("a pass that did not prune wrote the ChalkosConfig")
+	}
+	clk.Step(machineutil.FullListPruneInterval)
+	e.mustReconcile("w-1")
+	if n, _ := e.fake.Node(cpAddr); n.Prunes != 2 {
+		t.Errorf("%d prunes after %s, want 2", n.Prunes, machineutil.FullListPruneInterval)
+	}
+	if e.config("w-1").ResourceVersion != cfgVersion {
+		t.Error("a pass that pruned without making room wrote the ChalkosConfig")
+	}
+}
+
+// The text of an error dialling a control plane varies with how the dial failed; the condition
+// tells only that it is unreachable, so a waiting pass writes nothing.
+func TestWaitingWorkerHookIgnoresVaryingDialErrors(t *testing.T) {
+	e, _ := revokableWorker(t)
+	dial := func(why string) error {
+		return connect.NewError(connect.CodeUnavailable, "dial tcp "+cpAddr+":50000: "+why)
+	}
+	e.fake.Update(cpAddr, func(n *nodetest.Node) { n.Err = dial("connect: connection refused") })
+	e.atHook("w-1")
+	e.mustReconcile("w-1")
+	if c := conditions.Get(e.config("w-1"), bootstrapv1.NodeRemovedCondition); c == nil || c.Message != "No control plane revoked the node: cp-1: unreachable" {
+		t.Fatalf("NodeRemoved = %+v", c)
+	}
+	cfgVersion, mVersion := e.config("w-1").ResourceVersion, e.machineObj("w-1").ResourceVersion
+	for _, why := range []string{"i/o timeout", "connect: no route to host"} {
+		e.fake.Update(cpAddr, func(n *nodetest.Node) { n.Err = dial(why) })
+		e.mustReconcile("w-1")
+	}
+	if e.config("w-1").ResourceVersion != cfgVersion || e.machineObj("w-1").ResourceVersion != mVersion {
+		t.Error("a waiting pass wrote the ChalkosConfig or the Machine")
 	}
 }
 

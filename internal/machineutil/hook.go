@@ -56,6 +56,11 @@ const (
 	// HookPassTimeout bounds one pass of a hook, all its calls to nodes together, so that
 	// several nodes that do not answer cannot hold a reconcile for long.
 	HookPassTimeout = 3 * time.Minute
+	// FullListPruneInterval is how long after the last prune a hook that finds the list of
+	// revoked nodes full prunes it again before it retries the revocation. Within it, the hook
+	// only waits: a prune is a write to the workload cluster, and a CA rotation, which lets a
+	// prune drop nodes, takes longer than that.
+	FullListPruneInterval = 5 * time.Minute
 )
 
 // HasHook tells whether the Machine carries HookAnnotation, of any value.
