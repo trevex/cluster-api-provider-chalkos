@@ -297,6 +297,24 @@ func TestInvalidInput(t *testing.T) {
 // The documents For generates pass the check of chalkos's built-in kinds on an image with
 // Kubernetes, as the machine's image checks them before it installs.
 func TestGeneratedDocumentsPassChalkosCheck(t *testing.T) {
+	c := builtinContract(t)
+	pool := `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Node", "metadata": {"name": "default"}, "spec": {"labels": {"pool": "gpu"}}}`
+	for _, typ := range []string{documents.Worker, documents.ControlPlane} {
+		m := worker()
+		m.Type = typ
+		docs, err := documents.For(m, []runtime.RawExtension{file(clusterFile), file(systemDisk)}, []runtime.RawExtension{file(pool)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdk.Check(context.Background(), c, m.Name, docs); err != nil {
+			t.Fatalf("%s: chalkos refuses the documents: %v", typ, err)
+		}
+	}
+}
+
+// builtinContract is the contract of an image with chalkos's built-in kinds and Kubernetes.
+func builtinContract(t *testing.T) sdk.Contract {
+	t.Helper()
 	chalkostest.Chdir(t)
 	facts, err := sdk.ContractFacts(layers.All(), func(name string) ([]byte, error) {
 		if name == k8s.ContractFactsFile {
@@ -311,16 +329,5 @@ func TestGeneratedDocumentsPassChalkosCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Node", "metadata": {"name": "default"}, "spec": {"labels": {"pool": "gpu"}}}`
-	for _, typ := range []string{documents.Worker, documents.ControlPlane} {
-		m := worker()
-		m.Type = typ
-		docs, err := documents.For(m, []runtime.RawExtension{file(clusterFile), file(systemDisk)}, []runtime.RawExtension{file(pool)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := sdk.Check(context.Background(), c, m.Name, docs); err != nil {
-			t.Fatalf("%s: chalkos refuses the documents: %v", typ, err)
-		}
-	}
+	return c
 }
