@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/trevex/cluster-api-provider-chalkos/compare/v0.2.0...v0.3.0) (2026-11-28)
+
+
+### Features
+
+* roll the control plane on spec changes and hold workers on version skew ([#12](https://github.com/trevex/cluster-api-provider-chalkos/issues/12)) ([4b4ad11](https://github.com/trevex/cluster-api-provider-chalkos/commit/4b4ad11d40d746598d414b20fc29bf5266d2183d))
+
 ## [0.2.0](https://github.com/trevex/cluster-api-provider-chalkos/compare/v0.1.0...v0.2.0) (2026-11-28)
 
 
