@@ -152,7 +152,8 @@ pull request adds the release's section to `CHANGELOG.md` and sets the version o
 `release-please-config.json` lists in `extra-files`: lines that hold the marker
 `x-release-please-version` or lie between `x-release-please-start-version` and
 `x-release-please-end`, such as the install commands in the README, `VERSION` in the `Makefile`
-and `provider_version` in `lab/justfile`. Before 1.0, a `feat` commit or a breaking change raises
+and `provider_version` in `lab/justfile`. It sets only the first version on a line, so each line
+in such a block holds at most one version. Before 1.0, a `feat` commit or a breaking change raises
 the minor version and a `fix` the patch version.
 
 clusterctl installs a version only when `metadata.yaml` maps its major.minor to a Cluster API

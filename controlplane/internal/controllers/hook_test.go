@@ -644,17 +644,20 @@ func TestRevokedPrunedDaily(t *testing.T) {
 	}
 }
 
-// A node whose own etcd member does not answer refuses to leave; the hook waits and says how to
-// remove the member through another control plane, after which the leave is done.
+// deadMemberRefusal is chalkd's refusal of a leave of the node name, whose own etcd member does not
+// answer.
+func deadMemberRefusal(name string) error {
+	return connect.NewError(connect.CodeFailedPrecondition, "this node's etcd member "+name+" does not answer at https://127.0.0.1:2379; pass --through-others to remove it through the other members").WithRemote()
+}
+
+// A node whose own etcd member does not answer, while the other control planes list it as
+// healthy, refuses to leave; the hook waits and says how to remove the member through another
+// control plane, after which the leave is done.
 func TestControlPlaneWithADeadEtcdMemberWaits(t *testing.T) {
 	e := newEnv(t, 3, true)
 	ms, addrs := e.controlPlanes(3)
 	gone := ms[2].Name
-	e.fake.Update(addrs[gone], func(n *nodetest.Node) {
-		n.EtcdLeave = func() error {
-			return connect.NewError(connect.CodeFailedPrecondition, "this node's etcd member "+gone+" does not answer at https://127.0.0.1:2379; pass --through-others to remove it through the other members").WithRemote()
-		}
-	})
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.EtcdLeave = func() error { return deadMemberRefusal(gone) } })
 	e.atHook(gone)
 	e.mustReconcile()
 	if !e.hooked(gone) {
@@ -669,6 +672,50 @@ func TestControlPlaneWithADeadEtcdMemberWaits(t *testing.T) {
 	if e.hooked(gone) {
 		t.Error("the hook is kept once the member is gone")
 	}
+}
+
+// A node that refuses to leave while another control plane lists its member as unhealthy has its
+// member removed through that control plane, and is revoked.
+func TestUnhealthyEtcdMemberIsRemovedThroughAPeer(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[2].Name
+	e.setUnhealthy(ms, addrs, gone)
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.EtcdLeave = func() error { return deadMemberRefusal(gone) } })
+	e.atHook(gone)
+	e.mustReconcile()
+	if n, _ := e.fake.Node(addrs[ms[0].Name]); !slices.Equal(n.Removed, []string{gone}) || !slices.Equal(n.Revoked, []string{gone}) {
+		t.Errorf("through %s: removed %v, revoked %v", ms[0].Name, n.Removed, n.Revoked)
+	}
+	if e.hooked(gone) {
+		t.Error("the hook is kept")
+	}
+}
+
+// A node that refuses to leave for etcd's quorum while its member is unhealthy is not removed
+// through a peer that refuses for the quorum too: the hook waits.
+func TestUnhealthyEtcdMemberRefusedForQuorumWaits(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[2].Name
+	e.setUnhealthy(ms, addrs, gone)
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.EtcdLeave = func() error { return nodetest.QuorumRefused(gone) } })
+	for _, m := range ms[:2] {
+		e.fake.Update(addrs[m.Name], func(n *nodetest.Node) {
+			n.EtcdRemoveMember = func(member string) error { return nodetest.QuorumRefused(member) }
+		})
+	}
+	e.atHook(gone)
+	e.mustReconcile()
+	if !e.hooked(gone) {
+		t.Error("the hook is gone")
+	}
+	for _, m := range ms[:2] {
+		if n, _ := e.fake.Node(addrs[m.Name]); len(n.Removed) != 0 || len(n.Revoked) != 0 {
+			t.Errorf("through %s: removed %v, revoked %v", m.Name, n.Removed, n.Revoked)
+		}
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "its member is unhealthy, and no other control plane removes its etcd member")
 }
 
 // The text of the client's own errors for an unreachable node varies with how the dial failed;

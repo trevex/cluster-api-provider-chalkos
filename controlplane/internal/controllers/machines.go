@@ -150,7 +150,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 			}
 		}
 		if len(s.deleting) > 0 {
-			if why := r.etcdProblem(ctx, s, sec, nil); why != "" {
+			if why := r.etcdProblem(ctx, s, sec, nil, false); why != "" {
 				s.scaleUpWaiting = "waiting while a Machine is deleted: " + why
 				return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 			}

@@ -23,10 +23,11 @@ What works:
   Cluster API deletes the Machine's infrastructure, as [Removing Machines](#removing-machines)
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
 - Scaling the control plane down, one Machine at a time, once every Machine joined and etcd lists
-  one healthy member per Machine. Machines that are not up to date go first, then the oldest. A
-  Machine that never joined may go without that wait, as
+  one healthy member per Machine. Machines that are not up to date go first: among them, one that
+  etcd lists no voting member of, else the oldest. Such a Machine goes without that wait, as
   [How to recover from a replacement that never joins](#how-to-recover-from-a-replacement-that-never-joins)
-  describes.
+  describes. The Machine being deleted may hold the one unhealthy member when etcd has three
+  members or more.
 - Rolling out a changed version, image, files or infrastructure template of the control plane,
   one Machine at a time, oldest first, as [Rolling out changes](#rolling-out-changes) describes.
   A change of a field that every node of the cluster holds alike, such as the Cluster's domain,
@@ -95,9 +96,10 @@ is left. The provider runs the hook only once Cluster API waits for it, so the k
 report while its pods are evicted:
 
 - A worker's node is revoked through the first control plane that answers.
-- A control plane leaves etcd. When its node cannot be reached, another control plane removes its
-  etcd member instead. Then its node is revoked through another control plane. The control-plane
-  provider runs the hooks of its Machines one at a time, oldest deletion first.
+- A control plane leaves etcd. When its node cannot be reached, or refuses to leave while another
+  control plane lists its member as unhealthy, another control plane removes its etcd member
+  instead. Then its node is revoked through another control plane. The control-plane provider
+  runs the hooks of its Machines one at a time, oldest deletion first.
 
 Then the provider removes the annotation, and Cluster API deletes the infrastructure and the Node.
 A revoked node can no longer renew its certificates or change anything in the cluster;
@@ -126,9 +128,11 @@ Every step can be repeated safely. A Machine that waits as etcd's last voter rec
 event; it checks again every 30 seconds.
 
 A node whose own etcd member does not answer, for example after it lost its pinned address,
-refuses to leave etcd, and its hook waits. Remove the member through another control plane with
-`chalkctl etcd remove-member <node>`, or with `chalkctl etcd leave <node> --through-others`. The
-node is then no etcd member, and the hook goes on with the revocation.
+refuses to leave etcd. When the other control planes list that member as unhealthy, one of them
+removes it, as for an unreachable node. When they list it as healthy, the hook waits. Remove the
+member through another control plane with `chalkctl etcd remove-member <node>`, or with
+`chalkctl etcd leave <node> --through-others`. The node is then no etcd member, and the hook goes
+on with the revocation.
 
 ### What the conditions say
 
@@ -241,8 +245,15 @@ A refusal holds the roll with the reason `InvalidFiles`, so a change that cannot
 Machine and, with `maxSurge: 0`, costs no etcd member.
 
 A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
-Machine, no Machine is being deleted, and no guard holds. Scaling down takes the Machines that are
-not up to date first, so lowering `replicas` during a roll removes old Machines before new ones.
+Machine, no Machine is being deleted, and no guard holds. The Machine that a step deletes is the
+exception, as for a replacement that never joins or went unhealthy: it need not have joined, and
+its voting member may be unhealthy while every other member is a healthy voter and etcd has three
+members or more. Scaling down takes the Machines that are not up to date first, and among them one
+that etcd lists no voting member of, so lowering `replicas` during a roll removes old Machines
+before new ones. For a step that creates a Machine, or that deletes one that etcd lists no voting
+member of, a Machine whose node does not answer for its status counts as joined while etcd lists
+it as a voter. A step that deletes a voter waits for every other Machine to have joined, as the
+creation of a Machine after a deletion does, so that etcd is not left a voter short.
 
 ### Which changes does the control plane refuse?
 
@@ -297,18 +308,32 @@ Cluster API Cluster, reports on `ScalingUp` with the same reason instead.
 ### How to recover from a replacement that never joins
 
 A replacement that never joins, such as one whose image does not boot, holds the roll: the next
-step waits for its join. Revert `spec.version`, `spec.image` or `spec.files` to what the other
-Machines were made from. The stuck Machine is then the only one out of date, and the control plane
-deletes it without waiting for its join, which ends the roll. With `maxSurge: 0`, the control
-plane then creates the Machine it is short of from the reverted spec.
+step waits for its join. Change `spec.version`, `spec.image` or `spec.files` again, either back to
+what the other Machines were made from or forward to a fixed spec. The stuck Machine is then out
+of date, and among the Machines that are not up to date the control plane first deletes one that
+etcd's member list, taken through the other Machines, shows no voting member of: no member under
+its name or at its peer URL, or only a learner. Its removal takes no voter from etcd, and the
+check of etcd's members guards the quorum as for any step. A Machine that does not answer but
+that etcd lists as a voter is no such Machine: the roll treats it as any other. After a revert,
+that ends the roll. After a fix forward, the roll goes on over the other Machines. With
+`maxSurge: 0`, the control plane then creates the Machine it is short of from the current spec.
 
-A fix forward does not unstick the roll. The next step replaces the oldest Machine that is not up
-to date, which is one of the old Machines, and it waits for the stuck Machine to join. Revert to
-the spec the other Machines were made from first, then roll forward.
+The same holds for a change made while a surge Machine is still joining and not yet a voter: that
+Machine is then out of date too, and it goes first instead of joining. An up-to-date Machine that
+is joining is never deleted this way, so a roll without a further change still waits for its join.
 
-A replacement that joined etcd but is unhealthy holds the roll as well, because a step waits for
-one healthy member per Machine. Delete that Machine by hand. Its pre-terminate hook takes its
-member out of etcd while the other members keep quorum.
+A replacement that joined etcd and then went unhealthy holds the roll as well: a step waits for
+one healthy voting member per Machine. Revert the change, and the replacement is again the only
+Machine out of date. The control plane then deletes it, as Cluster API's own control plane does,
+when every other Machine's member is a healthy voter and those voters are a quorum of etcd's
+members as they are. That takes three members or more: of two members, one unhealthy, the healthy
+one is no quorum, and etcd could not commit the removal. The replacement's hook has a healthy
+control plane remove its member when its node does not leave etcd itself.
+
+After a fix forward, the control plane picks the oldest old Machine instead, which waits for
+etcd's health: delete the unhealthy replacement by hand, and its hook removes its member the same
+way. A one-replica control plane whose replacement went unhealthy has lost etcd's quorum, and no
+removal commits, by the control plane or by hand, until that member is healthy again.
 
 ### What happens to the workers?
 
@@ -361,7 +386,10 @@ an infrastructure provider:
 
 <!-- x-release-please-start-version -->
 ```sh
-clusterctl init --bootstrap chalkos:v0.3.0 --control-plane chalkos:v0.1.0 --infrastructure <provider>
+clusterctl init \
+  --bootstrap chalkos:v0.3.0 \
+  --control-plane chalkos:v0.3.0 \
+  --infrastructure <provider>
 ```
 <!-- x-release-please-end -->
 

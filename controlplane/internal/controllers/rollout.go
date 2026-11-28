@@ -350,27 +350,30 @@ func (r *ChalkosControlPlaneReconciler) contract(ctx context.Context, cp *contro
 
 // stepProblem says why etcd may not gain or lose a member by a scale-down or roll step now: a
 // Machine that has not joined the cluster, or etcd's members as etcdProblem reads them; empty when
-// nothing does. leaving, when not nil, is the Machine the step deletes. When it has not joined,
-// it holds no vote in etcd, so its join is not waited for and etcdProblem leaves it out, as
-// Cluster API's own control plane does: a replacement that never joins can go once its change
-// is reverted. Every other Machine must have joined.
+// nothing does. leaving, when not nil, is the Machine the step deletes: its own join is not waited
+// for, as Cluster API's own control plane does not wait for it. When etcd's members, listed through
+// the other Machines, hold no vote of it, it counts as being deleted, so a replacement that never
+// became a voter goes once its change is reverted or fixed forward. When it holds a vote, that
+// member may be unhealthy, and membersProblem guards etcd's quorum either way. Every other Machine
+// must have joined. A step that creates a Machine, or deletes one without a vote, also takes a
+// Machine that joinedForStep counts as joined. A step that deletes a voter does not: its
+// replacement's creation waits for every Machine's join, so the control plane would stay a voter
+// short behind a Machine that does not answer.
 func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, leaving *clusterv1.Machine) (string, error) {
-	var unjoined *clusterv1.Machine
-	if leaving != nil {
-		ok, err := r.joined(ctx, s, leaving, sec)
-		if err != nil {
-			return "", err
-		}
-		if !ok {
-			unjoined = leaving
-		}
-	}
+	noVote := leaving != nil && r.holdsNoVote(ctx, s, sec, leaving)
+	strict := leaving != nil && !noVote
 	for i := range s.machines {
 		m := &s.machines[i]
-		if unjoined != nil && m.Name == unjoined.Name {
+		if leaving != nil && m.Name == leaving.Name {
 			continue
 		}
-		ok, err := r.joined(ctx, s, m, sec)
+		var ok bool
+		var err error
+		if strict {
+			ok, err = r.joined(ctx, s, m, sec)
+		} else {
+			ok, err = r.joinedForStep(ctx, s, m, sec)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -378,7 +381,31 @@ func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scop
 			return fmt.Sprintf("waiting for the Machine %s to join the cluster", m.Name), nil
 		}
 	}
-	return r.etcdProblem(ctx, s, sec, unjoined), nil
+	return r.etcdProblem(ctx, s, sec, leaving, noVote), nil
+}
+
+// holdsNoVote tells whether etcd's members, listed through the control plane's other Machines, are
+// known to hold no voting member of the Machine m, as holdsVote reads them. A Machine whose vote
+// cannot be told counts as a voter.
+func (r *ChalkosControlPlaneReconciler) holdsNoVote(ctx context.Context, s *scope, sec clustersecrets.Secrets, m *clusterv1.Machine) bool {
+	vote, known := r.holdsVote(ctx, s, sec, m)
+	return known && !vote
+}
+
+// joinedForStep tells whether the Machine m counts as joined for a step: it joined, or its node
+// does not answer for its status while etcd, listed through the other Machines, holds a voting
+// member of it.
+func (r *ChalkosControlPlaneReconciler) joinedForStep(ctx context.Context, s *scope, m *clusterv1.Machine, sec clustersecrets.Secrets) (bool, error) {
+	ok, err := r.joined(ctx, s, m, sec)
+	if err != nil || ok {
+		return ok, err
+	}
+	if st, asked := s.statuses[m.Name]; !asked || st.err == nil {
+		// The node was not asked, as when it is not installed, or reports another phase.
+		return false, nil
+	}
+	vote, known := r.holdsVote(ctx, s, sec, m)
+	return vote && known, nil
 }
 
 // anyOutOfDate tells whether one of the control plane's Machines that are not being deleted is not
@@ -388,14 +415,26 @@ func (s *scope) anyOutOfDate() bool {
 }
 
 // oldest is the oldest of the control plane's Machines that are not being deleted, as oldestOf
-// orders them, or with outOfDate the oldest of those that are not up to date; nil when there is
-// none.
+// orders them; nil when there is none. With outOfDate it is one of those that are not up to date:
+// the oldest that etcd's members, listed through the other Machines, hold no vote of, or else the
+// oldest. Such a Machine goes without its join and costs etcd no voter, and membersProblem guards
+// the quorum as for any step: a replacement that never became a voter goes once its change is
+// reverted or fixed forward, which leaves every Machine out of date. A voter that does not answer
+// is no such Machine. An up-to-date Machine that is joining is not out of date, so a roll still
+// waits for its join.
 func (r *ChalkosControlPlaneReconciler) oldest(ctx context.Context, s *scope, sec clustersecrets.Secrets, outOfDate bool) (*clusterv1.Machine, error) {
 	var ms []*clusterv1.Machine
 	for i := range s.machines {
-		if !outOfDate || s.outOfDate(&s.machines[i]) != "" {
-			ms = append(ms, &s.machines[i])
+		m := &s.machines[i]
+		if outOfDate {
+			if s.outOfDate(m) == "" {
+				continue
+			}
+			if r.holdsNoVote(ctx, s, sec, m) {
+				return m, nil
+			}
 		}
+		ms = append(ms, m)
 	}
 	return oldestOf(ms, func(m *clusterv1.Machine) (bool, error) { return r.joined(ctx, s, m, sec) })
 }
@@ -429,11 +468,11 @@ func oldestOf(ms []*clusterv1.Machine, joined func(*clusterv1.Machine) (bool, er
 
 // rollOut takes the roll's next step while a Machine is not up to date and the control plane has
 // as many Machines as spec.replicas asks for, none being deleted. With maxSurge 1 it creates an
-// up-to-date Machine; once that one joined, scaleDown deletes the oldest Machine that is not up to
-// date. With maxSurge 0 it deletes that Machine first; scaleUp creates its replacement once it is
-// gone. A step starts only when the control plane is initialized, no guard holds, no other step
-// was taken in this reconcile, stepProblem finds nothing and the image accepts the documents the
-// new Machine installs with.
+// up-to-date Machine; once that one joined, scaleDown deletes the Machine that oldest picks among
+// those not up to date. With maxSurge 0, or when etcd holds no vote of that Machine, it deletes
+// that Machine first; scaleUp creates its replacement once it is gone. A step starts only when
+// the control plane is initialized, no guard holds, no other step was taken in this reconcile,
+// stepProblem finds nothing and the image accepts the documents the new Machine installs with.
 func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	want := int(ptr.Deref(s.cp.Spec.Replicas, 1))
 	switch {
@@ -455,10 +494,10 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// With maxSurge 0 the step deletes old, which may go without its join; a Machine created
-	// waits for every other to have joined.
+	// With maxSurge 0 the step deletes old first. So does it when etcd holds no vote of old: a
+	// Machine created waits for every other to have joined, which old may never do.
 	var leaving *clusterv1.Machine
-	if surge(s.cp) == 0 {
+	if surge(s.cp) == 0 || r.holdsNoVote(ctx, s, sec, old) {
 		leaving = old
 	}
 	why, err := r.stepProblem(ctx, s, sec, leaving)
@@ -473,7 +512,7 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 		return res, nil
 	}
 	log := ctrl.LoggerFrom(ctx)
-	if surge(s.cp) > 0 {
+	if leaving == nil {
 		m, err := r.createMachine(ctx, s)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -488,7 +527,7 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 	if err := r.deleteMachine(ctx, old); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("Rolling out: deleting the oldest Machine that is not up to date", "machine", old.Name)
+	log.Info("Rolling out: deleting a Machine that is not up to date", "machine", old.Name)
 	machineutil.Event(r.Recorder, s.cp, old, corev1.EventTypeNormal, "RollingOut", "DeleteMachine",
 		"Deleting the Machine %s, which is not up to date; its replacement is created once it is gone", old.Name)
 	s.removing = fmt.Sprintf("the Machine %s is deleted to be replaced", old.Name)
@@ -499,9 +538,10 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 
 // checkReplacement holds the roll, in s.held, unless spec.image accepts the documents that the
 // Machine replacing old installs with, as the image's contract checks them before an install:
-// with maxSurge 0 old goes first, and must not go while no replacement can install. A refusal
-// holds with InvalidFilesReason until the files or the image change; a check that could not be
-// made, as while the image cannot be read, holds without a reason and returns when to try again.
+// with maxSurge 0, or when etcd holds no vote of old, old goes first, and must not go while no
+// replacement can install. A refusal holds with InvalidFilesReason until the files or the image
+// change; a check that could not be made, as while the image cannot be read, holds without a
+// reason and returns when to try again.
 func (r *ChalkosControlPlaneReconciler) checkReplacement(ctx context.Context, s *scope, old *clusterv1.Machine) ctrl.Result {
 	log := ctrl.LoggerFrom(ctx)
 	c, err := r.contract(ctx, s.cp)
