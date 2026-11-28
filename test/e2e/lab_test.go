@@ -20,9 +20,9 @@ limitations under the License.
 // lab of one control plane and one worker, checks that its nodes join and that the providers
 // report them installed, scales the workers to two and back to one, checks that the removed
 // worker's node is revoked and its Node gone, and deletes the cluster again. With the tag e2e_ha,
-// it scales the control plane to three and back to one instead, and checks etcd's members and the
-// removed control planes' revocation. The lab must run
-// already, with the providers built from the checkout or the released ones, as after
+// it scales the control plane to three, rolls it twice and scales it back to one instead, and
+// checks etcd's members and the removed control planes' revocation. The lab must run already,
+// with the providers built from the checkout or the released ones, as after
 //
 //	just -f lab/justfile create kubevirt providers-local
 //	just -f lab/justfile create kubevirt providers

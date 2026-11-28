@@ -141,11 +141,11 @@ jobs:
   # /dev/kvm: a ready pull request with the label e2e runs make e2e, and the nightly run, whose
   # event is schedule or workflow_dispatch, runs make e2e and make e2e-ha, each on a runner of its
   # own; a push to main runs neither. make e2e takes about 9 GiB of the runner's 16 GiB at its
-  # peak: three VMs of 3, 2 and 2 GiB, KubeVirt, CDI and Cluster API; make e2e-ha about 13 GiB:
-  # three control planes of 3 GiB and a worker of 2 GiB. The VMs boot chalkos's released images
-  # from ghcr.io; the providers are built from the code under test. Each job's timeout leaves
-  # room for creating the lab and collecting its logs around the make target's own timeout, 90
-  # minutes for e2e and 120 for e2e-ha.
+  # peak: three VMs of 3, 2 and 2 GiB, KubeVirt, CDI and Cluster API; make e2e-ha about 14 GiB:
+  # four control planes of 3 GiB while a roll surges, the worker scaled away before. The VMs
+  # boot chalkos's released images from ghcr.io; the providers are built from the code under
+  # test. Each job's timeout leaves room for creating the lab and collecting its logs around the
+  # make target's own timeout, 90 minutes for e2e and 180 for e2e-ha.
   e2e:
     if: >-
       ${{ !github.event.pull_request.draft && github.event_name != 'push' &&
@@ -156,7 +156,7 @@ jobs:
       matrix:
         target: ${{ fromJSON(github.event_name == 'pull_request' && '["e2e"]' || '["e2e", "e2e-ha"]') }}
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.target == 'e2e-ha' && 170 || 150 }}
+    timeout-minutes: ${{ matrix.target == 'e2e-ha' && 230 || 150 }}
     permissions:
       contents: read
       # Hestia checks which cached packs GitHub has evicted.
