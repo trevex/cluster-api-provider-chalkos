@@ -22,7 +22,7 @@ export cdi_version := "v1.66.1"
 export capi_version := `go list -m sigs.k8s.io/cluster-api | cut -d" " -f2`
 export capk_version := "v0.11.2"
 # The latest release of the chalkos providers, which release-please sets with each release.
-export provider_version := "v0.2.0" # x-release-please-version
+export provider_version := "v0.3.0" # x-release-please-version
 # The chalkos release whose images the VMs boot: the one go.mod builds the providers against,
 # which Renovate bumps with the flake input. The images are those of its Kubernetes minor,
 # ghcr.io/trevex/chalkos/kubernetes-<minor>-kvm and its containerDisk, <...>-kvm-disk.
