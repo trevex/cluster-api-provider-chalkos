@@ -71,6 +71,15 @@ func machineLabels(cp *controlplanev1.ChalkosControlPlane, cluster string) map[s
 	return labels
 }
 
+// templateAnnotations are the machine template's annotations without those the controller sets
+// itself, the spec hash and the pre-terminate hook, which the template cannot override.
+func templateAnnotations(cp *controlplanev1.ChalkosControlPlane) map[string]string {
+	annotations := maps.Clone(cp.Spec.MachineTemplate.ObjectMeta.Annotations)
+	delete(annotations, controlplanev1.SpecHashAnnotation)
+	delete(annotations, machineutil.HookAnnotation)
+	return annotations
+}
+
 // listMachines lists the control plane's Machines uncached, so that a Machine created by the last
 // reconcile is never created again, and splits them into those being deleted and the others.
 func (r *ChalkosControlPlaneReconciler) listMachines(ctx context.Context, s *scope) error {
@@ -144,7 +153,7 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 	cp := s.cp
 	name := fmt.Sprintf("%s-%s", cp.Name, utilrand.String(5))
 	labels := machineLabels(cp, s.cluster.Name)
-	annotations := maps.Clone(cp.Spec.MachineTemplate.ObjectMeta.Annotations)
+	annotations := templateAnnotations(cp)
 	// The Machine controller makes the Machine the controller of its bootstrap config and
 	// infrastructure; until then the ChalkosControlPlane owns them.
 	owner := metav1.OwnerReference{APIVersion: controlPlaneKind.GroupVersion().String(), Kind: controlPlaneKind.Kind, Name: cp.Name, UID: cp.UID}

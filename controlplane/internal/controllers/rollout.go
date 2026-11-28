@@ -100,7 +100,7 @@ func (s *scope) outOfDate(m *clusterv1.Machine) string {
 	case !ok && m.Spec.Version != s.cp.Spec.Version:
 		return fmt.Sprintf("The Machine carries no %s and is of version %s, the control plane of %s", controlplanev1.SpecHashAnnotation, m.Spec.Version, s.cp.Spec.Version)
 	case !ok:
-		return fmt.Sprintf("The Machine carries no %s, and its ChalkosConfig is of another image than the control plane's", controlplanev1.SpecHashAnnotation)
+		return fmt.Sprintf("The Machine carries no %s, and its ChalkosConfig is missing or of another image than the control plane's", controlplanev1.SpecHashAnnotation)
 	case hash != s.hash:
 		return "The Machine was made from another version, image, files or infrastructure template than the control plane's"
 	case !s.rolloutAfter.IsZero() && m.CreationTimestamp.Before(&metav1.Time{Time: s.rolloutAfter}):
@@ -125,7 +125,7 @@ func (r *ChalkosControlPlaneReconciler) untilRolloutAfter(s *scope) ctrl.Result 
 // annotations the template no longer names stay.
 func (r *ChalkosControlPlaneReconciler) syncMachines(ctx context.Context, s *scope) error {
 	labels := machineLabels(s.cp, s.cluster.Name)
-	annotations := s.cp.Spec.MachineTemplate.ObjectMeta.Annotations
+	annotations := templateAnnotations(s.cp)
 	for i := range s.machines {
 		m := &s.machines[i]
 		h, err := patch.NewHelper(m, r.Client)
@@ -175,7 +175,8 @@ func setMeta(have *map[string]string, want map[string]string) bool {
 // adopt stamps the spec hash on a Machine that carries none, made by a provider before Machines
 // carried one, and on its ChalkosConfig, when the Machine is of the control plane's version and
 // its ChalkosConfig of its image: nothing else a Machine is made from could change before. It
-// tells whether it stamped the Machine, which the caller writes.
+// stamps today's hash even when spec.files changed while an older provider ran, which is not
+// told from the Machine. It tells whether it stamped the Machine, which the caller writes.
 func (r *ChalkosControlPlaneReconciler) adopt(ctx context.Context, s *scope, m *clusterv1.Machine) (bool, error) {
 	if _, ok := m.Annotations[controlplanev1.SpecHashAnnotation]; ok || m.Spec.Version != s.cp.Spec.Version {
 		return false, nil
@@ -200,7 +201,10 @@ func (r *ChalkosControlPlaneReconciler) adopt(ctx context.Context, s *scope, m *
 // observeFiles records in status.observedFiles the cluster-wide documents every Machine was made
 // from, with the defaults of the image's contract written out, once a Machine exists and none is
 // out of date or being deleted: at the first Machine's creation and when a roll finished. Without
-// the contract nothing is recorded, and it returns when to try again.
+// the contract nothing is recorded, and it returns when to try again. A pending change of a fixed
+// field, as through the Cluster's clusterNetwork or controlPlaneEndpoint, which the spec hash
+// does not cover, keeps the record. A first Machine created while the image cannot be read is
+// recorded later, from the Cluster as it is then: a change of the Cluster in between goes unseen.
 func (r *ChalkosControlPlaneReconciler) observeFiles(ctx context.Context, s *scope) ctrl.Result {
 	if len(s.machines) == 0 || len(s.deleting) > 0 {
 		return ctrl.Result{}
@@ -221,6 +225,12 @@ func (r *ChalkosControlPlaneReconciler) observeFiles(ctx context.Context, s *sco
 	if err != nil {
 		log.Info("Not recording the observed files yet: reading the image's contract", "reason", err.Error())
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
+	}
+	if observed := s.cp.Status.ObservedFiles; observed != "" {
+		// A pending change of a fixed field keeps the record; the guard reports it.
+		if changes, err := documents.FixedChanges(c, observed, docs); err != nil || len(changes) > 0 {
+			return ctrl.Result{}
+		}
 	}
 	text, err := documents.Observed(c, docs)
 	if err != nil {

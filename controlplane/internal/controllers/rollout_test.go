@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 
 	"github.com/trevex/chalkos/pkg/chalkd/layers/kubernetes/kubernetestest"
+	"github.com/trevex/chalkos/pkg/config"
 	"github.com/trevex/chalkos/pkg/ociimage"
 	"github.com/trevex/chalkos/pkg/schema/schematest"
 	"github.com/trevex/chalkos/pkg/sdk"
@@ -48,6 +49,9 @@ func clusterFile(domain string) runtime.RawExtension {
 	return runtime.RawExtension{Raw: []byte(`{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Cluster", "metadata": {"name": "default"}, "spec": {"domain": "` + domain +
 		`", "images": {"etcd": "registry.k8s.io/etcd:3.7.0-0", "coredns": "registry.k8s.io/coredns/coredns:v1.14.6", "pause": "registry.k8s.io/pause:3.10.2", "flannel": "ghcr.io/flannel-io/flannel:v0.28.9"}}}`)}
 }
+
+// systemDiskFile is a SystemDisk document, which marks no field.
+var systemDiskFile = runtime.RawExtension{Raw: []byte(`{"apiVersion": "storage.chalkos.dev/v1alpha1", "kind": "SystemDisk", "metadata": {"name": "system"}, "spec": {"disk": {"path": "/dev/vda"}}}`)}
 
 // setFiles sets the ChalkosControlPlane's spec.files.
 func (e *env) setFiles(files ...runtime.RawExtension) {
@@ -91,23 +95,41 @@ func (e *env) serveImage() {
 	})
 }
 
-// observed is the status.observedFiles of the ChalkosControlPlane's Cluster, version and files
-// as imageArtifact defaults them.
-func (e *env) observed(cp *controlplanev1.ChalkosControlPlane) string {
+// contract is the contract of imageArtifact.
+func (e *env) contract() sdk.Contract {
 	e.t.Helper()
 	c, err := sdk.ArtifactContract(layers.All(), imageArtifact(e.t))
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	return c
+}
+
+// cluster returns the Cluster API Cluster.
+func (e *env) cluster() *clusterv1.Cluster {
+	e.t.Helper()
 	var cluster clusterv1.Cluster
 	if err := testClient.Get(e.t.Context(), client.ObjectKey{Namespace: e.ns, Name: clusterName}, &cluster); err != nil {
 		e.t.Fatal(err)
 	}
-	docs, err := documents.ClusterWide(&cluster, cp.Spec.Version, cp.Spec.Files)
+	return &cluster
+}
+
+// clusterWide returns the cluster-wide documents of the Cluster and the ChalkosControlPlane.
+func (e *env) clusterWide(cp *controlplanev1.ChalkosControlPlane) []config.Document {
+	e.t.Helper()
+	docs, err := documents.ClusterWide(e.cluster(), cp.Spec.Version, cp.Spec.Files)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	text, err := documents.Observed(c, docs)
+	return docs
+}
+
+// observed is the status.observedFiles of the ChalkosControlPlane's Cluster, version and files
+// as imageArtifact defaults them.
+func (e *env) observed(cp *controlplanev1.ChalkosControlPlane) string {
+	e.t.Helper()
+	text, err := documents.Observed(e.contract(), e.clusterWide(cp))
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -259,15 +281,15 @@ func TestNewMachinesCarryTheSpecHash(t *testing.T) {
 	}
 }
 
-// status.observedFiles stays while a Machine is out of date, and follows the files once every
-// Machine is made from them, as after a roll.
+// status.observedFiles stays while a Machine is out of date, and follows a change of files that
+// holds no fixed field once every Machine is made from them, as after a roll.
 func TestObservedFilesAfterARoll(t *testing.T) {
 	e := newEnv(t, 1, true)
 	e.serveImage()
 	e.setFiles(clusterFile("lab.local"))
 	first := e.initialize("10.0.0.1")
 	before := e.cp().Status.ObservedFiles
-	e.setFiles(clusterFile("example.org"))
+	e.setFiles(clusterFile("lab.local"), systemDiskFile)
 	e.mustReconcile()
 	if got := e.cp().Status.ObservedFiles; got != before {
 		t.Errorf("observedFiles changed while the Machine is out of date:\n%s", got)
@@ -280,7 +302,7 @@ func TestObservedFilesAfterARoll(t *testing.T) {
 	e.stamp(first.Name, hash)
 	e.mustReconcile()
 	cp := e.cp()
-	if cp.Status.ObservedFiles != e.observed(cp) || !strings.Contains(cp.Status.ObservedFiles, "example.org") {
+	if cp.Status.ObservedFiles != e.observed(cp) || !strings.Contains(cp.Status.ObservedFiles, "SystemDisk") {
 		t.Errorf("observedFiles after the roll\n%s\nwant\n%s", cp.Status.ObservedFiles, e.observed(cp))
 	}
 }
@@ -394,4 +416,75 @@ func TestTemplateMetadataInPlace(t *testing.T) {
 	}
 	e.wantUpToDate(first.Name, metav1.ConditionTrue, "")
 	e.wantMachines(1)
+}
+
+// A change of a fixed field through the Cluster, which the spec hash does not cover, keeps
+// status.observedFiles, so that the change is still found against it.
+func TestClusterChangeKeepsTheObservedFiles(t *testing.T) {
+	e := newEnv(t, 1, true)
+	e.serveImage()
+	e.setFiles(clusterFile("lab.local"))
+	first := e.initialize("10.0.0.1")
+	before := e.cp().Status.ObservedFiles
+	if before == "" {
+		t.Fatal("no observedFiles recorded")
+	}
+	cluster := e.cluster()
+	cluster.Spec.ClusterNetwork.Pods.CIDRBlocks = []string{"10.200.0.0/16"}
+	if err := testClient.Update(t.Context(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	cp := e.cp()
+	if cp.Status.ObservedFiles != before {
+		t.Errorf("observedFiles changed with the Cluster's pod CIDRs:\n%s", cp.Status.ObservedFiles)
+	}
+	e.wantUpToDate(first.Name, metav1.ConditionTrue, "")
+	changes, err := documents.FixedChanges(e.contract(), cp.Status.ObservedFiles, e.clusterWide(cp))
+	if err != nil || len(changes) == 0 {
+		t.Errorf("FixedChanges = %v, %v; want the pod CIDRs' change", changes, err)
+	}
+}
+
+// The machine template cannot set the spec hash or the pre-terminate hook: neither on a new
+// Machine nor on an existing one, which stays up to date.
+func TestTemplateCannotSetReservedAnnotations(t *testing.T) {
+	e := newEnv(t, 1, true)
+	cp := e.cp()
+	cp.Spec.MachineTemplate.ObjectMeta.Annotations = map[string]string{
+		controlplanev1.SpecHashAnnotation: "bogus", machineutil.HookAnnotation: "bogus", "example.org/note": "kept",
+	}
+	if err := testClient.Update(t.Context(), cp); err != nil {
+		t.Fatal(err)
+	}
+	first := e.initialize("10.0.0.1")
+	e.mustReconcile()
+	want, err := specHash(e.cp())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := e.machine(first.Name)
+	if m.Annotations[controlplanev1.SpecHashAnnotation] != want || m.Annotations[machineutil.HookAnnotation] != machineutil.ControlPlaneHookOwner ||
+		m.Annotations["example.org/note"] != "kept" {
+		t.Errorf("the Machine's annotations %v, want the controller's hash and hook", m.Annotations)
+	}
+	if got := e.config(first.Name).Annotations[controlplanev1.SpecHashAnnotation]; got != want {
+		t.Errorf("the ChalkosConfig's hash %q, want %q", got, want)
+	}
+	e.wantUpToDate(first.Name, metav1.ConditionTrue, "")
+}
+
+// A Machine without the hash whose ChalkosConfig is gone is not adopted, and is out of date.
+func TestMachinesWithoutTheirConfigAreNotAdopted(t *testing.T) {
+	e := newEnv(t, 1, true)
+	first := e.initialize("10.0.0.1")
+	e.stamp(first.Name, "")
+	if err := testClient.Delete(t.Context(), e.config(first.Name)); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	if _, ok := e.machine(first.Name).Annotations[controlplanev1.SpecHashAnnotation]; ok {
+		t.Error("a Machine without its ChalkosConfig was adopted")
+	}
+	e.wantUpToDate(first.Name, metav1.ConditionFalse, "missing or of another image")
 }
