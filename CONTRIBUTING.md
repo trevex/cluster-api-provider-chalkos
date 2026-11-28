@@ -30,6 +30,7 @@ Run the targets of the `Makefile` in the development shell:
 | `make build` | Builds both managers. |
 | `make release-manifests` | Builds `bootstrap-components.yaml`, `control-plane-components.yaml` and a copy of `metadata.yaml` into `out/`, with the managers at `IMG_BOOTSTRAP` and `IMG_CONTROLPLANE`. |
 | `make e2e` | Runs the end-to-end test against a running lab. |
+| `make e2e-ha` | Scales the control plane 1 → 3 → 1 against a running lab. It needs about 11 GiB for its VMs; the nightly run runs it. |
 
 The generated files are committed. A change to an API type or a kubebuilder marker commits what
 `make generate manifests` produces from it.
@@ -40,7 +41,8 @@ The lab in [`lab/`](lab/) runs a kind management cluster with Cluster API, CAPK,
 both providers, and boots chalkos VMs on it from chalkos's released images. `just -f lab/justfile
 up` installs the released providers; the tests run the providers of your checkout, which
 `providers-local` builds and installs. `make e2e` creates the workload cluster `lab` there, checks
-it and deletes it:
+it, scales its workers to two and back to one, checks that the removed worker was revoked, and
+deletes the cluster:
 
 ```sh
 just -f lab/justfile create kubevirt providers-local
@@ -108,7 +110,8 @@ Open the pull request as a draft while the change is in progress: a draft runs o
 title, lint and workflow checks. Mark it ready for review to run the full CI. Add the label `e2e`
 when the change touches the controllers, the lab or the Cluster API contract: CI then runs the
 end-to-end test on the pull request, on a runner with `/dev/kvm`. A push to `main` does not run
-it; the nightly workflow runs it on `main` and opens an issue labelled `ci-failure` when it fails.
+it; the nightly workflow runs it and `make e2e-ha` on `main` and opens an issue labelled
+`ci-failure` when one fails.
 
 ## Dependency updates
 

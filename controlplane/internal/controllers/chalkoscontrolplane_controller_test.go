@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/test/builder"
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
+	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -215,8 +216,8 @@ func (e *env) wantMachines(n int) []clusterv1.Machine {
 	return ms
 }
 
-// provision gives the Machine, as it is now, the InternalIP addr, marks its ChalkosConfig Ready
-// and serves the machine at addr installed as its node, in the phase.
+// provision gives the Machine, as it is now, the InternalIP addr, marks its ChalkosConfig Ready and
+// installed, and serves the machine at addr installed as its node, in the phase.
 func (e *env) provision(m clusterv1.Machine, addr string, phase kubernetesv1.Phase) {
 	e.t.Helper()
 	if err := testClient.Get(e.t.Context(), client.ObjectKeyFromObject(&m), &m); err != nil {
@@ -231,6 +232,7 @@ func (e *env) provision(m clusterv1.Machine, addr string, phase kubernetesv1.Pha
 		e.t.Fatal(err)
 	}
 	conditions.Set(&cfg, metav1.Condition{Type: bootstrapv1.ReadyCondition, Status: metav1.ConditionTrue, Reason: bootstrapv1.InstalledReason})
+	cfg.Status.Installed = ptr.To(true)
 	if err := testClient.Status().Update(e.t.Context(), &cfg); err != nil {
 		e.t.Fatal(err)
 	}
@@ -434,7 +436,7 @@ func TestBootstrappedAlreadyIsDone(t *testing.T) {
 	e.fake.Update(addr, func(n *nodetest.Node) {
 		n.Bootstrap = func() error {
 			e.setStatus(addr, kubernetesv1.Phase_PHASE_BOOTSTRAPPED, false)
-			return connect.NewError(connect.CodeFailedPrecondition, "the node is bootstrapped already")
+			return nodetest.Reasoned(connect.CodeFailedPrecondition, nodev1.ErrorReason_ERROR_REASON_BOOTSTRAPPED_ALREADY, "the node is bootstrapped already")
 		}
 	})
 	if _, err := e.reconcile(); err != nil {
@@ -1005,10 +1007,12 @@ func TestFailedCreateCleansUp(t *testing.T) {
 }
 
 // A Machine being deleted is neither counted towards the scale-up nor waited for to join: its
-// replacement is created. status.replicas counts it, as with Cluster API's own control plane.
+// replacement is created, as etcd lists the joined Machine only. status.replicas counts it, as
+// with Cluster API's own control plane.
 func TestDeletingMachinesNotCounted(t *testing.T) {
 	e := newEnv(t, 3, true)
 	first := e.initialize("10.0.0.1")
+	e.setMembers([]clusterv1.Machine{first}, map[string]string{first.Name: "10.0.0.1"})
 	second := other(e.wantMachines(2), first.Name)
 	e.deleteHeld(second.Name)
 	e.mustReconcile()

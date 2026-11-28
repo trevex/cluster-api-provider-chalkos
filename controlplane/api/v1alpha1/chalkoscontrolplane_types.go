@@ -196,8 +196,15 @@ type ChalkosControlPlaneStatus struct {
 	// +optional
 	KubeconfigExpiresAt *metav1.Time `json:"kubeconfigExpiresAt,omitempty"`
 
+	// LastRevokedPruneTime is when the controller last asked a control plane to drop the revoked
+	// nodes nothing lets back in, whether or not that succeeded. It asks after each revocation
+	// of a control plane's node and otherwise once a day, which also prunes the workers'
+	// revocations.
+	// +optional
+	LastRevokedPruneTime *metav1.Time `json:"lastRevokedPruneTime,omitempty"`
+
 	// Conditions are the ChalkosControlPlane's current observations. Known condition types are
-	// Available, Initialized, MachinesReady, ScalingUp, Deleting and Paused.
+	// Available, Initialized, MachinesReady, ScalingUp, ScalingDown, Deleting and Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

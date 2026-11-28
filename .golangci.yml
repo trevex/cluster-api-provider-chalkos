@@ -1,6 +1,7 @@
 version: "2"
 
 run:
-  # The e2e test builds only with its tag; lint it with the rest.
+  # The e2e tests build only with their tags; lint them with the rest.
   build-tags:
     - e2e
+    - e2e_ha

@@ -53,6 +53,7 @@ func main() {
 			InstallTimeout:   installTimeout,
 			MaxInstalls:      concurrency,
 			WatchFilterValue: opts.WatchFilter,
+			Recorder:         mgr.GetEventRecorder("bootstrap-chalkos"),
 		}
 		return r.SetupWithManager(ctx, mgr)
 	})

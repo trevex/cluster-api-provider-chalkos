@@ -112,4 +112,11 @@ local-repo: local-repo-manifests ## Build and push both managers' images to REGI
 # and deletes it. The lab must run already: just -f lab/justfile create kubevirt providers-local.
 .PHONY: e2e
 e2e: ## Create and delete the lab's workload cluster on a running KubeVirt lab.
-	go test -tags e2e -timeout 60m -count=1 -v ./test/e2e/
+	go test -tags e2e -timeout 90m -count=1 -v ./test/e2e/
+
+# e2e-ha scales the lab's control plane 1 → 3 → 1 on the lab's workload cluster, which it creates
+# and deletes. It needs about 11 GiB for its VMs at the peak; the nightly run runs it, pull requests
+# do not.
+.PHONY: e2e-ha
+e2e-ha: ## Scale the lab's control plane to three and back on a running KubeVirt lab.
+	go test -tags e2e_ha -run '^TestHA$$' -timeout 120m -count=1 -v ./test/e2e/

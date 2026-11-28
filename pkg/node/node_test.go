@@ -19,6 +19,7 @@ package node_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/trevex/cluster-api-provider-chalkos/internal/chalkostest"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
+	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
 )
 
 func generate(t *testing.T) clustersecrets.Secrets {
@@ -160,11 +162,98 @@ func TestKubernetesCalls(t *testing.T) {
 	}
 }
 
+// A control plane that does not answer is one to move on from.
+func TestRemovalCallsToAnUnreachableNode(t *testing.T) {
+	s := generate(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	c := node.New()
+	for call, err := range map[string]error{
+		"EtcdLeave":        c.EtcdLeave(ctx, "127.0.0.1:1", s, "cp1"),
+		"EtcdRemoveMember": c.EtcdRemoveMember(ctx, "127.0.0.1:1", s, "cp1", "cp2"),
+	} {
+		if !node.Unreachable(err) || !node.TryNextControlPlane(err) {
+			t.Errorf("%s at a closed port = %v, want it unreachable", call, err)
+		}
+	}
+	if _, err := c.RevokeNode(ctx, "127.0.0.1:1", s, "cp1", "w1", false); !node.Unreachable(err) {
+		t.Errorf("RevokeNode at a closed port = %v, want it unreachable", err)
+	}
+}
+
+// The removal calls reach the installed node by its name.
+func TestRemovalCallsCheckTheName(t *testing.T) {
+	s := generate(t)
+	n := serveInstalled(t, s, "cp-1")
+	c := node.New()
+	ctx := context.Background()
+	if err := c.EtcdLeave(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) || !node.Unreachable(err) {
+		t.Errorf("EtcdLeave as cp-2 = %v, want ErrOtherNode", err)
+	}
+	if _, err := c.EtcdMembers(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) {
+		t.Errorf("EtcdMembers as cp-2 = %v, want ErrOtherNode", err)
+	}
+	if _, err := c.PruneRevoked(ctx, n.Addr, s, "cp-2"); !errors.Is(err, sdk.ErrOtherNode) {
+		t.Errorf("PruneRevoked as cp-2 = %v, want ErrOtherNode", err)
+	}
+}
+
+// Another control plane may answer where one is unreachable or no etcd member, but not where it
+// refused for etcd's quorum or a full revoked list.
+func TestTryNextControlPlane(t *testing.T) {
+	for err, want := range map[error]bool{
+		nodetest.Unreachable("10.0.0.1"):          true,
+		nodetest.EtcdUnavailable():                true,
+		nodetest.NotEtcdMember():                  true,
+		nodetest.QuorumRefused("cp2"):             false,
+		nodetest.RevokedListFull("w1"):            false,
+		context.DeadlineExceeded:                  true,
+		fmt.Errorf("x: %w", sdk.ErrNotInstalled):  true,
+		errors.New("the image has no such layer"): false,
+	} {
+		if got := node.TryNextControlPlane(err); got != want {
+			t.Errorf("TryNextControlPlane(%v) = %v, want %v", err, got, want)
+		}
+	}
+	if node.TryNextControlPlane(nil) {
+		t.Error("TryNextControlPlane(nil) = true")
+	}
+}
+
+// A node that answers was reached, also when it answers that its own etcd is unavailable or that
+// a call of its own ran out of time.
+func TestUnreachable(t *testing.T) {
+	for err, want := range map[error]bool{
+		nodetest.Unreachable("10.0.0.1"):          true,
+		nodetest.EtcdUnavailable():                false,
+		nodetest.EtcdTimedOut():                   false,
+		context.DeadlineExceeded:                  true,
+		fmt.Errorf("x: %w", sdk.ErrNotInstalled):  true,
+		fmt.Errorf("x: %w", sdk.ErrOtherNode):     true,
+		nodetest.NotEtcdMember():                  false,
+		errors.New("the image has no such layer"): false,
+	} {
+		if got := node.Unreachable(err); got != want {
+			t.Errorf("Unreachable(%v) = %v, want %v", err, got, want)
+		}
+	}
+}
+
 // A machine whose image trusts another OS CA refuses the controllers' certificate.
 func TestMaintenanceAtAMachineOfAnotherCluster(t *testing.T) {
 	s, other := generate(t), generate(t)
 	n := serveMaintenance(t, other, sdktest.Maintenance())
 	if _, err := node.New().Maintenance(context.Background(), n.Addr, s); !errors.Is(err, sdk.ErrOSCARefused) {
 		t.Errorf("Maintenance = %v, want ErrOSCARefused", err)
+	}
+}
+
+// A removal that names no member is refused before any call, at the node and at the Fake.
+func TestRemoveNoMember(t *testing.T) {
+	var s clustersecrets.Secrets
+	for name, c := range map[string]node.Client{"node": node.New(), "fake": nodetest.New()} {
+		if err := c.EtcdRemoveMember(t.Context(), "127.0.0.1:1", s, "cp1", ""); !errors.Is(err, node.ErrNoMember) {
+			t.Errorf("%s: EtcdRemoveMember of no member = %v, want ErrNoMember", name, err)
+		}
 	}
 }

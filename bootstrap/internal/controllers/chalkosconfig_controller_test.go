@@ -36,13 +36,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/conditions"
 
+	nodev1 "github.com/trevex/chalkos/pkg/api/node/v1"
 	"github.com/trevex/chalkos/pkg/chalkd/layers/kubernetes/kubernetestest"
 	"github.com/trevex/chalkos/pkg/check"
 	"github.com/trevex/chalkos/pkg/config"
@@ -51,6 +51,7 @@ import (
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
 )
@@ -628,7 +629,7 @@ func TestRebootingMachineIsWaitedFor(t *testing.T) {
 	e := newEnv(t, true, kubernetestest.Image)
 	e.machine("w-1", false, addr)
 	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint, Install: func(sdk.InstallRequest) error {
-		return connect.NewError(connect.CodeFailedPrecondition, "the node is installed and reboots")
+		return fmt.Errorf("install: %w", nodetest.Reasoned(connect.CodeFailedPrecondition, nodev1.ErrorReason_ERROR_REASON_INSTALLED_AND_REBOOTS, "the node is installed and reboots"))
 	}})
 	if res := e.mustReconcile("w-1"); res.RequeueAfter == 0 {
 		t.Error("a rebooting machine is not reconciled again")
@@ -640,6 +641,24 @@ func TestRebootingMachineIsWaitedFor(t *testing.T) {
 	}
 	e.mustReconcile("w-1")
 	e.wantInstalls(addr, 1)
+}
+
+// A refusal that says the machine reboots but gives no reason is an install failure: only the
+// reason tells.
+func TestRebootMessageWithoutReasonIsAFailure(t *testing.T) {
+	e := newEnv(t, true, kubernetestest.Image)
+	e.machine("w-1", false, addr)
+	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint, Install: func(sdk.InstallRequest) error {
+		return connect.NewError(connect.CodeFailedPrecondition, "the node is installed and reboots")
+	}})
+	if _, err := e.reconcile("w-1"); err == nil {
+		t.Error("a refusal without a reason does not fail the reconcile")
+	}
+	c := e.config("w-1")
+	wantReason(t, c, metav1.ConditionFalse, bootstrapv1.InstallingReason)
+	if msg := conditions.GetMessage(c, bootstrapv1.ReadyCondition); !strings.Contains(msg, "The install failed") {
+		t.Errorf("message %q, want the install failure", msg)
+	}
 }
 
 // An install waits for a free install slot.
@@ -804,25 +823,7 @@ func TestDeletingMachineNotInstalled(t *testing.T) {
 	e := newEnv(t, false, kubernetestest.Image)
 	e.machine("cp-1", true, addr)
 	e.fake.Set(addr, nodetest.Node{Fingerprint: fingerprint})
-	var m clusterv1.Machine
-	if err := testClient.Get(e.ctx, client.ObjectKey{Namespace: e.ns, Name: "cp-1"}, &m); err != nil {
-		t.Fatal(err)
-	}
-	const hold = "test.chalkos.dev/hold"
-	controllerutil.AddFinalizer(&m, hold)
-	if err := testClient.Update(e.ctx, &m); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		var m clusterv1.Machine
-		if err := testClient.Get(context.Background(), client.ObjectKey{Namespace: e.ns, Name: "cp-1"}, &m); err == nil {
-			controllerutil.RemoveFinalizer(&m, hold)
-			_ = testClient.Update(context.Background(), &m)
-		}
-	})
-	if err := testClient.Delete(e.ctx, &m); err != nil {
-		t.Fatal(err)
-	}
+	e.deleteMachineHeld("cp-1")
 	e.mustReconcile("cp-1")
 	e.wantInstalls(addr, 0)
 	wantReason(t, e.config("cp-1"), metav1.ConditionFalse, bootstrapv1.MachineDeletingReason)
@@ -849,6 +850,13 @@ func TestMachineChanged(t *testing.T) {
 		"dataSecretName": {func(m *clusterv1.Machine) { m.Spec.Bootstrap.DataSecretName = ptr.To("m") }, true},
 		"infrastructure": {func(m *clusterv1.Machine) { m.Status.Initialization.InfrastructureProvisioned = ptr.To(true) }, true},
 		"deletion":       {func(m *clusterv1.Machine) { m.DeletionTimestamp = &now }, true},
+		"hook": {func(m *clusterv1.Machine) {
+			m.Annotations = map[string]string{machineutil.HookAnnotation: machineutil.BootstrapHookOwner}
+		}, true},
+		"other annotation": {func(m *clusterv1.Machine) { m.Annotations = map[string]string{"example.com/a": ""} }, false},
+		"deleting reason": {func(m *clusterv1.Machine) {
+			m.Status.Conditions = []metav1.Condition{{Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason}}
+		}, true},
 	}
 	for name, c := range cases {
 		cur := base.DeepCopy()

@@ -6,10 +6,10 @@
 # the workflow again with everything. Every run but a draft's also runs govulncheck, which reads
 # the Go vulnerability database from the network. The jobs run the commands of the Makefile in the
 # flake's ci development shell. A ready pull request with the label e2e, which adding the label
-# runs the workflow again for, and the nightly run, which calls this workflow, also run the
-# end-to-end test on the KubeVirt lab; a push to main does not. The job result is the one check
-# that branch protection requires. On the release pull request, release-pr checks that it is
-# release-please's one commit on the tip of main.
+# runs the workflow again for, also runs the end-to-end test on the KubeVirt lab, and the nightly
+# run, which calls this workflow, runs it and the control plane's scaling test; a push to main
+# runs neither. The job result is the one check that branch protection requires. On the release
+# pull request, release-pr checks that it is release-please's one commit on the tip of main.
 name: ci
 
 on:
@@ -137,17 +137,26 @@ jobs:
       - name: Check for vulnerabilities the Go code calls
         run: nix develop .#ci --command govulncheck ./...
 
-  # The end-to-end test on the KubeVirt lab, the lab's VMs hardware-accelerated by the runner's
-  # /dev/kvm: a ready pull request with the label e2e and the nightly run, whose event is schedule
-  # or workflow_dispatch, run it; a push to main does not. The lab takes about 7 GiB of the
-  # runner's 16 GiB: two VMs of 3 and 2 GiB, KubeVirt, CDI and Cluster API. The VMs boot chalkos's
-  # released images from ghcr.io; the providers are built from the pull request's code.
+  # The end-to-end tests on the KubeVirt lab, the lab's VMs hardware-accelerated by the runner's
+  # /dev/kvm: a ready pull request with the label e2e runs make e2e, and the nightly run, whose
+  # event is schedule or workflow_dispatch, runs make e2e and make e2e-ha, each on a runner of its
+  # own; a push to main runs neither. make e2e takes about 9 GiB of the runner's 16 GiB at its
+  # peak: three VMs of 3, 2 and 2 GiB, KubeVirt, CDI and Cluster API; make e2e-ha about 13 GiB:
+  # three control planes of 3 GiB and a worker of 2 GiB. The VMs boot chalkos's released images
+  # from ghcr.io; the providers are built from the code under test. Each job's timeout leaves
+  # room for creating the lab and collecting its logs around the make target's own timeout, 90
+  # minutes for e2e and 120 for e2e-ha.
   e2e:
     if: >-
       ${{ !github.event.pull_request.draft && github.event_name != 'push' &&
       (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e')) }}
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event_name == 'pull_request' && '["e2e"]' || '["e2e", "e2e-ha"]') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.target == 'e2e-ha' && 170 || 150 }}
     permissions:
       contents: read
       # Hestia checks which cached packs GitHub has evicted.
@@ -180,17 +189,19 @@ jobs:
       # A test that skips, as when a provider is not available, fails the job. The memory the
       # runner uses is sampled while the test runs, and its peak goes to the run's summary.
       - name: Run the end-to-end test
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -o pipefail
           mkdir -p .lab/logs
           while :; do free -m | awk '/^Mem:/ {print $3}'; sleep 10; done >.lab/logs/memory.log &
           sampler=$!
           status=0
-          nix develop --command make e2e 2>&1 | tee .lab/logs/e2e.log || status=$?
+          nix develop --command make "$TARGET" 2>&1 | tee ".lab/logs/$TARGET.log" || status=$?
           kill "$sampler"
           peak=$(sort -n .lab/logs/memory.log | tail -n1)
           echo "The runner used at most $peak MiB of memory during the test; its disk: $(df -h --output=used,avail / | tail -n1)." >>"$GITHUB_STEP_SUMMARY"
-          if [ "$status" = 0 ] && grep -q -- '--- SKIP' .lab/logs/e2e.log; then
+          if [ "$status" = 0 ] && grep -q -- '--- SKIP' ".lab/logs/$TARGET.log"; then
             echo "::error title=Skipped::the end-to-end test skipped; the lab did not run"
             exit 1
           fi
@@ -211,7 +222,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-logs
+          name: ${{ matrix.target }}-logs
           path: .lab/logs
           retention-days: 7
           if-no-files-found: ignore
@@ -361,7 +372,7 @@ jobs:
           echo "lint: $LINT, generate: $GENERATE, test: $TEST, build: $BUILD, govulncheck: $GOVULNCHECK, e2e: $E2E, workflows: $WORKFLOWS, release series: $RELEASE_SERIES, release pull request: $RELEASE_PR, title: $PR_TITLE, sign-offs: $DCO"
           passed() { [ "$1" = success ] || { [ "$EVENT" != pull_request ] && [ "$1" = skipped ]; }; }
           # The e2e job runs for a pull request with the label e2e and in the nightly run, and
-          # passes only when it ran there; elsewhere it skips.
+          # passes only when it ran there, every target of its matrix; elsewhere it skips.
           e2e_selected() { [ "$EVENT" != push ] && { [ "$EVENT" != pull_request ] || [ "$E2E_LABEL" = true ]; }; }
           [ "$LINT" = success ] && [ "$GENERATE" = success ] && [ "$TEST" = success ] &&
             [ "$BUILD" = success ] && [ "$GOVULNCHECK" = success ] && [ "$WORKFLOWS" = success ] &&

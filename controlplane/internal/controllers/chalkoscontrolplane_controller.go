@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"connectrpc.com/connect/v2"
@@ -32,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -53,6 +53,7 @@ import (
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
 	"github.com/trevex/chalkos/pkg/clustersecrets"
+	sdkkubernetes "github.com/trevex/chalkos/pkg/sdk/layers/kubernetes"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -79,9 +80,10 @@ var controlPlaneKind = controlplanev1.GroupVersion.WithKind("ChalkosControlPlane
 type ChalkosControlPlaneReconciler struct {
 	// Client reads and writes the management cluster's objects, from the manager's cache.
 	Client client.Client
-	// APIReader reads uncached: the ChalkosControlPlane and its Machines, whose writes the next
-	// reconcile must see, the infrastructure templates and their CRDs, and the cluster's secrets
-	// and kubeconfig Secrets, none of which the controller watches.
+	// APIReader reads uncached: the ChalkosControlPlane, its Machines and the ChalkosConfig of a
+	// Machine whose hook runs, whose writes the next reconcile must see, and the infrastructure
+	// templates and their CRDs and the cluster's secrets and kubeconfig Secrets, none of which the
+	// controller watches.
 	APIReader client.Reader
 	// Node reaches the machines.
 	Node node.Client
@@ -95,6 +97,9 @@ type ChalkosControlPlaneReconciler struct {
 	// Clock tells the time the cluster's secrets and kubeconfig certificates are issued at; nil is
 	// the real clock.
 	Clock clock.PassiveClock
+	// Recorder records the events of the control planes' pre-terminate hooks and of the pruning of
+	// the revoked nodes; nil records none.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes,verbs=get;list;watch;update;patch
@@ -108,6 +113,7 @@ type ChalkosControlPlaneReconciler struct {
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;create;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // SetupWithManager registers the reconciler with mgr.
 func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
@@ -123,6 +129,7 @@ func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 			builder.WithPredicates(predicates.Any(scheme, log,
 				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(scheme, log),
 				clusterEndpointOrControlPlaneChanged(),
+				machineutil.ClusterDeletionStarted(),
 			))).
 		Complete(r)
 }
@@ -164,7 +171,7 @@ func (r *ChalkosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		conditionlog.Changes(ctrl.LoggerFrom(ctx), before, cp.Status.Conditions,
 			controlplanev1.InitializedCondition, controlplanev1.AvailableCondition,
 			controlplanev1.ScalingUpCondition, controlplanev1.MachinesReadyCondition,
-			controlplanev1.DeletingCondition)
+			controlplanev1.ScalingDownCondition, controlplanev1.DeletingCondition)
 		if err := s.patch(ctx); err != nil {
 			rerr = kerrors.NewAggregate([]error{rerr, err})
 		}
@@ -190,9 +197,15 @@ type scope struct {
 	// statuses are the Kubernetes statuses of the Machines' nodes read in this reconcile, by
 	// Machine name, so that each node is asked once.
 	statuses map[string]nodeStatus
-	// waitingToJoin is the Machine whose join the next Machine's creation waits for; empty when
-	// it waits for none.
-	waitingToJoin string
+	// scaleUpWaiting is what the next Machine's creation waits for, such as a Machine's join;
+	// empty when it waits for nothing.
+	scaleUpWaiting string
+	// scaleDownWaiting is why the next scale-down step may not start yet, for the ScalingDown
+	// condition; empty when it may.
+	scaleDownWaiting string
+	// removing and removingReason are what the pre-terminate hook of the Machine it removes waits
+	// on, for the ScalingDown and Deleting conditions; empty while no hook waits.
+	removing, removingReason string
 	// deletingReason and deletingMessage are the Deleting condition's reason and message while
 	// the ChalkosControlPlane is being deleted; empty before its Machines were listed.
 	deletingReason, deletingMessage string
@@ -217,7 +230,7 @@ func (s *scope) patch(ctx context.Context) error {
 		patch.WithOwnedConditions{Conditions: []string{
 			controlplanev1.AvailableCondition, controlplanev1.InitializedCondition,
 			controlplanev1.MachinesReadyCondition, controlplanev1.ScalingUpCondition,
-			controlplanev1.DeletingCondition,
+			controlplanev1.ScalingDownCondition, controlplanev1.DeletingCondition,
 		}},
 		patch.WithStatusObservedGeneration{})
 }
@@ -273,6 +286,22 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err := r.markUpToDate(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
+	if !s.cluster.DeletionTimestamp.IsZero() {
+		// The Cluster's deletion deletes the ChalkosControlPlane once the workers are gone: no
+		// Machine is created or bootstrapped meanwhile, and the kubeconfig is only renewed.
+		if err := r.removeAllHooks(ctx, s); err != nil {
+			return ctrl.Result{}, err
+		}
+		sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		renew, err := r.renewKubeconfig(ctx, s, sec, ok)
+		return ctrl.Result{RequeueAfter: renew}, err
+	}
+	if err := r.addHooks(ctx, s); err != nil {
+		return ctrl.Result{}, err
+	}
 	if !s.cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		// The Cluster's watch reconciles again once the endpoint is set.
 		s.notInitialized(controlplanev1.NotInitializedReason, "The Cluster has no controlPlaneEndpoint yet")
@@ -280,6 +309,10 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	}
 	owner := metav1.OwnerReference{APIVersion: controlPlaneKind.GroupVersion().String(), Kind: controlPlaneKind.Kind, Name: s.cp.Name, UID: s.cp.UID}
 	sec, err := secrets.Ensure(ctx, uncached{Client: r.Client, reader: r.APIReader}, client.ObjectKeyFromObject(s.cluster), owner, r.clock().Now())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	hooks, err := r.reconcileHooks(ctx, s, sec)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -291,7 +324,12 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	res = earliest(res, scale)
+	res = earliest(earliest(res, scale), hooks)
+	down, err := r.scaleDown(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	res = earliest(res, down)
 	if !s.initialized() {
 		return res, nil
 	}
@@ -299,30 +337,44 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	return earliest(res, ctrl.Result{RequeueAfter: renew}), nil
+	res = earliest(res, ctrl.Result{RequeueAfter: renew})
+	return earliest(res, r.reconcilePrune(ctx, s, sec)), nil
 }
 
 // reconcileDelete waits for the cluster's workers to be deleted, then deletes the control plane's
 // Machines and, once they are gone, removes the finalizer. The Machines' own finalizers delete
-// their infrastructure and nodes first. The workers go first, as with Cluster API's own control
-// plane, so that their nodes are drained while the cluster's API server still answers. The
-// kubeconfig is renewed while the deletion waits, since draining the workers needs it.
+// their infrastructure and nodes first, after the pre-terminate hooks, which take each Machine
+// but the last out of etcd and revoke it, one at a time; once the Cluster is being deleted no
+// hook runs. The workers go first, as with Cluster API's own control plane, so that their nodes
+// are drained while the cluster's API server still answers. The kubeconfig is renewed while the
+// deletion waits, since draining the workers needs it.
 func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result, error) {
 	if err := r.listMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
-	var renew time.Duration
-	if s.initialized() {
-		sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
-		if err != nil {
+	sec, ok, err := secrets.Get(ctx, r.APIReader, client.ObjectKeyFromObject(s.cluster))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	var res ctrl.Result
+	switch {
+	case !s.cluster.DeletionTimestamp.IsZero():
+		if err := r.removeAllHooks(ctx, s); err != nil {
 			return ctrl.Result{}, err
 		}
-		if ok {
-			if renew, err = r.reconcileKubeconfig(ctx, s, sec); err != nil {
-				return ctrl.Result{}, err
-			}
+	case ok:
+		if res, err = r.reconcileHooks(ctx, s, sec); err != nil {
+			return ctrl.Result{}, err
 		}
+	case slices.ContainsFunc(s.deleting, func(m clusterv1.Machine) bool { return machineutil.HasHook(&m) }):
+		s.removing = fmt.Sprintf("the Cluster's secrets %s are gone, so no Machine leaves etcd; remove the annotation %s from the Machines to delete them",
+			secrets.Name(s.cluster.Name), machineutil.HookAnnotation)
 	}
+	renew, err := r.renewKubeconfig(ctx, s, sec, ok)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	res = earliest(res, ctrl.Result{RequeueAfter: renew})
 	workers, pools, err := r.countWorkers(ctx, s)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -331,7 +383,7 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 		s.deletingReason = controlplanev1.DeletingWaitingForWorkersDeletionReason
 		s.deletingMessage = waitingForWorkersMessage(workers, pools)
 		// No watch reports the workers' deletion; the requeue does.
-		return earliest(ctrl.Result{RequeueAfter: machineutil.RetryAfter}, ctrl.Result{RequeueAfter: renew}), nil
+		return earliest(ctrl.Result{RequeueAfter: machineutil.RetryAfter}, res), nil
 	}
 	for i := range s.machines {
 		err := r.Client.Delete(ctx, &s.machines[i])
@@ -346,13 +398,26 @@ func (r *ChalkosControlPlaneReconciler) reconcileDelete(ctx context.Context, s *
 	if n := len(s.machines) + len(s.deleting); n > 0 {
 		s.deletingReason = controlplanev1.DeletingWaitingForMachineDeletionReason
 		s.deletingMessage = "Deleting " + plural(n, "Machine")
+		if s.removing != "" {
+			s.deletingMessage += "; " + s.removing
+		}
 		// The Machines' watch reconciles again as they go; the requeue covers a missed event.
-		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
+		return earliest(ctrl.Result{RequeueAfter: machineutil.RetryAfter}, res), nil
 	}
 	ctrl.LoggerFrom(ctx).Info("The Machines are gone; removing the finalizer")
 	s.deletingReason, s.deletingMessage = controlplanev1.DeletionCompletedReason, ""
 	controllerutil.RemoveFinalizer(s.cp, controlplanev1.ChalkosControlPlaneFinalizer)
 	return ctrl.Result{}, nil
+}
+
+// renewKubeconfig keeps the kubeconfig Secret of an initialized control plane while it or its
+// Cluster is being deleted, from the cluster's secrets sec if they still exist (ok), and returns
+// when to renew it next; zero when it is not kept.
+func (r *ChalkosControlPlaneReconciler) renewKubeconfig(ctx context.Context, s *scope, sec clustersecrets.Secrets, ok bool) (time.Duration, error) {
+	if !ok || !s.initialized() {
+		return 0, nil
+	}
+	return r.reconcileKubeconfig(ctx, s, sec)
 }
 
 // initialize bootstraps the cluster on the first Machine once it is installed, and marks the
@@ -444,7 +509,7 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	case err == nil:
 		log.Info("The machine bootstrapped the cluster")
 		return ctrl.Result{}, true, nil
-	case bootstrappedAlready(err):
+	case sdkkubernetes.BootstrappedAlready(err):
 		log.Info("The machine is bootstrapped already")
 		return ctrl.Result{}, true, nil
 	case ctx.Err() == nil && (connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded)):
@@ -457,15 +522,6 @@ func (r *ChalkosControlPlaneReconciler) bootstrap(ctx context.Context, s *scope,
 	}
 	s.notInitialized(controlplanev1.NotInitializedReason, fmt.Sprintf("Bootstrapping the Machine %s: %v", m.Name, err))
 	return ctrl.Result{}, false, err
-}
-
-// bootstrappedAlready tells whether err is chalkd's refusal of a bootstrap of a node that is
-// bootstrapped or joined the cluster already. chalkd gives the refusal no reason, so its message
-// tells.
-func bootstrappedAlready(err error) bool {
-	msg := err.Error()
-	return connect.CodeOf(err) == connect.CodeFailedPrecondition &&
-		(strings.Contains(msg, "the node is bootstrapped already") || strings.Contains(msg, "the node joined the cluster already"))
 }
 
 // nodeStatus is the Kubernetes status of the Machine's node, read once per reconcile.
@@ -526,7 +582,6 @@ func earliest(a, b ctrl.Result) ctrl.Result {
 	return b
 }
 
-
 // uncached is a client that reads with reader and writes with its Client: secrets.Ensure must not
 // read the Secret from a cache that does not hold it yet, or it would generate the secrets again,
 // and an infrastructure template is read without an informer for its kind.
@@ -539,7 +594,6 @@ type uncached struct {
 func (u uncached) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	return u.reader.Get(ctx, key, obj, opts...)
 }
-
 
 // isControlPlaneRef tells whether ref names a ChalkosControlPlane.
 func isControlPlaneRef(ref metav1.OwnerReference) bool {

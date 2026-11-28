@@ -80,3 +80,26 @@ const (
 	// replaces a machine that fell back to maintenance mode.
 	ImageFellBackReason = "ImageFellBack"
 )
+
+// NodeRemovedCondition reports, on the ChalkosConfig of a worker Machine being deleted, whether
+// its node was revoked, after which its pre-terminate hook is removed and its infrastructure
+// goes.
+const NodeRemovedCondition = "NodeRemoved"
+
+// Reasons for the NodeRemoved condition, besides WaitingForControlPlaneReason, which documents a
+// revocation that found no control plane to answer it.
+const (
+	// RevokingReason documents a worker whose node is being revoked, or whose revocation failed
+	// and is tried again.
+	RevokingReason = "Revoking"
+
+	// RevokedListFullReason documents a worker whose node the control planes refuse to revoke
+	// because their list of revoked nodes is full. The control-plane provider prunes the list with
+	// PruneRevoked, which drops expired entries and those older than both the cluster's OS CA and
+	// Kubernetes CA; rotating both CAs makes room when nothing has expired.
+	RevokedListFullReason = "RevokedListFull"
+
+	// DoneReason documents a worker whose node was revoked, or needs no revocation because it was
+	// never installed or the whole Cluster is being deleted.
+	DoneReason = "Done"
+)
