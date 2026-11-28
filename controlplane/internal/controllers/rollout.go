@@ -388,16 +388,32 @@ func (s *scope) anyOutOfDate() bool {
 }
 
 // oldest is the oldest of the control plane's Machines that are not being deleted, as oldestOf
-// orders them, or with outOfDate the oldest of those that are not up to date; nil when there is
-// none.
+// orders them; nil when there is none. With outOfDate it is one of those that are not up to date:
+// the oldest that has not joined, or else the oldest. A Machine that has not joined holds no vote
+// in etcd, so it goes without its join and at no cost to quorum: a replacement that never joins
+// goes once its change is reverted or fixed forward, which leaves every Machine out of date. An
+// up-to-date Machine that is joining is not out of date, so a roll still waits for its join.
 func (r *ChalkosControlPlaneReconciler) oldest(ctx context.Context, s *scope, sec clustersecrets.Secrets, outOfDate bool) (*clusterv1.Machine, error) {
+	joined := func(m *clusterv1.Machine) (bool, error) { return r.joined(ctx, s, m, sec) }
 	var ms []*clusterv1.Machine
 	for i := range s.machines {
-		if !outOfDate || s.outOfDate(&s.machines[i]) != "" {
-			ms = append(ms, &s.machines[i])
+		m := &s.machines[i]
+		switch {
+		case !outOfDate:
+		case s.outOfDate(m) == "":
+			continue
+		default:
+			ok, err := joined(m)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return m, nil
+			}
 		}
+		ms = append(ms, m)
 	}
-	return oldestOf(ms, func(m *clusterv1.Machine) (bool, error) { return r.joined(ctx, s, m, sec) })
+	return oldestOf(ms, joined)
 }
 
 // oldestOf is the first of ms, which are sorted by creation time, then by name. The API server
@@ -429,9 +445,9 @@ func oldestOf(ms []*clusterv1.Machine, joined func(*clusterv1.Machine) (bool, er
 
 // rollOut takes the roll's next step while a Machine is not up to date and the control plane has
 // as many Machines as spec.replicas asks for, none being deleted. With maxSurge 1 it creates an
-// up-to-date Machine; once that one joined, scaleDown deletes the oldest Machine that is not up to
-// date. With maxSurge 0 it deletes that Machine first; scaleUp creates its replacement once it is
-// gone. A step starts only when the control plane is initialized, no guard holds, no other step
+// up-to-date Machine; once that one joined, scaleDown deletes the Machine that oldest picks among
+// those not up to date. With maxSurge 0, or when that Machine has not joined, it deletes that
+// Machine first; scaleUp creates its replacement once it is gone. A step starts only when the control plane is initialized, no guard holds, no other step
 // was taken in this reconcile, stepProblem finds nothing and the image accepts the documents the
 // new Machine installs with.
 func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
@@ -455,10 +471,14 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// With maxSurge 0 the step deletes old, which may go without its join; a Machine created
-	// waits for every other to have joined.
+	// With maxSurge 0 the step deletes old, which may go without its join. So does it when old has
+	// not joined: a Machine created waits for every other to have joined, and old never may.
+	ok, err := r.joined(ctx, s, old, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	var leaving *clusterv1.Machine
-	if surge(s.cp) == 0 {
+	if surge(s.cp) == 0 || !ok {
 		leaving = old
 	}
 	why, err := r.stepProblem(ctx, s, sec, leaving)
@@ -473,7 +493,7 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 		return res, nil
 	}
 	log := ctrl.LoggerFrom(ctx)
-	if surge(s.cp) > 0 {
+	if leaving == nil {
 		m, err := r.createMachine(ctx, s)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -488,7 +508,7 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 	if err := r.deleteMachine(ctx, old); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("Rolling out: deleting the oldest Machine that is not up to date", "machine", old.Name)
+	log.Info("Rolling out: deleting a Machine that is not up to date", "machine", old.Name)
 	machineutil.Event(r.Recorder, s.cp, old, corev1.EventTypeNormal, "RollingOut", "DeleteMachine",
 		"Deleting the Machine %s, which is not up to date; its replacement is created once it is gone", old.Name)
 	s.removing = fmt.Sprintf("the Machine %s is deleted to be replaced", old.Name)
@@ -499,7 +519,7 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 
 // checkReplacement holds the roll, in s.held, unless spec.image accepts the documents that the
 // Machine replacing old installs with, as the image's contract checks them before an install:
-// with maxSurge 0 old goes first, and must not go while no replacement can install. A refusal
+// with maxSurge 0, or when old has not joined, old goes first, and must not go while no replacement can install. A refusal
 // holds with InvalidFilesReason until the files or the image change; a check that could not be
 // made, as while the image cannot be read, holds without a reason and returns when to try again.
 func (r *ChalkosControlPlaneReconciler) checkReplacement(ctx context.Context, s *scope, old *clusterv1.Machine) ctrl.Result {

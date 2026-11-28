@@ -37,13 +37,13 @@ import (
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
 
-// scaleDown deletes the control plane's oldest Machine that is not up to date, or else its oldest
-// Machine, while it has more than Spec.Replicas asks for, one at a time. A step starts only once
-// the control plane is initialized, no Machine is being deleted or was created or deleted in this
-// reconcile, and stepProblem finds nothing for the Machine. A Machine that has not joined goes
-// without its join, as a replacement that never joins once its change is reverted. The Machine's
-// pre-terminate hook takes it out of etcd and revokes it; the next step waits until it is gone.
-// Spec.Replicas is at least one, so the last Machine is never deleted.
+// scaleDown deletes a Machine that is not up to date, as oldest picks it, or else the control
+// plane's oldest Machine, while it has more than Spec.Replicas asks for, one at a time. A step
+// starts only once the control plane is initialized, no Machine is being deleted or was created
+// or deleted in this reconcile, and stepProblem finds nothing for the Machine. A Machine that has
+// not joined goes without its join, as a replacement that never joins once its change is reverted
+// or fixed forward. The Machine's pre-terminate hook takes it out of etcd and revokes it; the next
+// step waits until it is gone. Spec.Replicas is at least one, so the last Machine is never deleted.
 func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	n, want := len(s.machines), max(1, int(ptr.Deref(s.cp.Spec.Replicas, 1)))
 	if n <= want || !s.initialized() || len(s.deleting) > 0 || s.stepped {

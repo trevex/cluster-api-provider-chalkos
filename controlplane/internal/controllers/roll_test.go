@@ -83,38 +83,46 @@ func (e *env) rollingControlPlane(n int) ([]clusterv1.Machine, map[string]string
 	return ms, addrs
 }
 
-// With maxSurge 1, a patch version rolls the three Machines oldest first: each time an up-to-date
-// fourth Machine joins before the oldest that is not up to date is deleted.
-func TestRollWithSurge(t *testing.T) {
-	e := newEnv(t, 3, true)
-	ms, addrs := e.rollingControlPlane(3)
-	e.setVersion("v1.37.2")
-	left := ms
-	for step := range 3 {
+// rollWithSurge takes every step of a roll with maxSurge 1 to the version v over left, the joined
+// Machines oldest first: each time an up-to-date Machine, given an address in 10.0.<net>.0/24,
+// joins before the oldest Machine that is not up to date is deleted.
+func (e *env) rollWithSurge(left []clusterv1.Machine, addrs map[string]string, v string, net int) {
+	e.t.Helper()
+	n := len(left)
+	for step := range n {
 		e.mustReconcile()
-		repl := e.newcomer(e.wantMachines(4), addrs)
-		wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutReason, fmt.Sprintf("%d of 4 Machines", 3-step))
-		if repl.Spec.Version != "v1.37.2" {
-			t.Fatalf("step %d: the replacement is of %s", step, repl.Spec.Version)
+		repl := e.newcomer(e.wantMachines(n+1), addrs)
+		wantConditionReason(e.t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutReason, fmt.Sprintf("%d of %d Machines", n-step, n+1))
+		if repl.Spec.Version != v {
+			e.t.Fatalf("step %d: the replacement is of %s, want %s", step, repl.Spec.Version, v)
 		}
 		e.mustReconcile()
 		if got := e.deleted(); len(got) != 0 {
-			t.Fatalf("step %d: deleted %v before the replacement joined", step, got)
+			e.t.Fatalf("step %d: deleted %v before the replacement joined", step, got)
 		}
-		addr := fmt.Sprintf("10.0.1.%d", step+1)
+		addr := fmt.Sprintf("10.0.%d.%d", net, step+1)
 		e.provision(repl, addr, kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
 		addrs[repl.Name] = addr
 		current := append(slices.Clone(left), repl)
 		e.setMembers(current, addrs)
 		e.mustReconcile()
 		if got := e.deleted(); !slices.Equal(got, []string{left[0].Name}) {
-			t.Fatalf("step %d: deleted %v, want the oldest %s", step, got, left[0].Name)
+			e.t.Fatalf("step %d: deleted %v, want the oldest %s", step, got, left[0].Name)
 		}
 		e.finishRemoval(left[0].Name, current[1:], addrs)
 		left = current[1:]
 	}
 	e.mustReconcile()
-	e.wantMachines(3)
+	e.wantMachines(n)
+}
+
+// With maxSurge 1, a patch version rolls the three Machines oldest first: each time an up-to-date
+// fourth Machine joins before the oldest that is not up to date is deleted.
+func TestRollWithSurge(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.setVersion("v1.37.2")
+	e.rollWithSurge(ms, addrs, "v1.37.2", 1)
 	cp := e.cp()
 	wantConditionReason(t, cp, controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
 	if got := ptr.Deref(cp.Status.UpToDateReplicas, -1); got != 3 {
@@ -325,29 +333,120 @@ func TestRollWithoutSurgeWaitsForHealthyEtcd(t *testing.T) {
 	}
 }
 
-// A change of the spec while the surge Machine joins leaves the oldest Machine to go first, once
-// the surge Machine joined.
-func TestSpecChangeMidSurgeDeletesTheOldestFirst(t *testing.T) {
+// A change of the spec while the surge Machine has not joined yet makes it a Machine that is not up
+// to date and holds no vote: it goes first, without its join, and the roll goes on over the others.
+// Once it joined, it is one more joined Machine, and the oldest goes first.
+func TestSpecChangeMidSurge(t *testing.T) {
+	t.Run("before the surge Machine joined", func(t *testing.T) {
+		e := newEnv(t, 3, true)
+		ms, addrs := e.rollingControlPlane(3)
+		e.setVersion("v1.37.2")
+		e.mustReconcile()
+		repl := e.newcomer(e.wantMachines(4), addrs)
+		e.hold(repl.Name)
+		e.setVersion("v1.37.3")
+		e.mustReconcile()
+		if got := e.deleted(); !slices.Equal(got, []string{repl.Name}) {
+			t.Fatalf("deleted %v, want the surge Machine %s, which has not joined", got, repl.Name)
+		}
+		e.finishRemoval(repl.Name, ms, addrs)
+		e.rollWithSurge(ms, addrs, "v1.37.3", 1)
+	})
+	t.Run("after the surge Machine joined", func(t *testing.T) {
+		e := newEnv(t, 3, true)
+		ms, addrs := e.rollingControlPlane(3)
+		e.setVersion("v1.37.2")
+		e.mustReconcile()
+		repl := e.newcomer(e.wantMachines(4), addrs)
+		e.hold(repl.Name)
+		e.provision(repl, "10.0.1.1", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+		addrs[repl.Name] = "10.0.1.1"
+		e.setMembers(append(slices.Clone(ms), repl), addrs)
+		e.setVersion("v1.37.3")
+		e.mustReconcile()
+		// Every Machine joined, so the oldest is the first by creation time, then by name: the
+		// surge Machine too, when it was created in the same second as the others.
+		want := sorted(e.machines())[0].Name
+		if got := e.deleted(); !slices.Equal(got, []string{want}) {
+			t.Fatalf("deleted %v, want the oldest %s", got, want)
+		}
+	})
+}
+
+// otherDiskFile is systemDiskFile on another disk: a change of files that marks no fixed field.
+var otherDiskFile = runtime.RawExtension{Raw: []byte(`{"apiVersion": "storage.chalkos.dev/v1alpha1", "kind": "SystemDisk", "metadata": {"name": "system"}, "spec": {"disk": {"path": "/dev/vdb"}}}`)}
+
+// A replacement that never joins goes without its join once the change is fixed forward, by
+// another version or other files, and the roll to the fixed spec ends: every Machine is then out
+// of date, and the one that never joined holds no vote.
+func TestStuckReplacementGoesOnFixForward(t *testing.T) {
+	for name, fix := range map[string]func(e *env) string{
+		"a version": func(e *env) string { e.setVersion("v1.37.3"); return "v1.37.3" },
+		"files":     func(e *env) string { e.setFiles(clusterFile("lab.local"), otherDiskFile); return "v1.37.2" },
+	} {
+		t.Run("with maxSurge 1, "+name, func(t *testing.T) {
+			e := newEnv(t, 3, true)
+			ms, addrs := e.rollingControlPlane(3)
+			e.setVersion("v1.37.2")
+			e.mustReconcile()
+			stuck := e.newcomer(e.wantMachines(4), addrs)
+			e.hold(stuck.Name)
+			e.mustReconcile()
+			v := fix(e)
+			e.mustReconcile()
+			if got := e.deleted(); !slices.Equal(got, []string{stuck.Name}) {
+				t.Fatalf("deleted %v, want the replacement %s that never joined", got, stuck.Name)
+			}
+			e.finishRemoval(stuck.Name, ms, addrs)
+			e.rollWithSurge(ms, addrs, v, 1)
+			wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
+		})
+		t.Run("with maxSurge 0, "+name, func(t *testing.T) {
+			e := newEnv(t, 3, true)
+			ms, addrs := e.rollingControlPlane(3)
+			e.setMaxSurge(0)
+			e.setVersion("v1.37.2")
+			e.mustReconcile()
+			e.finishRemoval(ms[0].Name, ms[1:], addrs)
+			e.mustReconcile()
+			stuck := e.newcomer(e.wantMachines(3), addrs)
+			e.hold(stuck.Name)
+			v := fix(e)
+			e.mustReconcile()
+			if got := e.deleted(); !slices.Equal(got, []string{stuck.Name}) {
+				t.Fatalf("deleted %v, want the replacement %s that never joined", got, stuck.Name)
+			}
+			e.finishRemoval(stuck.Name, ms[1:], addrs)
+			e.mustReconcile()
+			repl := e.newcomer(e.wantMachines(3), addrs)
+			if repl.Spec.Version != v {
+				t.Errorf("the new Machine %s is of %s, want %s", repl.Name, repl.Spec.Version, v)
+			}
+		})
+	}
+}
+
+// With maxSurge 1, a Machine that scaleUp created in place of a deleted one and that never joins
+// goes without its join once a change makes it out of date: no Machine could be created while it
+// has not joined.
+func TestStuckScaleUpMachineGoesOnChange(t *testing.T) {
 	e := newEnv(t, 3, true)
-	ms, addrs := e.rollingControlPlane(3)
+	all, addrs := e.rollingControlPlane(3)
+	ms := all[:2]
+	e.deleteHeld(all[2].Name)
+	e.finishRemoval(all[2].Name, ms, addrs)
+	e.mustReconcile()
+	stuck := e.newcomer(e.wantMachines(3), addrs)
+	e.hold(stuck.Name)
 	e.setVersion("v1.37.2")
 	e.mustReconcile()
-	repl := e.newcomer(e.wantMachines(4), addrs)
-	e.hold(repl.Name)
-	e.setVersion("v1.37.3")
-	e.mustReconcile()
-	if got := e.deleted(); len(got) != 0 {
-		t.Fatalf("deleted %v before the surge Machine joined", got)
+	if got := e.deleted(); !slices.Equal(got, []string{stuck.Name}) {
+		t.Fatalf("deleted %v, want the Machine %s that never joined", got, stuck.Name)
 	}
-	e.provision(repl, "10.0.1.1", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
-	addrs[repl.Name] = "10.0.1.1"
-	e.setMembers(append(slices.Clone(ms), repl), addrs)
+	e.finishRemoval(stuck.Name, ms, addrs)
 	e.mustReconcile()
-	// Every Machine joined, so the oldest is the first by creation time, then by name: the
-	// surge Machine too, when it was created in the same second as the others.
-	want := sorted(e.machines())[0].Name
-	if got := e.deleted(); !slices.Equal(got, []string{want}) {
-		t.Fatalf("deleted %v, want the oldest %s", got, want)
+	if repl := e.newcomer(e.wantMachines(3), addrs); repl.Spec.Version != "v1.37.2" {
+		t.Errorf("the new Machine %s is of %s, want v1.37.2", repl.Name, repl.Spec.Version)
 	}
 }
 

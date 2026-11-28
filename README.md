@@ -23,8 +23,8 @@ What works:
   Cluster API deletes the Machine's infrastructure, as [Removing Machines](#removing-machines)
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
 - Scaling the control plane down, one Machine at a time, once every Machine joined and etcd lists
-  one healthy member per Machine. Machines that are not up to date go first, then the oldest. A
-  Machine that never joined may go without that wait, as
+  one healthy member per Machine. Machines that are not up to date go first: among them, one that
+  never joined, else the oldest. A Machine that never joined goes without that wait, as
   [How to recover from a replacement that never joins](#how-to-recover-from-a-replacement-that-never-joins)
   describes.
 - Rolling out a changed version, image, files or infrastructure template of the control plane,
@@ -242,7 +242,8 @@ Machine and, with `maxSurge: 0`, costs no etcd member.
 
 A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
 Machine, no Machine is being deleted, and no guard holds. Scaling down takes the Machines that are
-not up to date first, so lowering `replicas` during a roll removes old Machines before new ones.
+not up to date first, and among them one that never joined, so lowering `replicas` during a roll
+removes old Machines before new ones.
 
 ### Which changes does the control plane refuse?
 
@@ -297,14 +298,17 @@ Cluster API Cluster, reports on `ScalingUp` with the same reason instead.
 ### How to recover from a replacement that never joins
 
 A replacement that never joins, such as one whose image does not boot, holds the roll: the next
-step waits for its join. Revert `spec.version`, `spec.image` or `spec.files` to what the other
-Machines were made from. The stuck Machine is then the only one out of date, and the control plane
-deletes it without waiting for its join, which ends the roll. With `maxSurge: 0`, the control
-plane then creates the Machine it is short of from the reverted spec.
+step waits for its join. Change `spec.version`, `spec.image` or `spec.files` again, either back to
+what the other Machines were made from or forward to a fixed spec. The stuck Machine is then out
+of date, and among the Machines that are not up to date the control plane deletes one that never
+joined first, without waiting for its join: it holds no vote in etcd, so its removal costs no
+quorum. After a revert, that ends the roll. After a fix forward, the roll goes on over the other
+Machines. With `maxSurge: 0`, the control plane then creates the Machine it is short of from the
+current spec.
 
-A fix forward does not unstick the roll. The next step replaces the oldest Machine that is not up
-to date, which is one of the old Machines, and it waits for the stuck Machine to join. Revert to
-the spec the other Machines were made from first, then roll forward.
+The same holds for a change made while a surge Machine is still joining: that Machine is then out
+of date too, and it goes first instead of joining. An up-to-date Machine that is joining is never
+deleted this way, so a roll without a further change still waits for its join.
 
 A replacement that joined etcd but is unhealthy holds the roll as well, because a step waits for
 one healthy member per Machine. Delete that Machine by hand. Its pre-terminate hook takes its
