@@ -333,7 +333,7 @@ func (s *scope) machineWanted() bool {
 	if len(s.machines) < int(ptr.Deref(s.cp.Spec.Replicas, 1)) {
 		return true
 	}
-	return slices.ContainsFunc(s.machines, func(m clusterv1.Machine) bool { return s.outOfDate(&m) != "" })
+	return s.anyOutOfDate()
 }
 
 // surge is spec.rollout.strategy.rollingUpdate.maxSurge: how many Machines above spec.replicas
@@ -381,15 +381,50 @@ func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scop
 	return r.etcdProblem(ctx, s, sec, unjoined), nil
 }
 
-// oldestOutdated is the oldest of the control plane's Machines that is neither being deleted nor
-// up to date; nil when every one is up to date.
-func (s *scope) oldestOutdated() *clusterv1.Machine {
+// anyOutOfDate tells whether one of the control plane's Machines that are not being deleted is not
+// up to date.
+func (s *scope) anyOutOfDate() bool {
+	return slices.ContainsFunc(s.machines, func(m clusterv1.Machine) bool { return s.outOfDate(&m) != "" })
+}
+
+// oldest is the oldest of the control plane's Machines that are not being deleted, as oldestOf
+// orders them, or with outOfDate the oldest of those that are not up to date; nil when there is
+// none.
+func (r *ChalkosControlPlaneReconciler) oldest(ctx context.Context, s *scope, sec clustersecrets.Secrets, outOfDate bool) (*clusterv1.Machine, error) {
+	var ms []*clusterv1.Machine
 	for i := range s.machines {
-		if s.outOfDate(&s.machines[i]) != "" {
-			return &s.machines[i]
+		if !outOfDate || s.outOfDate(&s.machines[i]) != "" {
+			ms = append(ms, &s.machines[i])
 		}
 	}
-	return nil
+	return oldestOf(ms, func(m *clusterv1.Machine) (bool, error) { return r.joined(ctx, s, m, sec) })
+}
+
+// oldestOf is the first of ms, which are sorted by creation time, then by name. The API server
+// records creation times to the second, so among the Machines created in the same second as the
+// first, the first that joined is taken: one that has not joined yet is the newer in effect. nil
+// when ms is empty.
+func oldestOf(ms []*clusterv1.Machine, joined func(*clusterv1.Machine) (bool, error)) (*clusterv1.Machine, error) {
+	switch {
+	case len(ms) == 0:
+		return nil, nil
+	case len(ms) == 1 || !ms[1].CreationTimestamp.Equal(&ms[0].CreationTimestamp):
+		// No tie, and no need to ask whether the Machine joined.
+		return ms[0], nil
+	}
+	for _, m := range ms {
+		if !m.CreationTimestamp.Equal(&ms[0].CreationTimestamp) {
+			break
+		}
+		ok, err := joined(m)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return m, nil
+		}
+	}
+	return ms[0], nil
 }
 
 // rollOut takes the roll's next step while a Machine is not up to date and the control plane has
@@ -400,10 +435,9 @@ func (s *scope) oldestOutdated() *clusterv1.Machine {
 // was taken in this reconcile, stepProblem finds nothing and the image accepts the documents the
 // new Machine installs with.
 func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
-	old := s.oldestOutdated()
 	want := int(ptr.Deref(s.cp.Spec.Replicas, 1))
 	switch {
-	case old == nil || s.held != "" || s.stepped || !s.initialized():
+	case !s.anyOutOfDate() || s.held != "" || s.stepped || !s.initialized():
 		// RollingOut reports a guard; a step taken and the initialization reconcile again.
 		return ctrl.Result{}, nil
 	case len(s.machines) < want:
@@ -416,6 +450,10 @@ func (r *ChalkosControlPlaneReconciler) rollOut(ctx context.Context, s *scope, s
 	case len(s.machines) > want:
 		s.rollWaiting = s.scaleDownWaiting
 		return ctrl.Result{}, nil
+	}
+	old, err := r.oldest(ctx, s, sec, true)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	// With maxSurge 0 the step deletes old, which may go without its join; a Machine created
 	// waits for every other to have joined.

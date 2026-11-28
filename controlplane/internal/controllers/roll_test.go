@@ -333,6 +333,7 @@ func TestSpecChangeMidSurgeDeletesTheOldestFirst(t *testing.T) {
 	e.setVersion("v1.37.2")
 	e.mustReconcile()
 	repl := e.newcomer(e.wantMachines(4), addrs)
+	e.hold(repl.Name)
 	e.setVersion("v1.37.3")
 	e.mustReconcile()
 	if got := e.deleted(); len(got) != 0 {
@@ -342,8 +343,11 @@ func TestSpecChangeMidSurgeDeletesTheOldestFirst(t *testing.T) {
 	addrs[repl.Name] = "10.0.1.1"
 	e.setMembers(append(slices.Clone(ms), repl), addrs)
 	e.mustReconcile()
-	if got := e.deleted(); !slices.Equal(got, []string{ms[0].Name}) {
-		t.Fatalf("deleted %v, want the oldest %s", got, ms[0].Name)
+	// Every Machine joined, so the oldest is the first by creation time, then by name: the
+	// surge Machine too, when it was created in the same second as the others.
+	want := sorted(e.machines())[0].Name
+	if got := e.deleted(); !slices.Equal(got, []string{want}) {
+		t.Fatalf("deleted %v, want the oldest %s", got, want)
 	}
 }
 
@@ -375,5 +379,39 @@ func TestWithoutLearnerOf(t *testing.T) {
 	}
 	if got := ids(withoutLearnerOf(append(slices.Clone(members), nameless...), m)); !slices.Equal(got, []uint64{1, 2, 3, 4}) {
 		t.Errorf("without the nameless learner of d: %v", got)
+	}
+}
+
+// Among Machines created in the same second, the first that joined is the oldest; a Machine alone
+// in its second is the oldest without asking whether it joined.
+func TestOldestOf(t *testing.T) {
+	at := func(name string, sec int64) *clusterv1.Machine {
+		return &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: metav1.Unix(sec, 0)}}
+	}
+	joinedOf := func(names ...string) func(*clusterv1.Machine) (bool, error) {
+		return func(m *clusterv1.Machine) (bool, error) { return slices.Contains(names, m.Name), nil }
+	}
+	asked := func(*clusterv1.Machine) (bool, error) {
+		t.Error("asked whether a Machine joined without a tie")
+		return false, nil
+	}
+	for name, tc := range map[string]struct {
+		ms     []*clusterv1.Machine
+		joined func(*clusterv1.Machine) (bool, error)
+		want   string
+	}{
+		"none":                          {nil, asked, ""},
+		"no tie":                        {[]*clusterv1.Machine{at("b", 1), at("a", 2)}, asked, "b"},
+		"a tie, the first joined":       {[]*clusterv1.Machine{at("a", 1), at("b", 1)}, joinedOf("a", "b"), "a"},
+		"a tie, only the second joined": {[]*clusterv1.Machine{at("a", 1), at("b", 1), at("c", 2)}, joinedOf("b", "c"), "b"},
+		"a tie, a later one joined":     {[]*clusterv1.Machine{at("a", 1), at("b", 1), at("c", 2)}, joinedOf("c"), "a"},
+	} {
+		got, err := oldestOf(tc.ms, tc.joined)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := ptr.Deref(got, clusterv1.Machine{}).Name; got != tc.want {
+			t.Errorf("%s: oldestOf = %q, want %q", name, got, tc.want)
+		}
 	}
 }

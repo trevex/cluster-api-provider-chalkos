@@ -52,9 +52,12 @@ func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope,
 		return ctrl.Result{}, nil
 	}
 	// A Machine that is not up to date goes first, which a roll with maxSurge 1 relies on.
-	m := s.oldestOutdated()
-	if m == nil {
-		m = &s.machines[0]
+	m, err := r.oldest(ctx, s, sec, true)
+	if err == nil && m == nil {
+		m, err = r.oldest(ctx, s, sec, false)
+	}
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	why, err := r.stepProblem(ctx, s, sec, m)
 	if err != nil {
