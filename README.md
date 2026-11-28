@@ -389,6 +389,16 @@ just -f lab/justfile destroy
 A run that stops early still deletes the cluster, after it logged the cluster's state on failure.
 `E2E_KEEP=1 make e2e` keeps the cluster of such a run to look at.
 
+`make e2e-ha` tests control-plane scaling on the same lab. It creates the cluster `lab`, scales the
+ChalkosControlPlane to three replicas and waits until all four nodes are Ready and etcd lists
+three healthy voting members. It then scales the control plane back to one and checks that the
+provider removes the oldest control plane first and then the next one. For each removed control
+plane, the test checks that its Node is gone and that the remaining control plane lists it among
+the revoked nodes. Last, it checks that etcd has one member and that the remaining Node carries
+`node-role.kubernetes.io/control-plane`. At its peak the test runs three control planes of 3 GiB
+and one worker of 2 GiB, about 11 GiB for the VMs, so pull requests do not run it; the nightly
+run does.
+
 CI runs the same steps for a pull request with the label `e2e` and every night on `main`. A
 failed run uploads the test's output, the cluster's state and the kind node's logs as the
 artifact `e2e-logs`.

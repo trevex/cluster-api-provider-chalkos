@@ -30,6 +30,7 @@ Run the targets of the `Makefile` in the development shell:
 | `make build` | Builds both managers. |
 | `make release-manifests` | Builds `bootstrap-components.yaml`, `control-plane-components.yaml` and a copy of `metadata.yaml` into `out/`, with the managers at `IMG_BOOTSTRAP` and `IMG_CONTROLPLANE`. |
 | `make e2e` | Runs the end-to-end test against a running lab. |
+| `make e2e-ha` | Scales the control plane 1 → 3 → 1 against a running lab. It needs about 11 GiB for its VMs; the nightly run runs it. |
 
 The generated files are committed. A change to an API type or a kubebuilder marker commits what
 `make generate manifests` produces from it.

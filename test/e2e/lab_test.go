@@ -19,7 +19,9 @@ limitations under the License.
 // Package e2e runs the lab's scenario against the KubeVirt lab: it creates the workload cluster
 // lab of one control plane and one worker, checks that its nodes join and that the providers
 // report them installed, scales the workers to two and back to one, checks that the removed
-// worker's node is revoked and its Node gone, and deletes the cluster again. The lab must run
+// worker's node is revoked and its Node gone, and deletes the cluster again. With the tag e2e_ha,
+// it scales the control plane to three and back to one instead, and checks etcd's members and the
+// removed control planes' revocation. The lab must run
 // already, with the providers built from the checkout or the released ones, as after
 //
 //	just -f lab/justfile create kubevirt providers-local
@@ -63,6 +65,7 @@ import (
 	"sigs.k8s.io/cluster-api/util"
 
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
+	"github.com/trevex/chalkos/pkg/clustersecrets"
 
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
@@ -165,6 +168,46 @@ func newLab(t *testing.T) *lab {
 		}
 	}
 	return &lab{t: t, root: root, kubeconfig: kubeconfig, c: c}
+}
+
+// createCluster applies the lab's workload cluster, which must not exist yet, and deletes it again
+// when the test ends, after it logged the cluster's state if the test failed.
+func (l *lab) createCluster(ctx context.Context) {
+	l.t.Helper()
+	switch err := l.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: clusterName}, &clusterv1.Cluster{}); {
+	case err == nil:
+		l.t.Fatalf("the Cluster %s/%s exists already; delete it first", namespace, clusterName)
+	case !apierrors.IsNotFound(err):
+		l.t.Fatal(err)
+	}
+	// Cleanups run last first: a failed run is diagnosed before its Cluster is deleted. Both run
+	// after t.Context() is cancelled, so they bring their own.
+	l.t.Cleanup(l.deleteCluster)
+	l.t.Cleanup(func() {
+		if l.t.Failed() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			l.diagnose(ctx)
+		}
+	})
+	l.just("cluster")
+}
+
+// waitForMachinesReady waits until the cluster has n Machines, each with a Ready node of its name
+// and providerID, and returns them.
+func (l *lab) waitForMachinesReady(ctx context.Context, n int, timeout time.Duration) []clusterv1.Machine {
+	l.t.Helper()
+	var machines clusterv1.MachineList
+	l.waitFor(ctx, fmt.Sprintf("%d Machines with Ready nodes", n), timeout, func(ctx context.Context) (bool, string, error) {
+		if err := l.c.List(ctx, &machines, client.InNamespace(namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
+			return false, "", err
+		}
+		if len(machines.Items) != n {
+			return false, fmt.Sprintf("%d Machines", len(machines.Items)), nil
+		}
+		return l.nodesReady(ctx, machines.Items)
+	})
+	return machines.Items
 }
 
 // deploymentAvailable tells whether the Deployment's Available condition is true.
@@ -449,15 +492,24 @@ func (l *lab) chalkdAddr(ctx context.Context, machine string) (string, error) {
 	return net.JoinHostPort(strings.TrimSpace(out), strconv.Itoa(int(svc.Spec.Ports[0].NodePort))), nil
 }
 
-// revokedBy tells whether the control plane of the Machine cp lists the node as revoked in its
-// Kubernetes status, which it reads with an admin certificate from the cluster's secrets.
-func (l *lab) revokedBy(ctx context.Context, cp, nodeName string) (bool, error) {
+// secrets are the cluster's secrets, whose admin certificate the test reaches chalkd with.
+func (l *lab) secrets(ctx context.Context) (clustersecrets.Secrets, error) {
 	sec, ok, err := secrets.Get(ctx, l.c, client.ObjectKey{Namespace: namespace, Name: clusterName})
 	switch {
 	case err != nil:
-		return false, fmt.Errorf("the cluster's secrets: %w", err)
+		return clustersecrets.Secrets{}, fmt.Errorf("the cluster's secrets: %w", err)
 	case !ok:
-		return false, fmt.Errorf("the cluster's secrets %s do not exist", secrets.Name(clusterName))
+		return clustersecrets.Secrets{}, fmt.Errorf("the cluster's secrets %s do not exist", secrets.Name(clusterName))
+	}
+	return sec, nil
+}
+
+// revokedBy tells whether the control plane of the Machine cp lists the node as revoked in its
+// Kubernetes status, which it reads with an admin certificate from the cluster's secrets.
+func (l *lab) revokedBy(ctx context.Context, cp, nodeName string) (bool, error) {
+	sec, err := l.secrets(ctx)
+	if err != nil {
+		return false, err
 	}
 	addr, err := l.chalkdAddr(ctx, cp)
 	if err != nil {

@@ -46,24 +46,7 @@ func TestLab(t *testing.T) {
 	start := time.Now()
 
 	clusterKey := client.ObjectKey{Namespace: namespace, Name: clusterName}
-	var existing clusterv1.Cluster
-	switch err := l.c.Get(ctx, clusterKey, &existing); {
-	case err == nil:
-		t.Fatalf("the Cluster %s/%s exists already; delete it first", namespace, clusterName)
-	case !apierrors.IsNotFound(err):
-		t.Fatal(err)
-	}
-	// Cleanups run last first: a failed run is diagnosed before its Cluster is deleted. Both run
-	// after t.Context() is cancelled, so they bring their own.
-	t.Cleanup(l.deleteCluster)
-	t.Cleanup(func() {
-		if t.Failed() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			l.diagnose(ctx)
-		}
-	})
-	l.just("cluster")
+	l.createCluster(ctx)
 	t.Logf("applied the cluster after %s", since(start))
 
 	// 1. The control plane is initialized and available.
@@ -79,21 +62,12 @@ func TestLab(t *testing.T) {
 
 	// 2. The kubeconfig Secret reaches the cluster, whose nodes are the Machines, Ready and named
 	// by their providerID.
-	var machines clusterv1.MachineList
-	l.waitFor(ctx, "both nodes to be Ready", 15*time.Minute, func(ctx context.Context) (bool, string, error) {
-		if err := l.c.List(ctx, &machines, client.InNamespace(namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
-			return false, "", err
-		}
-		if len(machines.Items) != 2 {
-			return false, fmt.Sprintf("%d Machines", len(machines.Items)), nil
-		}
-		return l.nodesReady(ctx, machines.Items)
-	})
+	machines := l.waitForMachinesReady(ctx, 2, 15*time.Minute)
 	t.Logf("both nodes are Ready after %s", since(start))
 
 	// 3. The bootstrap provider reports each machine installed, with the fingerprint it trusted in
 	// maintenance mode and the image's root hash.
-	for _, m := range machines.Items {
+	for _, m := range machines {
 		var cfg bootstrapv1.ChalkosConfig
 		if err := l.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}, &cfg); err != nil {
 			t.Fatal(err)
@@ -120,15 +94,7 @@ func TestLab(t *testing.T) {
 	l.checkHooks(ctx)
 	scaled := time.Now()
 	l.scaleWorkers(ctx, 2)
-	l.waitFor(ctx, "three nodes to be Ready", 15*time.Minute, func(ctx context.Context) (bool, string, error) {
-		if err := l.c.List(ctx, &machines, client.InNamespace(namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
-			return false, "", err
-		}
-		if len(machines.Items) != 3 {
-			return false, fmt.Sprintf("%d Machines", len(machines.Items)), nil
-		}
-		return l.nodesReady(ctx, machines.Items)
-	})
+	l.waitForMachinesReady(ctx, 3, 15*time.Minute)
 	t.Logf("three nodes are Ready after %s", since(start))
 	l.checkHooks(ctx)
 	before, err := l.machinesOf(ctx, false)
