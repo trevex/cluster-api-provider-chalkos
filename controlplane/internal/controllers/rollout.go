@@ -355,15 +355,25 @@ func (r *ChalkosControlPlaneReconciler) contract(ctx context.Context, cp *contro
 // the other Machines, hold no vote of it, it counts as being deleted, so a replacement that never
 // became a voter goes once its change is reverted or fixed forward. When it holds a vote, that
 // member may be unhealthy, and membersProblem guards etcd's quorum either way. Every other Machine
-// must count as joined, as joinedForStep tells.
+// must have joined. A step that creates a Machine, or deletes one without a vote, also takes a
+// Machine that joinedForStep counts as joined. A step that deletes a voter does not: its
+// replacement's creation waits for every Machine's join, so the control plane would stay a voter
+// short behind a Machine that does not answer.
 func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, leaving *clusterv1.Machine) (string, error) {
 	noVote := leaving != nil && r.holdsNoVote(ctx, s, sec, leaving)
+	strict := leaving != nil && !noVote
 	for i := range s.machines {
 		m := &s.machines[i]
 		if leaving != nil && m.Name == leaving.Name {
 			continue
 		}
-		ok, err := r.joinedForStep(ctx, s, m, sec)
+		var ok bool
+		var err error
+		if strict {
+			ok, err = r.joined(ctx, s, m, sec)
+		} else {
+			ok, err = r.joinedForStep(ctx, s, m, sec)
+		}
 		if err != nil {
 			return "", err
 		}

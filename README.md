@@ -250,8 +250,10 @@ exception, as for a replacement that never joins or went unhealthy: it need not 
 its voting member may be unhealthy while every other member is a healthy voter and etcd has three
 members or more. Scaling down takes the Machines that are not up to date first, and among them one
 that etcd lists no voting member of, so lowering `replicas` during a roll removes old Machines
-before new ones. A Machine whose node does not answer for its status counts as joined while etcd
-lists it as a voter.
+before new ones. For a step that creates a Machine, or that deletes one that etcd lists no voting
+member of, a Machine whose node does not answer for its status counts as joined while etcd lists
+it as a voter. A step that deletes a voter waits for every other Machine to have joined, as the
+creation of a Machine after a deletion does, so that etcd is not left a voter short.
 
 ### Which changes does the control plane refuse?
 

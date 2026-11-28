@@ -38,10 +38,11 @@ import (
 )
 
 // scaleDown deletes a Machine that is not up to date, as oldest picks it, or else the control
-// plane's oldest Machine, while it has more than Spec.Replicas asks for, one at a time. A step
-// starts only once the control plane is initialized, no Machine is being deleted or was created
-// or deleted in this reconcile, and stepProblem finds nothing for the Machine. A Machine that has
-// not joined goes without its join, as a replacement that never joins once its change is reverted
+// plane's oldest Machine, while it has more than Spec.Replicas asks for, one at a time. Among the
+// Machines that are not up to date, one that etcd's member list shows no voting member of goes
+// first. A step starts only once the control plane is initialized, no Machine is being deleted or
+// was created or deleted in this reconcile, and stepProblem finds nothing for the Machine, whose
+// own join is never waited for: a replacement that never joins goes once its change is reverted
 // or fixed forward. The Machine's pre-terminate hook takes it out of etcd and revokes it; the next
 // step waits until it is gone. Spec.Replicas is at least one, so the last Machine is never deleted.
 func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {

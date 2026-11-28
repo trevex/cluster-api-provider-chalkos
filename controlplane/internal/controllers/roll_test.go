@@ -540,6 +540,51 @@ func TestRollCreatesFirstWhileAVoterDoesNotAnswer(t *testing.T) {
 	}
 }
 
+// With maxSurge 0, an old voter is not deleted while another Machine's node does not answer for its
+// status, though etcd lists it as a healthy voter: the replacement's creation waits for every
+// Machine's join, so the control plane would stay a voter short behind that Machine.
+func TestRollWithoutSurgeKeepsVotersWhileAMachineDoesNotAnswer(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.fake.Update(addrs[ms[1].Name], func(n *nodetest.Node) { n.StatusErr = nodetest.Unreachable(addrs[ms[1].Name]) })
+	e.setMaxSurge(0)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v while %s does not answer", got, ms[1].Name)
+	}
+	e.wantMachines(3)
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "waiting for the Machine "+ms[1].Name+" to join")
+}
+
+// A voter whose node does not answer for its status and that etcd lists as unhealthy holds both a
+// roll with maxSurge 1, which would create a Machine, and the scale-down of another Machine.
+func TestUnhealthyVoterThatDoesNotAnswerHolds(t *testing.T) {
+	setUp := func(t *testing.T) (*env, []clusterv1.Machine) {
+		e := newEnv(t, 3, true)
+		ms, addrs := e.rollingControlPlane(3)
+		e.setUnhealthy(ms, addrs, ms[1].Name)
+		e.fake.Update(addrs[ms[1].Name], func(n *nodetest.Node) { n.StatusErr = nodetest.Unreachable(addrs[ms[1].Name]) })
+		return e, ms
+	}
+	t.Run("a roll with maxSurge 1", func(t *testing.T) {
+		e, _ := setUp(t)
+		e.setVersion("v1.37.2")
+		e.mustReconcile()
+		e.wantMachines(3)
+		wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "unhealthy")
+	})
+	t.Run("a scale-down", func(t *testing.T) {
+		e, ms := setUp(t)
+		e.setReplicas(1)
+		e.mustReconcile()
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("deleted %v", got)
+		}
+		wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionFalse, controlplanev1.ScalingDownWaitingReason, "waiting for the Machine "+ms[1].Name+" to join")
+	})
+}
+
 // The only Machine of a one-replica control plane, whose node does not answer for its status, is
 // not deleted by a roll: no other Machine tells that it holds no vote, so the roll waits.
 func TestOneReplicaRollKeepsAMachineThatDoesNotAnswer(t *testing.T) {
