@@ -196,6 +196,38 @@ spec:
                                 type: object
                             type: object
                         type: object
+                      rollout:
+                        description: |-
+                          Rollout says when the control planes' Machines are replaced and how, as
+                          ChalkosControlPlaneSpec's does.
+                        properties:
+                          after:
+                            description: |-
+                              After replaces every control-plane Machine created before it, once it has passed, even when
+                              nothing else changed. Written in RFC 3339, such as 2026-11-28T09:00:00Z.
+                            format: date-time
+                            type: string
+                          strategy:
+                            description: Strategy says how a Machine that is not up
+                              to date is replaced.
+                            properties:
+                              rollingUpdate:
+                                description: RollingUpdate replaces the Machines one
+                                  at a time, the oldest first.
+                                properties:
+                                  maxSurge:
+                                    description: |-
+                                      MaxSurge is how many Machines above replicas the control plane runs while it replaces one.
+                                      1, the default, creates the replacement first and deletes the old Machine once the new one
+                                      has joined etcd. 0 deletes the old Machine first and creates the replacement once it is
+                                      gone, which needs at least three replicas.
+                                    format: int32
+                                    maximum: 1
+                                    minimum: 0
+                                    type: integer
+                                type: object
+                            type: object
+                        type: object
                     type: object
                 type: object
             required:

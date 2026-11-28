@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -409,5 +410,95 @@ func TestChalkosControlPlane_ScaleEvenRefused(t *testing.T) {
 	}
 	if got.Spec.Replicas == nil || *got.Spec.Replicas != 3 {
 		t.Fatalf("Spec.Replicas after refused scale: got %v, want unchanged at 3", got.Spec.Replicas)
+	}
+}
+
+// rolloutWithSurge is a rollout of the maxSurge given, nil for the default.
+func rolloutWithSurge(maxSurge *int32) ChalkosControlPlaneRolloutSpec {
+	return ChalkosControlPlaneRolloutSpec{Strategy: ChalkosControlPlaneRolloutStrategy{RollingUpdate: ChalkosControlPlaneRollingUpdate{MaxSurge: maxSurge}}}
+}
+
+// maxSurge is 1, its default, or 0, and 0 needs at least three replicas: with fewer, removing a
+// control plane first loses etcd's quorum.
+func TestChalkosControlPlane_MaxSurge(t *testing.T) {
+	ctx := t.Context()
+	for _, c := range []struct {
+		name               string
+		replicas, maxSurge *int32
+		wantErr            bool
+	}{
+		{name: "the default, one replica", replicas: ptr.To[int32](1)},
+		{name: "one, one replica", replicas: ptr.To[int32](1), maxSurge: ptr.To[int32](1)},
+		{name: "zero, three replicas", replicas: ptr.To[int32](3), maxSurge: ptr.To[int32](0)},
+		{name: "zero, one replica", replicas: ptr.To[int32](1), maxSurge: ptr.To[int32](0), wantErr: true},
+		{name: "zero, replicas left to their default", maxSurge: ptr.To[int32](0), wantErr: true},
+		{name: "two", replicas: ptr.To[int32](3), maxSurge: ptr.To[int32](2), wantErr: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cp := &ChalkosControlPlane{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "surge-", Namespace: "default"},
+				Spec: ChalkosControlPlaneSpec{
+					Replicas: c.replicas, Version: "v1.33.0", Image: digestImage('1'),
+					MachineTemplate: validMachineTemplate(), Rollout: rolloutWithSurge(c.maxSurge),
+				},
+			}
+			switch err := testClient.Create(ctx, cp); {
+			case c.wantErr && (!apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "maxSurge")):
+				t.Fatalf("Create: %v, want an Invalid error on maxSurge", err)
+			case !c.wantErr && err != nil:
+				t.Fatalf("Create: %v", err)
+			}
+		})
+	}
+}
+
+// A control plane that removes Machines first is not scaled below three replicas.
+func TestChalkosControlPlane_ScaleBelowThreeWithoutSurgeRefused(t *testing.T) {
+	ctx := t.Context()
+	cp := &ChalkosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "surge-", Namespace: "default"},
+		Spec: ChalkosControlPlaneSpec{
+			Replicas: ptr.To[int32](3), Version: "v1.33.0", Image: digestImage('2'),
+			MachineTemplate: validMachineTemplate(), Rollout: rolloutWithSurge(ptr.To[int32](0)),
+		},
+	}
+	if err := testClient.Create(ctx, cp); err != nil {
+		t.Fatal(err)
+	}
+	cp.Spec.Replicas = ptr.To[int32](1)
+	if err := testClient.Update(ctx, cp); !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "maxSurge") {
+		t.Fatalf("Update to one replica: %v, want an Invalid error on maxSurge", err)
+	}
+}
+
+// rollout.after is kept as written, and observedFiles round-trips through the status
+// subresource.
+func TestChalkosControlPlane_RolloutAfterAndObservedFiles(t *testing.T) {
+	ctx := t.Context()
+	after := metav1.Date(2026, 11, 28, 9, 0, 0, 0, time.UTC)
+	cp := &ChalkosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "after-", Namespace: "default"},
+		Spec: ChalkosControlPlaneSpec{
+			Version: "v1.33.0", Image: digestImage('3'), MachineTemplate: validMachineTemplate(),
+			Rollout: ChalkosControlPlaneRolloutSpec{After: after},
+		},
+	}
+	if err := testClient.Create(ctx, cp); err != nil {
+		t.Fatal(err)
+	}
+	const observed = "{\"apiVersion\":\"kubernetes.chalkos.dev/v1alpha1\",\"kind\":\"Cluster\"}\n"
+	cp.Status.ObservedFiles = observed
+	if err := testClient.Status().Update(ctx, cp); err != nil {
+		t.Fatalf("Update status: %v", err)
+	}
+	got := &ChalkosControlPlane{}
+	if err := testClient.Get(ctx, client.ObjectKeyFromObject(cp), got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.Rollout.After.Equal(&after) {
+		t.Errorf("rollout.after: got %v, want %v", got.Spec.Rollout.After, after)
+	}
+	if got.Status.ObservedFiles != observed {
+		t.Errorf("observedFiles: got %q, want %q", got.Status.ObservedFiles, observed)
 	}
 }

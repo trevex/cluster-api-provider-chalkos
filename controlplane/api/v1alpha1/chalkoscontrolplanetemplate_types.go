@@ -66,6 +66,11 @@ type ChalkosControlPlaneTemplateResourceSpec struct {
 	// +optional
 	MachineTemplate ChalkosControlPlaneTemplateMachineTemplate `json:"machineTemplate,omitempty,omitzero"`
 
+	// Rollout says when the control planes' Machines are replaced and how, as
+	// ChalkosControlPlaneSpec's does.
+	// +optional
+	Rollout ChalkosControlPlaneRolloutSpec `json:"rollout,omitempty,omitzero"`
+
 	// Files are the cluster-wide chalkos config documents every node of the cluster gets (such as
 	// Flannel, Addon and Registry documents), together with the control planes' own Node fields.
 	// They must hold the Cluster document, which names the etcd, coredns, pause and flannel images;

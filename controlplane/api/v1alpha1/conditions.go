@@ -151,3 +151,35 @@ const (
 	// NotScalingDownReason documents a ChalkosControlPlane that removes no Machine.
 	NotScalingDownReason = "NotScalingDown"
 )
+
+// RollingOutCondition reports whether the control plane replaces Machines that are not up to date:
+// made from another version, image, files or infrastructure template, or created before
+// spec.rollout.after. It is false with a reason of its own while a change is refused.
+const RollingOutCondition = clusterv1.RollingOutCondition
+
+// Reasons for the RollingOut condition.
+const (
+	// RollingOutReason documents a ChalkosControlPlane that replaces Machines; the message counts
+	// those not up to date.
+	RollingOutReason = clusterv1.RollingOutReason
+
+	// RollingOutWaitingReason documents a ChalkosControlPlane with Machines not up to date whose
+	// next step waits: for a Machine to join, for etcd's health, for a Machine's removal, or to
+	// read the image a change of the files is checked against. The message says which.
+	RollingOutWaitingReason = "WaitingToRollOut"
+
+	// FixedFieldChangedReason documents a ChalkosControlPlane whose documents for a new Machine
+	// change a field that every node of the cluster holds alike, such as the Cluster's domain,
+	// against status.observedFiles, through spec.files or the Cluster's network and endpoint. It
+	// creates no Machine until the change is reverted; the message names the documents, fields
+	// and values.
+	FixedFieldChangedReason = "FixedFieldChanged"
+
+	// VersionSkewReason documents a ChalkosControlPlane whose spec.version is more than one minor
+	// newer than one of its Machines, or of an older minor. It creates no Machine until the
+	// version is one it can upgrade to.
+	VersionSkewReason = "VersionSkew"
+
+	// NotRollingOutReason documents a ChalkosControlPlane whose Machines are all up to date.
+	NotRollingOutReason = clusterv1.NotRollingOutReason
+)
