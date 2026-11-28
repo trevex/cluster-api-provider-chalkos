@@ -471,6 +471,56 @@ func TestChalkosControlPlane_ScaleBelowThreeWithoutSurgeRefused(t *testing.T) {
 	}
 }
 
+// The scale subresource cannot scale a control plane that removes Machines first below three
+// replicas either.
+func TestChalkosControlPlane_ScaleSubresourceBelowThreeWithoutSurgeRefused(t *testing.T) {
+	ctx := t.Context()
+	cp := &ChalkosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "surge-scale-", Namespace: "default"},
+		Spec: ChalkosControlPlaneSpec{
+			Replicas: ptr.To[int32](3), Version: "v1.33.0", Image: digestImage('4'),
+			MachineTemplate: validMachineTemplate(), Rollout: rolloutWithSurge(ptr.To[int32](0)),
+		},
+	}
+	if err := testClient.Create(ctx, cp); err != nil {
+		t.Fatal(err)
+	}
+	scale := &autoscalingv1.Scale{}
+	if err := testClient.SubResource("scale").Get(ctx, cp, scale); err != nil {
+		t.Fatalf("Get scale: %v", err)
+	}
+	scale.Spec.Replicas = 1
+	if err := testClient.SubResource("scale").Update(ctx, cp, client.WithSubResourceBody(scale)); !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "maxSurge") {
+		t.Fatalf("Update scale to 1: %v, want an Invalid error on maxSurge", err)
+	}
+	got := &ChalkosControlPlane{}
+	if err := testClient.Get(ctx, client.ObjectKeyFromObject(cp), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 3 {
+		t.Fatalf("Spec.Replicas after refused scale: got %v, want unchanged at 3", got.Spec.Replicas)
+	}
+}
+
+// A template, which has no replicas, accepts a maxSurge of 0; the control plane made from it is
+// checked against its own replicas.
+func TestChalkosControlPlaneTemplate_MaxSurgeZero(t *testing.T) {
+	tmpl := &ChalkosControlPlaneTemplate{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "cptmpl-surge-", Namespace: "default"},
+		Spec: ChalkosControlPlaneTemplateSpec{
+			Template: ChalkosControlPlaneTemplateResource{
+				Spec: ChalkosControlPlaneTemplateResourceSpec{
+					Image:   digestImage('5'),
+					Rollout: rolloutWithSurge(ptr.To[int32](0)),
+				},
+			},
+		},
+	}
+	if err := testClient.Create(t.Context(), tmpl); err != nil {
+		t.Fatalf("Create with maxSurge 0: %v", err)
+	}
+}
+
 // rollout.after is kept as written, and observedFiles round-trips through the status
 // subresource.
 func TestChalkosControlPlane_RolloutAfterAndObservedFiles(t *testing.T) {

@@ -84,7 +84,9 @@ type ChalkosControlPlaneSpec struct {
 	// the controllers derive the API server's, controller-manager's, scheduler's and kube-proxy's
 	// from the version where it names none. Fields the controllers own are refused: the Node's type
 	// and providerID, the Cluster's endpoint, and its ipFamilies, podCIDRs and serviceCIDRs when the
-	// Cluster's clusterNetwork gives ranges.
+	// Cluster's clusterNetwork gives ranges. The cluster-wide documents other than Secrets are also
+	// recorded in status.observedFiles, so very large files count about twice against the
+	// object's size limit.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:MaxItems=256
@@ -250,7 +252,7 @@ type ChalkosControlPlaneStatus struct {
 	// ObservedFiles are the cluster-wide documents the control plane's Machines were made from,
 	// as a control-plane Machine installs them: spec.files with the fields the controllers fill
 	// from the Cluster, the Cluster document's endpoint, ipFamilies, podCIDRs and serviceCIDRs,
-	// but without a Machine's own Node document. They are one YAML stream of JSON documents
+	// but without a Machine's own Node document and without Secret documents. They are one YAML stream of JSON documents
 	// separated by ---, recorded once a Machine exists and none is out of date or being deleted.
 	// While the documents a new Machine would get differ from them, the controllers compare the
 	// two for changes to fields every node of the cluster holds alike, which hold every new

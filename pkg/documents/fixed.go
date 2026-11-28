@@ -35,7 +35,9 @@ const observedSource = "the ChalkosControlPlane's status.observedFiles"
 
 // ClusterWide returns the documents every control-plane Machine of cluster installs alike at the
 // Kubernetes version: files, a ChalkosControlPlane's spec.files, with the fields For fills from
-// the Cluster and the version, but without the Node document, which is each Machine's own.
+// the Cluster and the version, but without the Node document, which is each Machine's own, and
+// without Secret documents: they hold no fixed fields, and leaving them out keeps a second copy
+// of their values out of status.observedFiles.
 func ClusterWide(cluster *clusterv1.Cluster, version string, files []runtime.RawExtension) ([]config.Document, error) {
 	network := cluster.Spec.ClusterNetwork
 	docs, err := For(Machine{
@@ -50,7 +52,7 @@ func ClusterWide(cluster *clusterv1.Cluster, version string, files []runtime.Raw
 		return nil, err
 	}
 	return slices.DeleteFunc(docs, func(d config.Document) bool {
-		return d.APIVersion == kubernetesAPI && d.Kind == "Node"
+		return d.IsSecret() || d.APIVersion == kubernetesAPI && d.Kind == "Node"
 	}), nil
 }
 

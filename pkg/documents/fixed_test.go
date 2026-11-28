@@ -45,11 +45,12 @@ func clusterOf(spec string) runtime.RawExtension {
 	return file(`{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Cluster", "metadata": {"name": "default"}, "spec": ` + spec + `}`)
 }
 
-// The cluster-wide documents are a control plane's without its Node, with the Cluster's fields
-// filled from the Cluster API Cluster.
+// The cluster-wide documents are a control plane's without its Node and Secrets, with the
+// Cluster's fields filled from the Cluster API Cluster.
 func TestClusterWide(t *testing.T) {
 	node := `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Node", "metadata": {"name": "default"}, "spec": {"labels": {"role": "cp"}}}`
-	docs, err := documents.ClusterWide(capiCluster(), "v1.37.1", []runtime.RawExtension{file(clusterFile), file(node), file(systemDisk)})
+	secret := `{"apiVersion": "chalkos.dev/v1alpha1", "kind": "Secret", "metadata": {"name": "bgp"}, "spec": {"data": {"password": "s3cret"}}}`
+	docs, err := documents.ClusterWide(capiCluster(), "v1.37.1", []runtime.RawExtension{file(clusterFile), file(node), file(secret), file(systemDisk)})
 	if err != nil {
 		t.Fatal(err)
 	}
