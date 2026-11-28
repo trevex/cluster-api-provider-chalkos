@@ -107,12 +107,31 @@ func (r *ChalkosControlPlaneReconciler) listMachines(ctx context.Context, s *sco
 
 // scaleUp creates the control plane's next Machine while it has fewer than it asks for: the first
 // at once, every other only once the control plane is initialized and each Machine it has joined
-// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted,
-// so that it is replaced, but while one is, etcd must list only healthy voting members of the
-// Machines: the replacement of a single control plane joins its etcd, while one of several that
-// is down and still a member keeps etcd from growing by a member it may lose quorum with.
+// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted
+// towards replicas, so that it is replaced, but replicas and maxSurge bound the Machines, being
+// deleted included: with maxSurge 0 the replacement waits until the Machine is gone. While one is
+// deleted, etcd must list only healthy voting members of the Machines: the replacement of a
+// single control plane joins its etcd, while one of several that is down and still a member keeps
+// etcd from growing by a member it may lose quorum with. While a guard holds, no Machine is
+// created.
 func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
-	if len(s.machines) >= int(ptr.Deref(s.cp.Spec.Replicas, 1)) {
+	want := int(ptr.Deref(s.cp.Spec.Replicas, 1))
+	if len(s.machines) >= want {
+		return ctrl.Result{}, nil
+	}
+	switch {
+	case s.held != "" && s.heldReason != "":
+		// The ChalkosControlPlane's or the Cluster's change reconciles again.
+		s.scaleUpWaiting = "no Machine is created while the control plane refuses the change: " + s.heldReason
+		return ctrl.Result{}, nil
+	case s.held != "":
+		// The guard's result retries.
+		s.scaleUpWaiting = "no Machine is created: " + s.held
+		return ctrl.Result{}, nil
+	case len(s.machines)+len(s.deleting) >= want+surge(s.cp):
+		// The Machine's deletion reconciles again.
+		s.scaleUpWaiting = fmt.Sprintf("waiting for the Machine %s, being deleted, to go: with maxSurge %d the control plane keeps %s at most",
+			s.deleting[0].Name, surge(s.cp), plural(want+surge(s.cp), "Machine"))
 		return ctrl.Result{}, nil
 	}
 	switch {

@@ -74,8 +74,9 @@ const (
 	NotScalingUpReason = "NotScalingUp"
 )
 
-// The ScalingUp condition also takes FixedFieldChangedReason, when the control plane refuses to
-// create a Machine while every Machine is up to date.
+// The ScalingUp condition also takes FixedFieldChangedReason or VersionSkewReason, when the
+// control plane refuses to create a Machine while every Machine is up to date; it is true then
+// while the control plane has fewer Machines than Spec.Replicas asks for.
 
 // Reasons documenting why a ChalkosControlPlane's Machine cannot be installed, used across its
 // conditions.

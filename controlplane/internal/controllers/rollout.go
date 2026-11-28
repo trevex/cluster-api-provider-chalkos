@@ -28,6 +28,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -223,7 +225,9 @@ func (r *ChalkosControlPlaneReconciler) observeFiles(ctx context.Context, s *sco
 	}
 	c, err := r.contract(ctx, s.cp)
 	if err != nil {
-		log.Info("Not recording the observed files yet: reading the image's contract", "reason", err.Error())
+		// The ScalingUp condition reports it.
+		s.imageWaiting = "status.observedFiles is recorded once the image is read: " + err.Error()
+		log.V(1).Info("Not recording the observed files yet: reading the image's contract", "reason", err.Error())
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
 	}
 	if observed := s.cp.Status.ObservedFiles; observed != "" {
@@ -239,6 +243,76 @@ func (r *ChalkosControlPlaneReconciler) observeFiles(ctx context.Context, s *sco
 	}
 	s.cp.Status.ObservedFiles = text
 	return ctrl.Result{}
+}
+
+// versionSkew says why the Machines cannot move to version in one step: Kubernetes upgrades a
+// control plane one minor at a time and never downgrades a minor. It is empty when they can, as
+// for a change of the patch version alone.
+func versionSkew(version string, machines []clusterv1.Machine) string {
+	want, err := utilversion.ParseSemantic(version)
+	if err != nil {
+		return fmt.Sprintf("spec.version %s is no Kubernetes version: %v", version, err)
+	}
+	for i := range machines {
+		m := &machines[i]
+		have, err := utilversion.ParseSemantic(m.Spec.Version)
+		if err != nil {
+			return fmt.Sprintf("The Machine %s is of version %s, which is no Kubernetes version", m.Name, m.Spec.Version)
+		}
+		switch {
+		case want.Major() != have.Major():
+			return fmt.Sprintf("spec.version %s is of another major version than the Machine %s, of %s; Kubernetes upgrades one minor at a time", version, m.Name, m.Spec.Version)
+		case want.Minor() < have.Minor():
+			return fmt.Sprintf("spec.version %s is of an older minor than the Machine %s, of %s; Kubernetes does not downgrade a minor, so keep spec.version at v%d.%d or newer", version, m.Name, m.Spec.Version, have.Major(), have.Minor())
+		case want.Minor() > have.Minor()+1:
+			return fmt.Sprintf("spec.version %s is more than one minor newer than the Machine %s, of %s; upgrade one minor at a time, to v%d.%d first", version, m.Name, m.Spec.Version, have.Major(), have.Minor()+1)
+		}
+	}
+	return ""
+}
+
+// guard records in s why the control plane may create no Machine now: a version its Machines
+// cannot reach in one step, or cluster-wide documents that change, against
+// status.observedFiles, a field every node of the cluster holds alike, as the contract of
+// spec.image marks it. Without observed files, or while the documents cannot be made, as before
+// the Cluster has an endpoint, there is nothing to compare. It returns when to check again when
+// the image cannot be read.
+func (r *ChalkosControlPlaneReconciler) guard(ctx context.Context, s *scope) ctrl.Result {
+	if msg := versionSkew(s.cp.Spec.Version, s.machines); msg != "" {
+		s.held, s.heldReason = msg, controlplanev1.VersionSkewReason
+		return ctrl.Result{}
+	}
+	observed := s.cp.Status.ObservedFiles
+	if observed == "" {
+		return ctrl.Result{}
+	}
+	docs, err := documents.ClusterWide(s.cluster, s.cp.Spec.Version, s.cp.Spec.Files)
+	if err != nil {
+		return ctrl.Result{}
+	}
+	c, err := r.contract(ctx, s.cp)
+	if err != nil {
+		s.held = "the cluster-wide documents are not checked against the image yet: " + err.Error()
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
+	}
+	if text, err := documents.Observed(c, docs); err == nil && text == observed {
+		return ctrl.Result{}
+	}
+	changes, err := documents.FixedChanges(c, observed, docs)
+	switch {
+	case err != nil:
+		// The ChalkosControlPlane's change reconciles again.
+		s.held = "the cluster-wide documents cannot be checked against status.observedFiles: " + err.Error()
+	case len(changes) > 0:
+		s.held, s.heldReason = documents.DescribeFixed(changes), controlplanev1.FixedFieldChangedReason
+	}
+	return ctrl.Result{}
+}
+
+// surge is spec.rollout.strategy.rollingUpdate.maxSurge: how many Machines above spec.replicas
+// the control plane runs while it replaces one, 1 by default.
+func surge(cp *controlplanev1.ChalkosControlPlane) int {
+	return int(ptr.Deref(cp.Spec.Rollout.Strategy.RollingUpdate.MaxSurge, 1))
 }
 
 // contract is the contract of the ChalkosControlPlane's image, which the Machines are built from,

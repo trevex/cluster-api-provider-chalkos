@@ -102,7 +102,8 @@ type ChalkosControlPlaneReconciler struct {
 	// the revoked nodes; nil records none.
 	Recorder events.EventRecorder
 
-	// artifacts holds the images read before, whose contracts default status.observedFiles.
+	// artifacts holds the images read before, whose contracts default status.observedFiles and
+	// mark the fields the guard compares.
 	artifacts images.Cache
 	// contracts holds the contracts of the images read before.
 	contracts contractCache
@@ -225,6 +226,16 @@ type scope struct {
 	// deletingReason and deletingMessage are the Deleting condition's reason and message while
 	// the ChalkosControlPlane is being deleted; empty before its Machines were listed.
 	deletingReason, deletingMessage string
+	// held is why no Machine may be created, as the guard found; empty when nothing holds.
+	// heldReason is the reason of a refused change, VersionSkewReason or FixedFieldChangedReason;
+	// empty for a check that could not be made, which the conditions report as a wait.
+	held, heldReason string
+	// rollWaiting is what the roll's next step waits for, for the RollingOut condition; empty
+	// when nothing.
+	rollWaiting string
+	// imageWaiting is why status.observedFiles is not recorded yet, as while the image cannot be
+	// read; empty when nothing.
+	imageWaiting string
 }
 
 // nodeStatus is a node's answer to KubernetesStatus.
@@ -332,6 +343,7 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	guarded := r.guard(ctx, s)
 	res, err := r.initialize(ctx, s, sec)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -345,7 +357,7 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	res = earliest(earliest(res, down), earliest(r.untilRolloutAfter(s), r.observeFiles(ctx, s)))
+	res = earliest(earliest(res, down), earliest(guarded, earliest(r.untilRolloutAfter(s), r.observeFiles(ctx, s))))
 	if !s.initialized() {
 		return res, nil
 	}

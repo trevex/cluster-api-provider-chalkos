@@ -307,8 +307,8 @@ func TestObservedFilesAfterARoll(t *testing.T) {
 	}
 }
 
-// Without the image's contract, status.observedFiles is not recorded, and the controller tries
-// again.
+// Without the image's contract, status.observedFiles is not recorded, ScalingUp says why, and the
+// controller tries again without writing anything new.
 func TestObservedFilesWaitForTheImage(t *testing.T) {
 	e := newEnv(t, 1, true)
 	e.setFiles(clusterFile("lab.local"))
@@ -319,6 +319,10 @@ func TestObservedFilesWaitForTheImage(t *testing.T) {
 	if got := e.cp().Status.ObservedFiles; got != "" {
 		t.Errorf("observedFiles %s recorded without the image", got)
 	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionFalse, controlplanev1.NotScalingUpReason, "image pull Secret")
+	// The pass after the Machine's creation sees it listed in order; the one after writes nothing.
+	e.mustReconcile()
+	e.wantNoWrite()
 	e.serveImage()
 	e.mustReconcile()
 	if cp := e.cp(); cp.Status.ObservedFiles != e.observed(cp) {

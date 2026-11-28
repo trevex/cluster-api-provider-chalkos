@@ -17,6 +17,7 @@ limitations under the License.
 package controllers
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -106,18 +107,41 @@ func setStatus(s *scope) {
 		})
 	}
 
+	// While a Machine is not up to date, RollingOut reports what the guard found; otherwise
+	// ScalingUp does, also when no Machine is to be created.
+	outOfDate := current < n
 	switch want := ptr.Deref(s.cp.Spec.Replicas, 1); {
-	case n < want && s.cp.DeletionTimestamp.IsZero():
+	case !s.cp.DeletionTimestamp.IsZero():
+		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason})
+	case s.heldReason != "" && !outOfDate:
+		status := metav1.ConditionFalse
+		if n < want {
+			status = metav1.ConditionTrue
+		}
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.ScalingUpCondition, Status: status, Reason: s.heldReason,
+			Message: machineutil.Truncate(s.held),
+		})
+	case n < want:
 		msg := fmt.Sprintf("Scaling up from %d to %d replicas", n, want)
-		if s.scaleUpWaiting != "" {
-			msg += "; " + s.scaleUpWaiting
+		for _, w := range []string{s.scaleUpWaiting, s.imageWaiting} {
+			if w != "" {
+				msg += "; " + w
+			}
 		}
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.ScalingUpReason,
 			Message: machineutil.Truncate(msg),
 		})
 	default:
-		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason})
+		msg := s.imageWaiting
+		if !outOfDate && s.held != "" {
+			msg = s.held
+		}
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.ScalingUpCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingUpReason,
+			Message: machineutil.Truncate(msg),
+		})
 	}
 
 	switch want := ptr.Deref(s.cp.Spec.Replicas, 1); {
@@ -145,6 +169,26 @@ func setStatus(s *scope) {
 		})
 	default:
 		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotScalingDownReason})
+	}
+
+	switch {
+	case !s.cp.DeletionTimestamp.IsZero() || !outOfDate:
+		conditions.Set(s.cp, metav1.Condition{Type: controlplanev1.RollingOutCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.NotRollingOutReason})
+	case s.heldReason != "":
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.RollingOutCondition, Status: metav1.ConditionTrue, Reason: s.heldReason,
+			Message: machineutil.Truncate(s.held),
+		})
+	default:
+		reason, msg := controlplanev1.RollingOutReason, fmt.Sprintf("%d of %d Machines not up to date", n-current, n)
+		// A check the guard could not make holds the roll as much as the roll's own wait.
+		if w := cmp.Or(s.held, s.rollWaiting); w != "" {
+			reason, msg = controlplanev1.RollingOutWaitingReason, msg+"; "+w
+		}
+		conditions.Set(s.cp, metav1.Condition{
+			Type: controlplanev1.RollingOutCondition, Status: metav1.ConditionTrue, Reason: reason,
+			Message: machineutil.Truncate(msg),
+		})
 	}
 
 	switch {
