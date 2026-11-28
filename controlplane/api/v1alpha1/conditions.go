@@ -191,9 +191,9 @@ const (
 
 	// InvalidFilesReason documents a ChalkosControlPlane whose spec.files, with the fields filled
 	// from the Cluster, cannot be made into a control-plane Machine's documents, as when they set a
-	// field Cluster API owns, or whose status.observedFiles cannot be compared with them. It creates
-	// no Machine until the files or the Cluster are fixed, or the record is cleared; the message
-	// says which. RollingOut stays true with this reason while a Machine is not up to date;
+	// field Cluster API owns; whose replacement Machine's documents the target image refuses; or
+	// whose status.observedFiles cannot be compared with them. It creates no Machine until the
+	// files, the image or the Cluster are fixed, or the record is cleared; the message says which. RollingOut stays true with this reason while a Machine is not up to date;
 	// otherwise ScalingUp takes it.
 	InvalidFilesReason = "InvalidFiles"
 

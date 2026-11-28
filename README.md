@@ -23,7 +23,10 @@ What works:
   Cluster API deletes the Machine's infrastructure, as [Removing Machines](#removing-machines)
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
 - Scaling the control plane down, one Machine at a time, once every Machine joined and etcd lists
-  one healthy member per Machine. Machines that are not up to date go first, then the oldest.
+  one healthy member per Machine. Machines that are not up to date go first, then the oldest. A
+  Machine that never joined may go without that wait, as
+  [How to recover from a replacement that never joins](#how-to-recover-from-a-replacement-that-never-joins)
+  describes.
 - Rolling out a changed version, image, files or infrastructure template of the control plane,
   one Machine at a time, oldest first, as [Rolling out changes](#rolling-out-changes) describes.
   A change of a field that every node of the cluster holds alike, such as the Cluster's domain,
@@ -212,8 +215,8 @@ A Machine is out of date in three cases:
 - It carries no hash. Machines made by v0.2.0 of the providers carry none. The control plane
   adopts such a Machine, and stamps the current hash on it, when the Machine's version is
   `spec.version` and its ChalkosConfig's image is `spec.image`; it replaces the others. A change of
-  `spec.files` made while v0.2.0 ran cannot be told from the Machine, so adoption does not
-  replace it.
+  `spec.files` or of the infrastructure template made while v0.2.0 ran cannot be told from the
+  Machine, so adoption does not replace it.
 
 Each Machine's `UpToDate` condition says why it is out of date, and `status.upToDateReplicas`
 counts the Machines that are up to date. The labels and annotations of `machineTemplate.metadata`
@@ -230,9 +233,11 @@ on the Machines.
   step, so the infrastructure needs room for it.
 - `0` deletes the old Machine first and creates the replacement once the old one is gone. It
   needs three replicas or more, which the API enforces, because etcd keeps its quorum with one
-  member fewer only from three members on. Before it deletes a Machine, the control plane checks
-  the replacement's documents against the target image; a refusal holds the roll with the reason
-  `InvalidFiles`, so a change that cannot install costs no etcd member.
+  member fewer only from three members on.
+
+Before either step, the control plane checks the replacement's documents against the target image.
+A refusal holds the roll with the reason `InvalidFiles`, so a change that cannot install creates no
+Machine and, with `maxSurge: 0`, costs no etcd member.
 
 A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
 Machine, no Machine is being deleted, and no guard holds. Scaling down takes the Machines that are
@@ -295,6 +300,14 @@ step waits for its join. Revert `spec.version`, `spec.image` or `spec.files` to 
 Machines were made from. The stuck Machine is then the only one out of date, and the control plane
 deletes it without waiting for its join, which ends the roll. With `maxSurge: 0`, the control
 plane then creates the Machine it is short of from the reverted spec.
+
+A fix forward does not unstick the roll. The next step replaces the oldest Machine that is not up
+to date, which is one of the old Machines, and it waits for the stuck Machine to join. Revert to
+the spec the other Machines were made from first, then roll forward.
+
+A replacement that joined etcd but is unhealthy holds the roll as well, because a step waits for
+one healthy member per Machine. Delete that Machine by hand. Its pre-terminate hook takes its
+member out of etcd while the other members keep quorum.
 
 ### What happens to the workers?
 
