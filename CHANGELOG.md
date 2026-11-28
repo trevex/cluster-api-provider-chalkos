@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/trevex/cluster-api-provider-chalkos/compare/v0.3.0...v0.3.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* recover stuck rolls and remove an unhealthy voter of the Machine being deleted ([#14](https://github.com/trevex/cluster-api-provider-chalkos/issues/14)) ([40599d3](https://github.com/trevex/cluster-api-provider-chalkos/commit/40599d3e0e4f44b2ae1230f05112a40f3c26f3c6))
+
 ## [0.3.0](https://github.com/trevex/cluster-api-provider-chalkos/compare/v0.2.0...v0.3.0) (2026-11-28)
 
 
