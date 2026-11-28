@@ -13,7 +13,7 @@ RELEASE_DIR ?= out
 REGISTRY ?= localhost:5001
 IMG_TAG ?= dev
 # x-release-please-start-version
-VERSION ?= v0.1.0
+VERSION ?= v0.2.0
 # x-release-please-end
 
 IMG_BOOTSTRAP_LOCAL := $(REGISTRY)/cluster-api-provider-chalkos-bootstrap:$(IMG_TAG)
