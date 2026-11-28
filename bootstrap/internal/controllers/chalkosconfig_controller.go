@@ -31,7 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -67,6 +66,7 @@ import (
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/images"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/documents"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
@@ -88,8 +88,6 @@ const (
 	// rebootGrace is how long after an accepted install the machine is given to reboot into it
 	// before it may be installed again.
 	rebootGrace = 2 * time.Minute
-	// imageTimeout bounds the read of an image's header and contract from its registry.
-	imageTimeout = 2 * time.Minute
 	// controlPlaneWait is how soon a worker that waits for the Cluster's control plane is
 	// reconciled again in case the Cluster's watch missed the update that initialized it.
 	controlPlaneWait = time.Minute
@@ -130,7 +128,7 @@ type ChalkosConfigReconciler struct {
 
 	slotsOnce sync.Once
 	slots     chan struct{}
-	images    imageCache
+	artifacts images.Cache
 
 	// prunes holds, per Cluster, when a worker's hook last had a control plane prune the full
 	// list of revoked nodes. It lives only in memory: a restarted controller prunes once more.
@@ -370,11 +368,11 @@ func (r *ChalkosConfigReconciler) install(ctx context.Context, s *scope, addr st
 		s.refuse(bootstrapv1.ConfigRefusedReason, cpErr.Error(), in)
 		return ctrl.Result{}, nil
 	}
-	kc, err := r.keychain(ctx, s.cfg)
+	kc, err := images.Keychain(ctx, r.APIReader, s.cfg.Namespace, s.cfg.Spec.ImagePullSecretRef)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	a, err := r.image(ctx, s.cfg, kc)
+	a, err := r.artifacts.Image(ctx, r.Node, string(s.cfg.Spec.Image), s.cfg.Namespace, s.cfg.Spec.ImagePullSecretRef, kc)
 	if err != nil {
 		s.set(metav1.ConditionFalse, bootstrapv1.InstallingReason, fmt.Sprintf("Reading the image: %v", err))
 		return ctrl.Result{}, err
@@ -505,39 +503,6 @@ func (r *ChalkosConfigReconciler) takeSlot() (release func(), ok bool) {
 	default:
 		return nil, false
 	}
-}
-
-// keychain returns the credentials the ChalkosConfig's image pull Secret holds; without one, the
-// image is read anonymously.
-func (r *ChalkosConfigReconciler) keychain(ctx context.Context, cfg *bootstrapv1.ChalkosConfig) (authn.Keychain, error) {
-	if cfg.Spec.ImagePullSecretRef == nil {
-		return keychain{}, nil
-	}
-	var s corev1.Secret
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.Spec.ImagePullSecretRef.Name}, &s); err != nil {
-		return nil, fmt.Errorf("the image pull Secret: %w", err)
-	}
-	return keychainOf(&s)
-}
-
-// image reads the ChalkosConfig's image with kc, or answers it from the images read before with
-// the same pull Secret. An image is named by digest, so what was read once stays true.
-func (r *ChalkosConfigReconciler) image(ctx context.Context, cfg *bootstrapv1.ChalkosConfig, kc authn.Keychain) (*ociimage.Artifact, error) {
-	key := string(cfg.Spec.Image)
-	if ref := cfg.Spec.ImagePullSecretRef; ref != nil {
-		key += " " + cfg.Namespace + "/" + ref.Name
-	}
-	if a, ok := r.images.get(key); ok {
-		return a, nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, imageTimeout)
-	defer cancel()
-	a, err := r.Node.Image(ctx, string(cfg.Spec.Image), kc)
-	if err != nil {
-		return nil, err
-	}
-	r.images.add(key, a)
-	return a, nil
 }
 
 // clusterFiles are the spec.files of the Cluster's ChalkosControlPlane: the cluster-wide
@@ -679,40 +644,6 @@ func (r *ChalkosConfigReconciler) configsOf(ctx context.Context, cluster client.
 // isChalkosConfig tells whether ref names a ChalkosConfig.
 func isChalkosConfig(ref clusterv1.ContractVersionedObjectReference) bool {
 	return ref.IsDefined() && ref.APIGroup == bootstrapv1.GroupVersion.Group && ref.Kind == "ChalkosConfig"
-}
-
-// maxImages is how many image artifacts an imageCache holds.
-const maxImages = 64
-
-// imageCache holds the artifacts of images read before, by reference and pull Secret. It is safe
-// for concurrent use; its zero value is empty.
-type imageCache struct {
-	mu        sync.Mutex
-	artifacts map[string]*ociimage.Artifact
-}
-
-// get returns the artifact held under key.
-func (c *imageCache) get(key string) (*ociimage.Artifact, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	a, ok := c.artifacts[key]
-	return a, ok
-}
-
-// add holds a under key, dropping another artifact when the cache is full.
-func (c *imageCache) add(key string, a *ociimage.Artifact) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.artifacts == nil {
-		c.artifacts = map[string]*ociimage.Artifact{}
-	}
-	if len(c.artifacts) >= maxImages {
-		for k := range c.artifacts {
-			delete(c.artifacts, k)
-			break
-		}
-	}
-	c.artifacts[key] = a
 }
 
 // machineChanged passes the creation and deletion of a Machine, and the updates that change what

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controllers
+package images
 
 import (
 	"encoding/base64"
@@ -60,7 +60,7 @@ func TestKeychainOf(t *testing.T) {
 			`"docker.io": ` + auth("hub") + `, ` +
 			`"https://index.docker.io/v1/": ` + auth("index") + `}}`)},
 	}
-	k, err := keychainOf(s)
+	k, err := KeychainOf(s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestKeychainOf(t *testing.T) {
 			t.Errorf("%s: user %q, want %q", repository, got, want)
 		}
 	}
-	if _, err := keychainOf(&corev1.Secret{Type: corev1.SecretTypeOpaque}); err == nil {
+	if _, err := KeychainOf(&corev1.Secret{Type: corev1.SecretTypeOpaque}); err == nil {
 		t.Error("an Opaque Secret read as a docker config")
 	}
 }

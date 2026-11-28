@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controllers
+package images
 
 import (
 	"encoding/json"
@@ -33,10 +33,10 @@ import (
 // longest key it falls under; one under no key is read anonymously.
 type keychain map[string]authn.AuthConfig
 
-// keychainOf reads the credentials of a kubernetes.io/dockerconfigjson Secret. Of two keys that
+// KeychainOf reads the credentials of a kubernetes.io/dockerconfigjson Secret. Of two keys that
 // name the same registry, such as docker.io and https://index.docker.io/v1/, the first in
 // lexical order counts.
-func keychainOf(s *corev1.Secret) (keychain, error) {
+func KeychainOf(s *corev1.Secret) (keychain, error) {
 	if s.Type != corev1.SecretTypeDockerConfigJson {
 		return nil, fmt.Errorf("the Secret %s/%s is of type %s, not %s", s.Namespace, s.Name, s.Type, corev1.SecretTypeDockerConfigJson)
 	}
