@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect/v2"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -135,7 +136,7 @@ func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(clusterToControlPlane),
 			builder.WithPredicates(predicates.Any(scheme, log,
 				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(scheme, log),
-				clusterEndpointOrControlPlaneChanged(),
+				clusterInputsChanged(),
 				machineutil.ClusterDeletionStarted(),
 			))).
 		Complete(r)
@@ -664,14 +665,15 @@ func clusterToControlPlane(_ context.Context, o client.Object) []ctrl.Request {
 	return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: c.Namespace, Name: ref.Name}}}
 }
 
-// clusterEndpointOrControlPlaneChanged passes the updates of a Cluster whose controlPlaneEndpoint
-// or controlPlaneRef changed.
-func clusterEndpointOrControlPlaneChanged() predicate.Funcs {
+// clusterInputsChanged passes the updates of a Cluster whose controlPlaneEndpoint,
+// controlPlaneRef or clusterNetwork changed: the control plane's Machines are made from them.
+func clusterInputsChanged() predicate.Funcs {
 	return predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			old, ok := e.ObjectOld.(*clusterv1.Cluster)
 			cur, ok2 := e.ObjectNew.(*clusterv1.Cluster)
-			return ok && ok2 && (old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint || old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef)
+			return ok && ok2 && (old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint || old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef ||
+				!equality.Semantic.DeepEqual(old.Spec.ClusterNetwork, cur.Spec.ClusterNetwork))
 		},
 		CreateFunc:  func(event.CreateEvent) bool { return false },
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },

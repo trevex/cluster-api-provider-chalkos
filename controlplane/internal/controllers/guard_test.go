@@ -18,10 +18,14 @@ package controllers
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -30,15 +34,150 @@ import (
 	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 )
 
-// wantNoWrite fails the test when a pass after the retry interval writes the ChalkosControlPlane.
+// wantNoWrite fails the test when a pass after the retry interval writes the ChalkosControlPlane
+// or one of its Machines.
 func (e *env) wantNoWrite() {
 	e.t.Helper()
-	version := e.cp().ResourceVersion
+	cpVersion := e.cp().ResourceVersion
+	versions := map[string]string{}
+	for _, m := range e.machines() {
+		versions[m.Name] = m.ResourceVersion
+	}
 	e.clock.Step(machineutil.RetryAfter)
 	e.mustReconcile()
-	if e.cp().ResourceVersion != version {
+	if e.cp().ResourceVersion != cpVersion {
 		e.t.Error("a waiting pass wrote the ChalkosControlPlane")
 	}
+	for _, m := range e.machines() {
+		if m.ResourceVersion != versions[m.Name] {
+			e.t.Errorf("a waiting pass wrote the Machine %s", m.Name)
+		}
+	}
+}
+
+// ownedFile is a Cluster document that sets spec.endpoint, which Cluster API owns.
+var ownedFile = runtime.RawExtension{Raw: []byte(`{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Cluster", "metadata": {"name": "default"}, "spec": {"endpoint": "https://other:6443"}}`)}
+
+// A change of the Cluster's endpoint, controlPlaneRef or clusterNetwork reconciles the control
+// plane; one of its other fields does not.
+func TestClusterInputsChanged(t *testing.T) {
+	base := &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{
+		ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "10.0.0.1", Port: 6443},
+		ClusterNetwork:       clusterv1.ClusterNetwork{Pods: clusterv1.NetworkRanges{CIDRBlocks: []string{"10.244.0.0/16"}}},
+	}}
+	p := clusterInputsChanged()
+	for name, tc := range map[string]struct {
+		edit func(*clusterv1.Cluster)
+		want bool
+	}{
+		"the endpoint":         {func(c *clusterv1.Cluster) { c.Spec.ControlPlaneEndpoint.Port = 443 }, true},
+		"the controlPlaneRef":  {func(c *clusterv1.Cluster) { c.Spec.ControlPlaneRef.Name = "other" }, true},
+		"the pod ranges":       {func(c *clusterv1.Cluster) { c.Spec.ClusterNetwork.Pods.CIDRBlocks = []string{"10.200.0.0/16"} }, true},
+		"the service ranges":   {func(c *clusterv1.Cluster) { c.Spec.ClusterNetwork.Services.CIDRBlocks = []string{"10.96.0.0/12"} }, true},
+		"the service domain":   {func(c *clusterv1.Cluster) { c.Spec.ClusterNetwork.ServiceDomain = "lab.local" }, true},
+		"the labels":           {func(c *clusterv1.Cluster) { c.Labels = map[string]string{"a": "b"} }, false},
+		"the availability gate": {func(c *clusterv1.Cluster) { c.Spec.AvailabilityGates = []clusterv1.ClusterAvailabilityGate{{ConditionType: "X"}} }, false},
+	} {
+		cur := base.DeepCopy()
+		tc.edit(cur)
+		if got := p.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: cur}); got != tc.want {
+			t.Errorf("a change of %s passes %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// Files no control-plane Machine can be made from, as one setting a field Cluster API owns,
+// create no Machine, also the first, before any observed files are recorded.
+func TestInvalidFilesHoldTheFirstMachine(t *testing.T) {
+	e := newEnv(t, 1, true)
+	e.setFiles(ownedFile)
+	e.mustReconcile()
+	e.wantMachines(0)
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.InvalidFilesReason, "spec.endpoint, which Cluster API owns")
+	e.wantNoWrite()
+	e.setFiles(clusterFile("lab.local"))
+	e.mustReconcile()
+	e.wantMachines(1)
+}
+
+// Invalid files hold the replacement of a deleted Machine once observed files are recorded too,
+// and RollingOut reports them while the Machines are of other files.
+func TestInvalidFilesHoldEveryNewMachine(t *testing.T) {
+	e := newEnv(t, 3, true)
+	e.serveImage()
+	ms, _ := e.controlPlanes(3)
+	if e.cp().Status.ObservedFiles == "" {
+		t.Fatal("no observedFiles recorded")
+	}
+	e.setFiles(ownedFile)
+	e.deleteHeld(ms[2].Name)
+	e.mustReconcile()
+	e.wantMachines(3)
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.InvalidFilesReason, "cannot be made into a control-plane Machine's documents")
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.ScalingUpReason, "InvalidFiles")
+	e.wantNoWrite()
+}
+
+// A Machine being deleted counts in the skew: it runs until it is gone, so a single control
+// plane being replaced gets no replacement more than one minor ahead of it.
+func TestVersionSkewCountsDeletingMachines(t *testing.T) {
+	e := newEnv(t, 1, true)
+	ms, _ := e.controlPlanes(1)
+	e.setVersion("v1.39.0")
+	e.atHook(ms[0].Name)
+	e.mustReconcile()
+	e.wantMachines(1)
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.VersionSkewReason, "to v1.38 first")
+	e.wantNoWrite()
+}
+
+// status.observedFiles that cannot be read holds every new Machine with a remedy, the record's
+// clearing, which lifts the hold.
+func TestUnreadableRecordHolds(t *testing.T) {
+	e := newEnv(t, 3, true)
+	e.serveImage()
+	ms, _ := e.controlPlanes(3)
+	cp := e.cp()
+	cp.Status.ObservedFiles = "{{{"
+	if err := testClient.Status().Update(t.Context(), cp); err != nil {
+		t.Fatal(err)
+	}
+	e.deleteHeld(ms[2].Name)
+	e.mustReconcile()
+	e.wantMachines(3)
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.InvalidFilesReason, "--subresource=status")
+	e.wantNoWrite()
+	cp = e.cp()
+	cp.Status.ObservedFiles = ""
+	if err := testClient.Status().Update(t.Context(), cp); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	e.wantMachines(4)
+}
+
+// A held change of a fixed field keeps neither scale-down nor the pre-terminate hooks from
+// working: 3 → 1 deletes the oldest Machine, and its hook runs.
+func TestHeldChangeStillScalesDown(t *testing.T) {
+	e := newEnv(t, 3, true)
+	e.serveImage()
+	ms, _ := e.controlPlanes(3)
+	for _, m := range ms {
+		e.hold(m.Name)
+	}
+	e.setFiles(clusterFile("example.org"))
+	e.setReplicas(1)
+	e.mustReconcile()
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.FixedFieldChangedReason, "example.org")
+	if got := e.deleted(); !slices.Equal(got, []string{ms[0].Name}) {
+		t.Fatalf("deleted %v, want the oldest %s", got, ms[0].Name)
+	}
+	e.markWaiting(ms[0].Name)
+	e.mustReconcile()
+	if e.hooked(ms[0].Name) {
+		t.Error("the deleted Machine keeps its hook")
+	}
+	e.wantMachines(3)
 }
 
 // The Machines move to a version in one step when it is of their minor or the next; another
@@ -67,6 +206,7 @@ func TestVersionSkew(t *testing.T) {
 		{"v2.0.0", ms("v1.37.1"), "another major version"},
 		{"latest", ms("v1.37.1"), "no Kubernetes version"},
 		{"v1.37.1", ms("bogus"), "which is no Kubernetes version"},
+		{"v1.37.1", ms(""), "has no spec.version; set it"},
 	} {
 		got := versionSkew(tc.version, tc.machines)
 		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
@@ -185,6 +325,22 @@ func TestUnreadableImageHolds(t *testing.T) {
 	}
 	e.wantMachines(3)
 	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "image")
-	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.ScalingUpReason, "checked against the image")
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionTrue, controlplanev1.ScalingUpReason, "not checked against it")
+	e.wantNoWrite()
+}
+
+// While no Machine is wanted, an image that cannot be read holds nothing: ScalingUp says that the
+// observed files wait for it, alike at every pass.
+func TestUnreadableImageInSteadyState(t *testing.T) {
+	e := newEnv(t, 3, true)
+	e.serveImage()
+	e.controlPlanes(3)
+	e.r = e.reconciler()
+	if err := testClient.Delete(t.Context(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: "pull"}}); err != nil {
+		t.Fatal(err)
+	}
+	e.mustReconcile()
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionFalse, controlplanev1.NotScalingUpReason, "cannot be read, so status.observedFiles is not recorded yet")
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
 	e.wantNoWrite()
 }

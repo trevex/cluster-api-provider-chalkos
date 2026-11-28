@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -219,14 +220,14 @@ func (r *ChalkosControlPlaneReconciler) observeFiles(ctx context.Context, s *sco
 	log := ctrl.LoggerFrom(ctx)
 	docs, err := documents.ClusterWide(s.cluster, s.cp.Spec.Version, s.cp.Spec.Files)
 	if err != nil {
-		// The ChalkosControlPlane's or the Cluster's change reconciles again.
-		log.Info("Not recording the observed files", "reason", err.Error())
+		// The guard reports it; a change of the files or of the Cluster reconciles again.
+		log.V(1).Info("Not recording the observed files", "reason", err.Error())
 		return ctrl.Result{}
 	}
 	c, err := r.contract(ctx, s.cp)
 	if err != nil {
 		// The ScalingUp condition reports it.
-		s.imageWaiting = "status.observedFiles is recorded once the image is read: " + err.Error()
+		s.imageWaiting = fmt.Sprintf("the image %s cannot be read, so status.observedFiles is not recorded yet", s.cp.Spec.Image)
 		log.V(1).Info("Not recording the observed files yet: reading the image's contract", "reason", err.Error())
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
 	}
@@ -255,9 +256,12 @@ func versionSkew(version string, machines []clusterv1.Machine) string {
 	}
 	for i := range machines {
 		m := &machines[i]
+		if m.Spec.Version == "" {
+			return fmt.Sprintf("The Machine %s has no spec.version; set it to the Kubernetes version the Machine runs", m.Name)
+		}
 		have, err := utilversion.ParseSemantic(m.Spec.Version)
 		if err != nil {
-			return fmt.Sprintf("The Machine %s is of version %s, which is no Kubernetes version", m.Name, m.Spec.Version)
+			return fmt.Sprintf("The Machine %s is of version %s, which is no Kubernetes version; set its spec.version to the version the Machine runs", m.Name, m.Spec.Version)
 		}
 		switch {
 		case want.Major() != have.Major():
@@ -271,28 +275,39 @@ func versionSkew(version string, machines []clusterv1.Machine) string {
 	return ""
 }
 
-// guard records in s why the control plane may create no Machine now: a version its Machines
-// cannot reach in one step, or cluster-wide documents that change, against
-// status.observedFiles, a field every node of the cluster holds alike, as the contract of
-// spec.image marks it. Without observed files, or while the documents cannot be made, as before
-// the Cluster has an endpoint, there is nothing to compare. It returns when to check again when
-// the image cannot be read.
+// guard records in s why the control plane may create no Machine now: a version its Machines,
+// being deleted included, cannot reach in one step; spec.files that, with the fields filled from
+// the Cluster, make no control-plane Machine's documents; or cluster-wide documents that change,
+// against status.observedFiles, a field every node of the cluster holds alike, as the contract of
+// spec.image marks it. Without observed files there is nothing to compare. An image that cannot
+// be read holds, and is read again, only while a Machine is wanted: while the control plane has
+// fewer Machines than spec.replicas or a Machine is not up to date. Otherwise observeFiles
+// reports it, once no Machine is being deleted.
 func (r *ChalkosControlPlaneReconciler) guard(ctx context.Context, s *scope) ctrl.Result {
-	if msg := versionSkew(s.cp.Spec.Version, s.machines); msg != "" {
+	// A Machine being deleted runs until it is gone, so a new Machine must reach it too.
+	if msg := versionSkew(s.cp.Spec.Version, append(slices.Clone(s.machines), s.deleting...)); msg != "" {
 		s.held, s.heldReason = msg, controlplanev1.VersionSkewReason
+		return ctrl.Result{}
+	}
+	// reconcile reaches the guard only once the Cluster has an endpoint, so an error here is one
+	// of the files or of the Cluster's network, which a change of either reconciles again.
+	docs, err := documents.ClusterWide(s.cluster, s.cp.Spec.Version, s.cp.Spec.Files)
+	if err != nil {
+		s.held, s.heldReason = "spec.files cannot be made into a control-plane Machine's documents: "+err.Error(), controlplanev1.InvalidFilesReason
 		return ctrl.Result{}
 	}
 	observed := s.cp.Status.ObservedFiles
 	if observed == "" {
 		return ctrl.Result{}
 	}
-	docs, err := documents.ClusterWide(s.cluster, s.cp.Spec.Version, s.cp.Spec.Files)
-	if err != nil {
-		return ctrl.Result{}
-	}
 	c, err := r.contract(ctx, s.cp)
 	if err != nil {
-		s.held = "the cluster-wide documents are not checked against the image yet: " + err.Error()
+		if !s.machineWanted() {
+			return ctrl.Result{}
+		}
+		ctrl.LoggerFrom(ctx).V(1).Info("Not checking the cluster-wide documents yet: reading the image's contract", "reason", err.Error())
+		// The message stays alike at every attempt; the error itself is logged.
+		s.held = fmt.Sprintf("the image %s cannot be read, so the cluster-wide documents are not checked against it yet", s.cp.Spec.Image)
 		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}
 	}
 	if text, err := documents.Observed(c, docs); err == nil && text == observed {
@@ -301,12 +316,24 @@ func (r *ChalkosControlPlaneReconciler) guard(ctx context.Context, s *scope) ctr
 	changes, err := documents.FixedChanges(c, observed, docs)
 	switch {
 	case err != nil:
-		// The ChalkosControlPlane's change reconciles again.
-		s.held = "the cluster-wide documents cannot be checked against status.observedFiles: " + err.Error()
+		// Clearing the record or a change of the files reconciles again.
+		s.held = fmt.Sprintf("status.observedFiles cannot be compared with the cluster-wide documents: %v; if the record is at fault, "+
+			"clear it, and the next Machine is made without the check: kubectl patch chalkoscontrolplane %s -n %s --subresource=status --type=merge -p '{\"status\":{\"observedFiles\":null}}'",
+			err, s.cp.Name, s.cp.Namespace)
+		s.heldReason = controlplanev1.InvalidFilesReason
 	case len(changes) > 0:
 		s.held, s.heldReason = documents.DescribeFixed(changes), controlplanev1.FixedFieldChangedReason
 	}
 	return ctrl.Result{}
+}
+
+// machineWanted tells whether the control plane wants a new Machine: it has fewer Machines than
+// spec.replicas asks for, or a Machine is not up to date.
+func (s *scope) machineWanted() bool {
+	if len(s.machines) < int(ptr.Deref(s.cp.Spec.Replicas, 1)) {
+		return true
+	}
+	return slices.ContainsFunc(s.machines, func(m clusterv1.Machine) bool { return s.outOfDate(&m) != "" })
 }
 
 // surge is spec.rollout.strategy.rollingUpdate.maxSurge: how many Machines above spec.replicas

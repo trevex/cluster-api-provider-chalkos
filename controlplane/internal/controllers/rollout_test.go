@@ -319,7 +319,7 @@ func TestObservedFilesWaitForTheImage(t *testing.T) {
 	if got := e.cp().Status.ObservedFiles; got != "" {
 		t.Errorf("observedFiles %s recorded without the image", got)
 	}
-	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionFalse, controlplanev1.NotScalingUpReason, "image pull Secret")
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionFalse, controlplanev1.NotScalingUpReason, "cannot be read")
 	// The pass after the Machine's creation sees it listed in order; the one after writes nothing.
 	e.mustReconcile()
 	e.wantNoWrite()

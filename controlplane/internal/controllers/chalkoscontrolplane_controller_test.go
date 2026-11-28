@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/clientcmd"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -117,6 +118,8 @@ func newEnv(t *testing.T, replicas int32, endpoint bool) *env {
 			Version:            version,
 			Image:              image,
 			ImagePullSecretRef: &corev1.LocalObjectReference{Name: "pull"},
+			// A control-plane Machine needs a Cluster document.
+			Files: []runtime.RawExtension{clusterFile("lab.local")},
 			MachineTemplate: controlplanev1.ChalkosControlPlaneMachineTemplate{
 				ObjectMeta: clusterv1.ObjectMeta{Labels: map[string]string{"pool": "cp"}},
 				Spec: controlplanev1.ChalkosControlPlaneMachineTemplateSpec{
@@ -609,6 +612,7 @@ func TestKubeconfigIssuedAndRenewed(t *testing.T) {
 // joined the cluster.
 func TestJoinsOneAtATime(t *testing.T) {
 	e := newEnv(t, 3, true)
+	e.serveImage()
 	first := e.initialize("10.0.0.1")
 	ms := e.wantMachines(2)
 	second := ms[0]

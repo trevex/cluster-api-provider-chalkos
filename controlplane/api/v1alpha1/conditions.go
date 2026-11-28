@@ -74,9 +74,10 @@ const (
 	NotScalingUpReason = "NotScalingUp"
 )
 
-// The ScalingUp condition also takes FixedFieldChangedReason or VersionSkewReason, when the
-// control plane refuses to create a Machine while every Machine is up to date; it is true then
-// while the control plane has fewer Machines than Spec.Replicas asks for.
+// The ScalingUp condition also takes FixedFieldChangedReason, VersionSkewReason or
+// InvalidFilesReason, when the control plane refuses to create a Machine while every Machine is
+// up to date; it is true then while the control plane has fewer Machines than Spec.Replicas asks
+// for.
 
 // Reasons documenting why a ChalkosControlPlane's Machine cannot be installed, used across its
 // conditions.
@@ -183,9 +184,18 @@ const (
 	FixedFieldChangedReason = "FixedFieldChanged"
 
 	// VersionSkewReason documents a ChalkosControlPlane whose spec.version is more than one minor
-	// newer than one of its Machines, or of an older minor; RollingOut stays true. It creates no Machine until the
+	// newer than one of its Machines, being deleted included, of an older minor or of another major,
+	// or that is no Kubernetes version; RollingOut stays true. It creates no Machine until the
 	// version is one it can upgrade to.
 	VersionSkewReason = "VersionSkew"
+
+	// InvalidFilesReason documents a ChalkosControlPlane whose spec.files, with the fields filled
+	// from the Cluster, cannot be made into a control-plane Machine's documents, as when they set a
+	// field Cluster API owns, or whose status.observedFiles cannot be compared with them. It creates
+	// no Machine until the files or the Cluster are fixed, or the record is cleared; the message
+	// says which. RollingOut stays true with this reason while a Machine is not up to date;
+	// otherwise ScalingUp takes it.
+	InvalidFilesReason = "InvalidFiles"
 
 	// NotRollingOutReason documents a ChalkosControlPlane whose Machines are all up to date.
 	NotRollingOutReason = clusterv1.NotRollingOutReason

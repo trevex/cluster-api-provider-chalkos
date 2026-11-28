@@ -121,7 +121,8 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 	}
 	switch {
 	case s.held != "" && s.heldReason != "":
-		// The ChalkosControlPlane's or the Cluster's change reconciles again.
+		// A change of the ChalkosControlPlane, of the Cluster's endpoint or network, or of its
+		// Machines, as one being deleted going, reconciles again.
 		s.scaleUpWaiting = "no Machine is created while the control plane refuses the change: " + s.heldReason
 		return ctrl.Result{}, nil
 	case s.held != "":
