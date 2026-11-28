@@ -160,7 +160,7 @@ func setStatus(s *scope) {
 	case n > want && s.scaleDownWaiting != "":
 		conditions.Set(s.cp, metav1.Condition{
 			Type: controlplanev1.ScalingDownCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.ScalingDownWaitingReason,
-			Message: machineutil.Truncate(s.scaleDownWaiting),
+			Message: machineutil.Truncate(fmt.Sprintf("Not scaling down from %d to %d replicas yet: %s", n, want, s.scaleDownWaiting)),
 		})
 	case n > want:
 		conditions.Set(s.cp, metav1.Condition{

@@ -30,6 +30,7 @@ import (
 	kubernetesv1 "github.com/trevex/chalkos/pkg/api/kubernetes/v1"
 
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
+	"github.com/trevex/cluster-api-provider-chalkos/pkg/node/nodetest"
 )
 
 // setMaxSurge sets the ChalkosControlPlane's spec.rollout.strategy.rollingUpdate.maxSurge.
@@ -242,4 +243,137 @@ func TestWaitingRollWritesNothing(t *testing.T) {
 	e.mustReconcile()
 	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "to join")
 	e.wantNoWrite()
+}
+
+// With maxSurge 1, a replacement that never joins holds the roll until the change is reverted;
+// then it is the only Machine not up to date and goes without its join, and the roll ends.
+func TestStuckSurgeMachineGoesOnRevert(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	stuck := e.newcomer(e.wantMachines(4), addrs)
+	e.hold(stuck.Name)
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v before the replacement joined", got)
+	}
+	e.setVersion(version)
+	e.mustReconcile()
+	if got := e.deleted(); !slices.Equal(got, []string{stuck.Name}) {
+		t.Fatalf("deleted %v, want the replacement %s that never joined", got, stuck.Name)
+	}
+	e.finishRemoval(stuck.Name, ms, addrs)
+	e.mustReconcile()
+	e.wantMachines(3)
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
+}
+
+// With maxSurge 0, a replacement that never joins goes without its join once the change is
+// reverted, and a Machine of the reverted spec replaces it.
+func TestStuckReplacementGoesOnRevertWithoutSurge(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.setMaxSurge(0)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	e.finishRemoval(ms[0].Name, ms[1:], addrs)
+	e.mustReconcile()
+	stuck := e.newcomer(e.wantMachines(3), addrs)
+	e.hold(stuck.Name)
+	e.setVersion(version)
+	e.mustReconcile()
+	if got := e.deleted(); !slices.Equal(got, []string{stuck.Name}) {
+		t.Fatalf("deleted %v, want the replacement %s that never joined", got, stuck.Name)
+	}
+	e.finishRemoval(stuck.Name, ms[1:], addrs)
+	e.mustReconcile()
+	repl := e.newcomer(e.wantMachines(3), addrs)
+	if repl.Name == stuck.Name || repl.Spec.Version != version {
+		t.Errorf("the new Machine %s is of %s, want a new one of %s", repl.Name, repl.Spec.Version, version)
+	}
+}
+
+// With maxSurge 0, no Machine goes while etcd has an unhealthy member or a learner.
+func TestRollWithoutSurgeWaitsForHealthyEtcd(t *testing.T) {
+	for name, tc := range map[string]struct {
+		member func(*kubernetesv1.EtcdMember)
+		want   string
+	}{
+		"unhealthy": {func(m *kubernetesv1.EtcdMember) { m.Unhealthy = "context deadline exceeded" }, "unhealthy"},
+		"a learner": {func(m *kubernetesv1.EtcdMember) { m.Learner = true }, "learner"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, 3, true)
+			ms, addrs := e.rollingControlPlane(3)
+			var members []*kubernetesv1.EtcdMember
+			for i, m := range ms {
+				members = append(members, &kubernetesv1.EtcdMember{Id: uint64(i + 1), Name: m.Name, PeerUrls: []string{"https://" + addrs[m.Name] + ":2380"}})
+			}
+			tc.member(members[1])
+			for _, m := range ms {
+				e.fake.Update(addrs[m.Name], func(n *nodetest.Node) { n.Members = members })
+			}
+			e.setMaxSurge(0)
+			e.setVersion("v1.37.2")
+			e.mustReconcile()
+			if got := e.deleted(); len(got) != 0 {
+				t.Fatalf("deleted %v while etcd is not healthy", got)
+			}
+			wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, tc.want)
+		})
+	}
+}
+
+// A change of the spec while the surge Machine joins leaves the oldest Machine to go first, once
+// the surge Machine joined.
+func TestSpecChangeMidSurgeDeletesTheOldestFirst(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	repl := e.newcomer(e.wantMachines(4), addrs)
+	e.setVersion("v1.37.3")
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v before the surge Machine joined", got)
+	}
+	e.provision(repl, "10.0.1.1", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+	addrs[repl.Name] = "10.0.1.1"
+	e.setMembers(append(slices.Clone(ms), repl), addrs)
+	e.mustReconcile()
+	if got := e.deleted(); !slices.Equal(got, []string{ms[0].Name}) {
+		t.Fatalf("deleted %v, want the oldest %s", got, ms[0].Name)
+	}
+}
+
+// withoutLearnerOf drops the Machine's learner, by name or by peer URL, and nothing else.
+func TestWithoutLearnerOf(t *testing.T) {
+	m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "d"}, Status: clusterv1.MachineStatus{Addresses: clusterv1.MachineAddresses{
+		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.4"},
+	}}}
+	members := []*kubernetesv1.EtcdMember{
+		{Id: 1, Name: "a"},
+		{Id: 2, Name: "d"},
+		{Id: 3, Name: "b", Learner: true},
+		{Id: 4, Learner: true, PeerUrls: []string{"https://10.0.0.5:2380"}},
+	}
+	named := []*kubernetesv1.EtcdMember{{Id: 5, Name: "d", Learner: true}}
+	nameless := []*kubernetesv1.EtcdMember{{Id: 6, Learner: true, PeerUrls: []string{"https://10.0.0.4:2380"}}}
+	ids := func(ms []*kubernetesv1.EtcdMember) []uint64 {
+		var out []uint64
+		for _, mem := range ms {
+			out = append(out, mem.GetId())
+		}
+		return out
+	}
+	if got := ids(withoutLearnerOf(members, m)); !slices.Equal(got, []uint64{1, 2, 3, 4}) {
+		t.Errorf("without the learner of d: %v, want every member", got)
+	}
+	if got := ids(withoutLearnerOf(append(slices.Clone(members), named...), m)); !slices.Equal(got, []uint64{1, 2, 3, 4}) {
+		t.Errorf("without the named learner of d: %v", got)
+	}
+	if got := ids(withoutLearnerOf(append(slices.Clone(members), nameless...), m)); !slices.Equal(got, []uint64{1, 2, 3, 4}) {
+		t.Errorf("without the nameless learner of d: %v", got)
+	}
 }

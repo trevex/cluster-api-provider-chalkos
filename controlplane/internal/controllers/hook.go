@@ -331,12 +331,7 @@ func (r *ChalkosControlPlaneReconciler) removeMember(ctx context.Context, addr s
 	if err != nil {
 		return fmt.Errorf("etcd lists no member %s, and listing its members to find an unstarted learner failed: %w", m.Name, err)
 	}
-	var peerURLs []string
-	for _, a := range machineutil.InternalIPs(m) {
-		if ip, err := netip.ParseAddr(a); err == nil {
-			peerURLs = append(peerURLs, chalkoskubernetes.EtcdPeerURL(ip))
-		}
-	}
+	peerURLs := etcdPeerURLs(m)
 	for _, mem := range members {
 		if mem.GetName() != "" {
 			continue
@@ -353,6 +348,17 @@ func (r *ChalkosControlPlaneReconciler) removeMember(ctx context.Context, addr s
 		}
 	}
 	return nil
+}
+
+// etcdPeerURLs are the etcd peer URLs chalkd may build for the Machine's node, one per InternalIP.
+func etcdPeerURLs(m *clusterv1.Machine) []string {
+	var urls []string
+	for _, a := range machineutil.InternalIPs(m) {
+		if ip, err := netip.ParseAddr(a); err == nil {
+			urls = append(urls, chalkoskubernetes.EtcdPeerURL(ip))
+		}
+	}
+	return urls
 }
 
 // revokeControlPlane revokes the Machine's node, a control plane, through the first peer that

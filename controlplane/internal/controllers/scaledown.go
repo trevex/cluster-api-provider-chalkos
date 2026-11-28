@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,9 +40,10 @@ import (
 // scaleDown deletes the control plane's oldest Machine that is not up to date, or else its oldest
 // Machine, while it has more than Spec.Replicas asks for, one at a time. A step starts only once
 // the control plane is initialized, no Machine is being deleted or was created or deleted in this
-// reconcile, and stepProblem finds nothing. The Machine's pre-terminate hook takes it out of etcd
-// and revokes it; the next step waits until it is gone. Spec.Replicas is at least one, so the
-// last Machine is never deleted.
+// reconcile, and stepProblem finds nothing for the Machine. A Machine that has not joined goes
+// without its join, as a replacement that never joins once its change is reverted. The Machine's
+// pre-terminate hook takes it out of etcd and revokes it; the next step waits until it is gone.
+// Spec.Replicas is at least one, so the last Machine is never deleted.
 func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	n, want := len(s.machines), max(1, int(ptr.Deref(s.cp.Spec.Replicas, 1)))
 	if n <= want || !s.initialized() || len(s.deleting) > 0 || s.stepped {
@@ -49,18 +51,18 @@ func (r *ChalkosControlPlaneReconciler) scaleDown(ctx context.Context, s *scope,
 		// a Machine's creation.
 		return ctrl.Result{}, nil
 	}
-	why, err := r.stepProblem(ctx, s, sec)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if why != "" {
-		s.scaleDownWaiting = fmt.Sprintf("Not scaling down from %d to %d replicas yet: %s", n, want, why)
-		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
-	}
 	// A Machine that is not up to date goes first, which a roll with maxSurge 1 relies on.
 	m := s.oldestOutdated()
 	if m == nil {
 		m = &s.machines[0]
+	}
+	why, err := r.stepProblem(ctx, s, sec, m)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if why != "" {
+		s.scaleDownWaiting = why
+		return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 	}
 	if err := r.deleteMachine(ctx, m); err != nil {
 		return ctrl.Result{}, err
@@ -85,12 +87,18 @@ func (r *ChalkosControlPlaneReconciler) deleteMachine(ctx context.Context, m *cl
 
 // etcdProblem says why etcd may not gain or lose a member now, as the first of the control
 // plane's Machines that answers lists its members, those not being deleted first; empty when
-// membersProblem finds nothing.
-func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets) string {
+// membersProblem finds nothing. unjoined, when not nil, is a Machine that has not joined and is
+// about to be deleted: it counts as being deleted, its learner is left out, which its hook
+// removes, and the members are not listed through it.
+func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, unjoined *clusterv1.Machine) string {
 	passCtx, cancel := context.WithTimeout(ctx, machineutil.HookPassTimeout)
 	defer cancel()
+	machines, deleting := s.machines, s.deleting
+	if unjoined != nil {
+		machines = slices.DeleteFunc(slices.Clone(machines), func(m clusterv1.Machine) bool { return m.Name == unjoined.Name })
+	}
 	var tried []string
-	for _, ms := range [][]clusterv1.Machine{s.machines, s.deleting} {
+	for _, ms := range [][]clusterv1.Machine{machines, deleting} {
 		for i := range ms {
 			m := &ms[i]
 			addr := machineutil.InternalIP(m)
@@ -105,7 +113,10 @@ func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scop
 			}
 			switch {
 			case err == nil:
-				return membersProblem(members, s.machines, s.deleting)
+				if unjoined != nil {
+					return membersProblem(withoutLearnerOf(members, unjoined), machines, append(slices.Clone(deleting), *unjoined))
+				}
+				return membersProblem(members, machines, deleting)
 			case node.TryNextControlPlane(err):
 				tried = append(tried, fmt.Sprintf("%s: %s", m.Name, node.ConditionError(err)))
 			default:
@@ -117,6 +128,21 @@ func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scop
 		return "no control-plane Machine has an InternalIP to list etcd's members through"
 	}
 	return "no control plane lists etcd's members: " + strings.Join(tried, "; ")
+}
+
+// withoutLearnerOf are the members without the Machine's learner, found by its name or, for a
+// learner that never started and has no name yet, by its peer URL.
+func withoutLearnerOf(members []*kubernetesv1.EtcdMember, m *clusterv1.Machine) []*kubernetesv1.EtcdMember {
+	urls := etcdPeerURLs(m)
+	return slices.DeleteFunc(slices.Clone(members), func(mem *kubernetesv1.EtcdMember) bool {
+		switch {
+		case !mem.GetLearner():
+			return false
+		case mem.GetName() != "":
+			return mem.GetName() == m.Name
+		}
+		return slices.ContainsFunc(mem.GetPeerUrls(), func(u string) bool { return slices.Contains(urls, u) })
+	})
 }
 
 // membersProblem says what keeps etcd's members from being one healthy voting member per
