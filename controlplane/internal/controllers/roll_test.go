@@ -450,6 +450,60 @@ func TestStuckScaleUpMachineGoesOnChange(t *testing.T) {
 	}
 }
 
+// A replacement that joined etcd and then went unhealthy holds the roll; once the change is
+// reverted, it is the only Machine out of date and goes, the other three members being a healthy
+// quorum. Its node's own member does not answer, so a peer removes it.
+func TestUnhealthyReplacementGoesOnRevert(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	repl := e.newcomer(e.wantMachines(4), addrs)
+	e.hold(repl.Name)
+	e.provision(repl, "10.0.1.1", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+	addrs[repl.Name] = "10.0.1.1"
+	e.setUnhealthy(append(slices.Clone(ms), repl), addrs, repl.Name)
+	e.fake.Update(addrs[repl.Name], func(n *nodetest.Node) { n.EtcdLeave = func() error { return deadMemberRefusal(repl.Name) } })
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v while the replacement's member is unhealthy", got)
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "unhealthy")
+
+	e.setVersion(version)
+	e.mustReconcile()
+	if got := e.deleted(); !slices.Equal(got, []string{repl.Name}) {
+		t.Fatalf("deleted %v, want the unhealthy replacement %s", got, repl.Name)
+	}
+	e.finishRemoval(repl.Name, ms, addrs)
+	if n, _ := e.fake.Node(addrs[ms[0].Name]); !slices.Equal(n.Removed, []string{repl.Name}) {
+		t.Errorf("removed %v through %s, want the replacement's member", n.Removed, ms[0].Name)
+	}
+	e.mustReconcile()
+	e.wantMachines(3)
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
+}
+
+// With one replica, a replacement whose member is unhealthy leaves etcd with two members of which
+// one is healthy, no quorum to remove a member: it is not deleted, as its removal could not commit.
+func TestOneReplicaUnhealthyReplacementStays(t *testing.T) {
+	e := newEnv(t, 1, true)
+	ms, addrs := e.rollingControlPlane(1)
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	repl := e.newcomer(e.wantMachines(2), addrs)
+	e.hold(repl.Name)
+	e.provision(repl, "10.0.0.2", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+	addrs[repl.Name] = "10.0.0.2"
+	e.setUnhealthy([]clusterv1.Machine{ms[0], repl}, addrs, repl.Name)
+	e.setVersion(version)
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v without a quorum to remove the member", got)
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionFalse, controlplanev1.ScalingDownWaitingReason, "1 healthy of 2 members")
+}
+
 // withoutLearnerOf drops the Machine's learner, by name or by peer URL, and nothing else.
 func TestWithoutLearnerOf(t *testing.T) {
 	m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "d"}, Status: clusterv1.MachineStatus{Addresses: clusterv1.MachineAddresses{

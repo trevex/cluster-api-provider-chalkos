@@ -264,8 +264,9 @@ func (r *ChalkosControlPlaneReconciler) everReached(ctx context.Context, m *clus
 }
 
 // leaveEtcd takes the Machine's node out of etcd: the node leaves, or, when it cannot be reached
-// as itself, a peer removes its member. A node that is no member, or a member etcd does not list,
-// counts as out. It tells whether the node is out; otherwise s says what the step waits on.
+// as itself, or refuses while a peer lists its member as unhealthy, a peer removes its member. A
+// node that is no member, or a member etcd does not list, counts as out. It tells whether the
+// node is out; otherwise s says what the step waits on.
 func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope, m *clusterv1.Machine, peers []clusterv1.Machine, sec clustersecrets.Secrets) bool {
 	addr := machineutil.InternalIP(m)
 	err := errNoAddress
@@ -274,9 +275,15 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 		err = r.Node.EtcdLeave(callCtx, addr, sec, m.Name)
 		cancel()
 	}
+	var why string
 	switch {
 	case err == nil, sdkkubernetes.NotEtcdMember(err):
 		return true
+	case connect.CodeOf(err) == connect.CodeFailedPrecondition && r.unhealthyMember(ctx, m, peers, sec):
+		// The node refuses, as when its own member does not answer, and a peer lists that member
+		// as unhealthy: a peer removes it, as an operator would, and guards etcd's quorum alike.
+		ctrl.LoggerFrom(ctx).Info("The node does not leave etcd, and its member is unhealthy", "machine", m.Name, "error", err.Error())
+		why = fmt.Sprintf("does not leave etcd (%s), and its member is unhealthy", node.ConditionError(err))
 	case !errors.Is(err, errNoAddress) && !node.Unreachable(err):
 		// Only the node itself may answer for its leave: another control plane is not asked. A node
 		// whose own etcd member does not answer refuses to leave through the other members alone;
@@ -297,7 +304,7 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 		}
 		perr := r.removeMember(ctx, paddr, sec, p.Name, m)
 		if perr == nil {
-			ctrl.LoggerFrom(ctx).Info("Removed the etcd member of an unreachable Machine", "machine", m.Name, "through", p.Name, "error", err.Error())
+			ctrl.LoggerFrom(ctx).Info("Removed the etcd member of a Machine through a peer", "machine", m.Name, "through", p.Name, "error", err.Error())
 			return true
 		}
 		ctrl.LoggerFrom(ctx).Info("A control plane did not remove the etcd member", "machine", m.Name, "through", p.Name, "error", perr.Error())
@@ -311,8 +318,34 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 	if len(tried) == 0 {
 		tried = append(tried, "no other control-plane Machine has an InternalIP")
 	}
+	if why == "" {
+		why = fmt.Sprintf("cannot be reached (%s)", node.ConditionError(err))
+	}
 	return r.hookWaits(s, m, "EtcdRemoveMember", controlplanev1.ScalingDownReason, fmt.Sprintf(
-		"the Machine %s cannot be reached (%s), and no other control plane removes its etcd member: %s", m.Name, node.ConditionError(err), strings.Join(tried, "; ")))
+		"the Machine %s %s, and no other control plane removes its etcd member: %s", m.Name, why, strings.Join(tried, "; ")))
+}
+
+// unhealthyMember tells whether the first of the Machine m's peers that lists etcd's members
+// lists m's voting member as unhealthy.
+func (r *ChalkosControlPlaneReconciler) unhealthyMember(ctx context.Context, m *clusterv1.Machine, peers []clusterv1.Machine, sec clustersecrets.Secrets) bool {
+	for i := range peers {
+		p := &peers[i]
+		addr := machineutil.InternalIP(p)
+		if addr == "" {
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, machineutil.HookCallTimeout)
+		members, err := r.Node.EtcdMembers(callCtx, addr, sec, p.Name)
+		cancel()
+		if err != nil {
+			ctrl.LoggerFrom(ctx).V(1).Info("Listing etcd's members failed", "machine", m.Name, "through", p.Name, "error", err.Error())
+			continue
+		}
+		return slices.ContainsFunc(members, func(mem *kubernetesv1.EtcdMember) bool {
+			return mem.GetName() == m.Name && !mem.GetLearner() && mem.GetUnhealthy() != ""
+		})
+	}
+	return false
 }
 
 // removeMember removes the etcd member of the Machine's node through the control plane via at

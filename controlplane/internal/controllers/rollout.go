@@ -350,24 +350,23 @@ func (r *ChalkosControlPlaneReconciler) contract(ctx context.Context, cp *contro
 
 // stepProblem says why etcd may not gain or lose a member by a scale-down or roll step now: a
 // Machine that has not joined the cluster, or etcd's members as etcdProblem reads them; empty when
-// nothing does. leaving, when not nil, is the Machine the step deletes. When it has not joined,
-// it holds no vote in etcd, so its join is not waited for and etcdProblem leaves it out, as
-// Cluster API's own control plane does: a replacement that never joins can go once its change
-// is reverted. Every other Machine must have joined.
+// nothing does. leaving, when not nil, is the Machine the step deletes, whose own voting member may
+// be unhealthy, as membersProblem tells. When it has not joined, it holds no vote in etcd, so its
+// join is not waited for and etcdProblem leaves it out, as Cluster API's own control plane does: a
+// replacement that never joins can go once its change is reverted. Every other Machine must have
+// joined.
 func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, leaving *clusterv1.Machine) (string, error) {
-	var unjoined *clusterv1.Machine
+	unjoined := false
 	if leaving != nil {
 		ok, err := r.joined(ctx, s, leaving, sec)
 		if err != nil {
 			return "", err
 		}
-		if !ok {
-			unjoined = leaving
-		}
+		unjoined = !ok
 	}
 	for i := range s.machines {
 		m := &s.machines[i]
-		if unjoined != nil && m.Name == unjoined.Name {
+		if unjoined && m.Name == leaving.Name {
 			continue
 		}
 		ok, err := r.joined(ctx, s, m, sec)
@@ -378,7 +377,7 @@ func (r *ChalkosControlPlaneReconciler) stepProblem(ctx context.Context, s *scop
 			return fmt.Sprintf("waiting for the Machine %s to join the cluster", m.Name), nil
 		}
 	}
-	return r.etcdProblem(ctx, s, sec, unjoined), nil
+	return r.etcdProblem(ctx, s, sec, leaving, unjoined), nil
 }
 
 // anyOutOfDate tells whether one of the control plane's Machines that are not being deleted is not

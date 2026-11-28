@@ -95,9 +95,10 @@ is left. The provider runs the hook only once Cluster API waits for it, so the k
 report while its pods are evicted:
 
 - A worker's node is revoked through the first control plane that answers.
-- A control plane leaves etcd. When its node cannot be reached, another control plane removes its
-  etcd member instead. Then its node is revoked through another control plane. The control-plane
-  provider runs the hooks of its Machines one at a time, oldest deletion first.
+- A control plane leaves etcd. When its node cannot be reached, or refuses to leave while another
+  control plane lists its member as unhealthy, another control plane removes its etcd member
+  instead. Then its node is revoked through another control plane. The control-plane provider
+  runs the hooks of its Machines one at a time, oldest deletion first.
 
 Then the provider removes the annotation, and Cluster API deletes the infrastructure and the Node.
 A revoked node can no longer renew its certificates or change anything in the cluster;
@@ -126,9 +127,11 @@ Every step can be repeated safely. A Machine that waits as etcd's last voter rec
 event; it checks again every 30 seconds.
 
 A node whose own etcd member does not answer, for example after it lost its pinned address,
-refuses to leave etcd, and its hook waits. Remove the member through another control plane with
-`chalkctl etcd remove-member <node>`, or with `chalkctl etcd leave <node> --through-others`. The
-node is then no etcd member, and the hook goes on with the revocation.
+refuses to leave etcd. When the other control planes list that member as unhealthy, one of them
+removes it, as for an unreachable node. When they list it as healthy, the hook waits. Remove the
+member through another control plane with `chalkctl etcd remove-member <node>`, or with
+`chalkctl etcd leave <node> --through-others`. The node is then no etcd member, and the hook goes
+on with the revocation.
 
 ### What the conditions say
 
@@ -241,9 +244,11 @@ A refusal holds the roll with the reason `InvalidFiles`, so a change that cannot
 Machine and, with `maxSurge: 0`, costs no etcd member.
 
 A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
-Machine, no Machine is being deleted, and no guard holds. Scaling down takes the Machines that are
-not up to date first, and among them one that never joined, so lowering `replicas` during a roll
-removes old Machines before new ones.
+Machine, no Machine is being deleted, and no guard holds. The Machine that a step deletes is the
+exception, as for a replacement that never joins or went unhealthy: it need not have joined, and
+its voting member may be unhealthy while every other member is a healthy voter. Scaling down takes
+the Machines that are not up to date first, and among them one that never joined, so lowering
+`replicas` during a roll removes old Machines before new ones.
 
 ### Which changes does the control plane refuse?
 
@@ -310,9 +315,18 @@ The same holds for a change made while a surge Machine is still joining: that Ma
 of date too, and it goes first instead of joining. An up-to-date Machine that is joining is never
 deleted this way, so a roll without a further change still waits for its join.
 
-A replacement that joined etcd but is unhealthy holds the roll as well, because a step waits for
-one healthy member per Machine. Delete that Machine by hand. Its pre-terminate hook takes its
-member out of etcd while the other members keep quorum.
+A replacement that joined etcd and then went unhealthy holds the roll as well: a step waits for
+one healthy voting member per Machine. Revert the change, and the replacement is again the only
+Machine out of date. The control plane then deletes it, as Cluster API's own control plane does,
+when every other Machine's member is a healthy voter and those voters are a quorum of etcd's
+members as they are. That takes three members or more: of two members, one unhealthy, the healthy
+one is no quorum, and etcd could not commit the removal. The replacement's hook has a healthy
+control plane remove its member when its node does not leave etcd itself.
+
+After a fix forward, the control plane picks the oldest old Machine instead, which waits for
+etcd's health: delete the unhealthy replacement by hand, and its hook removes its member the same
+way. A one-replica control plane whose replacement went unhealthy has lost etcd's quorum, and no
+removal commits, by the control plane or by hand, until that member is healthy again.
 
 ### What happens to the workers?
 

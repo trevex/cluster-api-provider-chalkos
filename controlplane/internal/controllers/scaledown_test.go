@@ -153,6 +153,60 @@ func TestScaleDownWaitsForHealth(t *testing.T) {
 	}
 }
 
+// setUnhealthy has every node of ms list one etcd member per Machine of ms, those of the Machines
+// names unhealthy.
+func (e *env) setUnhealthy(ms []clusterv1.Machine, addrs map[string]string, names ...string) {
+	e.setMembers(ms, addrs)
+	for _, m := range ms {
+		e.fake.Update(addrs[m.Name], func(n *nodetest.Node) {
+			for _, mem := range n.Members {
+				if slices.Contains(names, mem.GetName()) {
+					mem.Unhealthy = "context deadline exceeded"
+				}
+			}
+		})
+	}
+}
+
+// A step deletes a Machine whose own voting member is unhealthy when the other Machines' members
+// are healthy voters that make a quorum of etcd's members; another unhealthy member holds it.
+func TestScaleDownRemovesTheUnhealthyMemberOfTheMachineItDeletes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		unhealthy []int
+		deleted   bool
+	}{
+		"its own member":           {[]int{0}, true},
+		"another Machine's member": {[]int{1}, false},
+		"two members":              {[]int{0, 1}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, 3, true)
+			ms, addrs := e.controlPlanes(3)
+			for _, m := range ms {
+				e.hold(m.Name)
+			}
+			var names []string
+			for _, i := range tc.unhealthy {
+				names = append(names, ms[i].Name)
+			}
+			e.setUnhealthy(ms, addrs, names...)
+			e.setReplicas(1)
+			e.mustReconcile()
+			got := e.deleted()
+			if !tc.deleted {
+				if len(got) != 0 {
+					t.Fatalf("deleted %v", got)
+				}
+				wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionFalse, controlplanev1.ScalingDownWaitingReason, "unhealthy")
+				return
+			}
+			if !slices.Equal(got, []string{ms[0].Name}) {
+				t.Fatalf("deleted %v, want %s, whose member is unhealthy", got, ms[0].Name)
+			}
+		})
+	}
+}
+
 // A 3-replica control plane whose Machine being deleted is down and still an etcd member does not
 // grow to a fourth member; once the member is gone, it creates the replacement.
 func TestScaleUpWaitsForEtcdWhileAMachineIsDeleted(t *testing.T) {
@@ -323,21 +377,40 @@ func TestMembersProblem(t *testing.T) {
 		}
 		return ms
 	}
+	unhealthy := func(ms []*kubernetesv1.EtcdMember, names ...string) []*kubernetesv1.EtcdMember {
+		for _, m := range ms {
+			if slices.Contains(names, m.Name) {
+				m.Unhealthy = "context deadline exceeded"
+			}
+		}
+		return ms
+	}
 	for name, tc := range map[string]struct {
 		members            []*kubernetesv1.EtcdMember
 		machines, deleting []clusterv1.Machine
+		leaving            string
 		want               string
 	}{
-		"healthy":                     {members("a", "b"), machines("a", "b"), nil, ""},
-		"a member of no Machine":      {members("a", "c"), machines("a", "b"), nil, `"c"`},
-		"too few":                     {members("a"), machines("a", "b"), nil, "1 member for 2 Machines"},
-		"too many":                    {members("a", "b", "c"), machines("a", "b"), nil, "3 members for 2 Machines"},
-		"a deleted one still in etcd": {members("a", "b", "d"), machines("a", "b"), machines("d"), ""},
-		"a deleted one out of etcd":   {members("a", "b"), machines("a", "b"), machines("d"), ""},
-		"a Machine without a member":  {members("a", "d"), machines("a", "b"), machines("d"), "the Machine b"},
-		"a nameless learner":          {[]*kubernetesv1.EtcdMember{{Name: "a"}, {Id: 0xbeef, Learner: true}}, machines("a", "b"), nil, "beef is a learner"},
+		"healthy":                     {members("a", "b"), machines("a", "b"), nil, "", ""},
+		"a member of no Machine":      {members("a", "c"), machines("a", "b"), nil, "", `"c"`},
+		"too few":                     {members("a"), machines("a", "b"), nil, "", "1 member for 2 Machines"},
+		"too many":                    {members("a", "b", "c"), machines("a", "b"), nil, "", "3 members for 2 Machines"},
+		"a deleted one still in etcd": {members("a", "b", "d"), machines("a", "b"), machines("d"), "", ""},
+		"a deleted one out of etcd":   {members("a", "b"), machines("a", "b"), machines("d"), "", ""},
+		"a Machine without a member":  {members("a", "d"), machines("a", "b"), machines("d"), "", "the Machine b"},
+		"a nameless learner":          {[]*kubernetesv1.EtcdMember{{Name: "a"}, {Id: 0xbeef, Learner: true}}, machines("a", "b"), nil, "", "beef is a learner"},
+		"an unhealthy member":         {unhealthy(members("a", "b", "c"), "a"), machines("a", "b", "c"), nil, "", "a is unhealthy"},
+		"the leaving Machine's unhealthy member": {unhealthy(members("a", "b", "c"), "a"), machines("a", "b", "c"), nil, "a", ""},
+		"the unhealthy member of a leaving Machine that has not joined": {
+			unhealthy(members("a", "b", "c"), "a"), machines("b", "c"), machines("a"), "a", ""},
+		"another Machine's unhealthy member": {unhealthy(members("a", "b", "c"), "b"), machines("a", "b", "c"), nil, "a", "b is unhealthy"},
+		"two unhealthy members":              {unhealthy(members("a", "b", "c"), "a", "b"), machines("a", "b", "c"), nil, "a", "b is unhealthy"},
+		"two members, the leaving one unhealthy": {
+			unhealthy(members("a", "b"), "a"), machines("a", "b"), nil, "a", "1 healthy of 2 members"},
+		"the leaving Machine's unhealthy member and a learner": {
+			append(unhealthy(members("a", "b", "c"), "a"), &kubernetesv1.EtcdMember{Id: 9, Name: "d", Learner: true}), machines("a", "b", "c"), machines("d"), "a", "d is a learner"},
 	} {
-		got := membersProblem(tc.members, tc.machines, tc.deleting)
+		got := membersProblem(tc.members, tc.machines, tc.deleting, tc.leaving)
 		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
 			t.Errorf("%s: membersProblem = %q, want %q", name, got, tc.want)
 		}

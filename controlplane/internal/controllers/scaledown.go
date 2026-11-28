@@ -90,18 +90,28 @@ func (r *ChalkosControlPlaneReconciler) deleteMachine(ctx context.Context, m *cl
 
 // etcdProblem says why etcd may not gain or lose a member now, as the first of the control
 // plane's Machines that answers lists its members, those not being deleted first; empty when
-// membersProblem finds nothing. unjoined, when not nil, is a Machine that has not joined and is
-// about to be deleted: it counts as being deleted, its learner is left out, which its hook
-// removes, and the members are not listed through it.
-func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, unjoined *clusterv1.Machine) string {
+// membersProblem finds nothing. leaving, when not nil, is the Machine about to be deleted, which
+// may hold an unhealthy member: the others list the members before it. When it has not joined,
+// as unjoined tells, it counts as being deleted, its learner is left out, which its hook removes,
+// and the members are not listed through it.
+func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scope, sec clustersecrets.Secrets, leaving *clusterv1.Machine, unjoined bool) string {
 	passCtx, cancel := context.WithTimeout(ctx, machineutil.HookPassTimeout)
 	defer cancel()
 	machines, deleting := s.machines, s.deleting
-	if unjoined != nil {
-		machines = slices.DeleteFunc(slices.Clone(machines), func(m clusterv1.Machine) bool { return m.Name == unjoined.Name })
+	through := [][]clusterv1.Machine{machines, deleting}
+	name := ""
+	if leaving != nil {
+		name = leaving.Name
+		others := slices.DeleteFunc(slices.Clone(machines), func(m clusterv1.Machine) bool { return m.Name == leaving.Name })
+		if unjoined {
+			machines, deleting = others, append(slices.Clone(deleting), *leaving)
+			through = [][]clusterv1.Machine{others, s.deleting}
+		} else {
+			through = [][]clusterv1.Machine{others, {*leaving}, deleting}
+		}
 	}
 	var tried []string
-	for _, ms := range [][]clusterv1.Machine{machines, deleting} {
+	for _, ms := range through {
 		for i := range ms {
 			m := &ms[i]
 			addr := machineutil.InternalIP(m)
@@ -116,10 +126,10 @@ func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scop
 			}
 			switch {
 			case err == nil:
-				if unjoined != nil {
-					return membersProblem(withoutLearnerOf(members, unjoined), machines, append(slices.Clone(deleting), *unjoined))
+				if unjoined {
+					members = withoutLearnerOf(members, leaving)
 				}
-				return membersProblem(members, machines, deleting)
+				return membersProblem(members, machines, deleting, name)
 			case node.TryNextControlPlane(err):
 				tried = append(tried, fmt.Sprintf("%s: %s", m.Name, node.ConditionError(err)))
 			default:
@@ -151,7 +161,10 @@ func withoutLearnerOf(members []*kubernetesv1.EtcdMember, m *clusterv1.Machine) 
 // membersProblem says what keeps etcd's members from being one healthy voting member per
 // Machine; empty when nothing does. Each Machine not being deleted has a member, and each
 // member is a Machine's; a Machine being deleted may still have one, or may have left etcd.
-func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clusterv1.Machine) string {
+// leaving, when not empty, names the Machine the step deletes. Its voting member may be
+// unhealthy, as Cluster API's own control plane allows, when every other member is a healthy
+// voter of another Machine and those make a quorum of the members as they are.
+func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clusterv1.Machine, leaving string) string {
 	if len(members) < len(machines) || len(members) > len(machines)+len(deleting) {
 		msg := fmt.Sprintf("etcd has %s for %s", plural(len(members), "member"), plural(len(machines), "Machine"))
 		if len(deleting) > 0 {
@@ -166,6 +179,7 @@ func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clu
 		}
 	}
 	has := map[string]bool{}
+	unhealthy := false
 	for _, mem := range members {
 		name := mem.GetName()
 		if name == "" {
@@ -175,6 +189,8 @@ func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clu
 		switch {
 		case mem.GetLearner():
 			return fmt.Sprintf("the member %s is a learner", name)
+		case mem.GetUnhealthy() != "" && leaving != "" && mem.GetName() == leaving:
+			unhealthy = true
 		case mem.GetUnhealthy() != "":
 			// Without etcd's error, whose text varies from one health check to the next.
 			return fmt.Sprintf("the member %s is unhealthy", name)
@@ -187,6 +203,20 @@ func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clu
 		if !has[machines[i].Name] {
 			return fmt.Sprintf("the Machine %s has no etcd member", machines[i].Name)
 		}
+	}
+	if !unhealthy {
+		return ""
+	}
+	if i := slices.IndexFunc(deleting, func(m clusterv1.Machine) bool { return m.Name != leaving }); i >= 0 {
+		return fmt.Sprintf("the member %s is unhealthy, and the Machine %s is being deleted", leaving, deleting[i].Name)
+	}
+	// Removing the unhealthy member changes etcd's membership, which commits only with a quorum of
+	// the n members as they are, n/2+1 rounded down. Every other member is a healthy voter here, so
+	// n-1 of them answer: enough from three members on, but with two, one of them unhealthy, etcd
+	// has lost its quorum and the removal could not commit. The n-1 healthy voters left are then a
+	// quorum of themselves too.
+	if n := len(members); n-1 < n/2+1 {
+		return fmt.Sprintf("the member %s is unhealthy, and %d healthy of %d members are no quorum to remove it", leaving, n-1, n)
 	}
 	return ""
 }
