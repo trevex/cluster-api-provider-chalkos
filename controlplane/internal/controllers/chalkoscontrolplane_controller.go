@@ -80,9 +80,10 @@ var controlPlaneKind = controlplanev1.GroupVersion.WithKind("ChalkosControlPlane
 type ChalkosControlPlaneReconciler struct {
 	// Client reads and writes the management cluster's objects, from the manager's cache.
 	Client client.Client
-	// APIReader reads uncached: the ChalkosControlPlane and its Machines, whose writes the next
-	// reconcile must see, the infrastructure templates and their CRDs, and the cluster's secrets
-	// and kubeconfig Secrets, none of which the controller watches.
+	// APIReader reads uncached: the ChalkosControlPlane, its Machines and the ChalkosConfig of a
+	// Machine whose hook runs, whose writes the next reconcile must see, and the infrastructure
+	// templates and their CRDs and the cluster's secrets and kubeconfig Secrets, none of which the
+	// controller watches.
 	APIReader client.Reader
 	// Node reaches the machines.
 	Node node.Client

@@ -248,10 +248,11 @@ func lastVoterMessage(s *scope, m *clusterv1.Machine, why string) string {
 // everReached tells whether the bootstrap provider ever reached the Machine's machine to install
 // it, which may have given it certificates: its ChalkosConfig records the machine installed, an
 // install, or a maintenance-mode fingerprint. A Machine without its ChalkosConfig counts as
-// reached, since nothing tells otherwise.
+// reached, since nothing tells otherwise. It reads the ChalkosConfig uncached: an install the
+// bootstrap controller recorded just now must count.
 func (r *ChalkosControlPlaneReconciler) everReached(ctx context.Context, m *clusterv1.Machine) (bool, error) {
 	var cfg bootstrapv1.ChalkosConfig
-	err := r.Client.Get(ctx, client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}, &cfg)
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}, &cfg)
 	switch {
 	case apierrors.IsNotFound(err):
 		return true, nil
