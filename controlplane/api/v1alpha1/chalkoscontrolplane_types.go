@@ -252,11 +252,12 @@ type ChalkosControlPlaneStatus struct {
 	// ObservedFiles are the cluster-wide documents the control plane's Machines were made from,
 	// as a control-plane Machine installs them: spec.files with the fields the controllers fill
 	// from the Cluster, the Cluster document's endpoint, ipFamilies, podCIDRs and serviceCIDRs,
-	// but without a Machine's own Node document and without Secret documents. They are one YAML stream of JSON documents
-	// separated by ---, recorded once a Machine exists and none is out of date or being deleted.
-	// While the documents a new Machine would get differ from them, the controllers compare the
-	// two for changes to fields every node of the cluster holds alike, which hold every new
-	// Machine.
+	// but without a Machine's own Node document and without Secret documents, and with the
+	// image's defaults written out, so that an image defaulting a field every node holds alike
+	// differently shows as a change. They are one YAML stream of JSON documents separated by ---,
+	// recorded once a Machine exists and none is out of date or being deleted. While the
+	// documents a new Machine would get differ from them, the controllers compare the two for
+	// changes to fields every node of the cluster holds alike, which hold every new Machine.
 	// +optional
 	ObservedFiles string `json:"observedFiles,omitempty"`
 

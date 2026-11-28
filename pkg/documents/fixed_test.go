@@ -17,6 +17,7 @@ limitations under the License.
 package documents_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -75,6 +76,9 @@ func TestClusterWide(t *testing.T) {
 	if _, err := documents.ClusterWide(capiCluster(), "v1.37.1", []runtime.RawExtension{file(systemDisk)}); err == nil || !strings.Contains(err.Error(), "no Cluster document") {
 		t.Errorf("without a Cluster document: %v", err)
 	}
+	if _, err := documents.ClusterWide(&clusterv1.Cluster{}, "v1.37.1", []runtime.RawExtension{file(clusterFile)}); err == nil || !strings.Contains(err.Error(), "no control-plane endpoint") {
+		t.Errorf("without an endpoint: %v", err)
+	}
 }
 
 // A change of the Cluster's domain is a fixed change, named with both values, and so is one of
@@ -94,15 +98,17 @@ func TestFixedChanges(t *testing.T) {
 		"the default written": {`{"images": {"coredns": "a"}}`, `{"domain": "cluster.local", "images": {"coredns": "a"}}`, nil, "", ""},
 		"the version": {before, before, nil, "v1.38.0", ""},
 		"the domain": {before, `{"domain": "example.org", "images": {"coredns": "a"}}`, nil, "",
-			`the cluster-wide documents change Cluster/default spec.domain from "lab.local" to "example.org": every node of the cluster holds these fields alike, and a running cluster keeps them; revert the change`},
+			`The cluster-wide documents change Cluster/default spec.domain from "lab.local" to "example.org": every node of the cluster holds these fields alike, and a running cluster keeps them; revert it in spec.files or in the Cluster's clusterNetwork or controlPlaneEndpoint`},
 		"the pod range": {before, before, func(cl *clusterv1.Cluster) { cl.Spec.ClusterNetwork.Pods.CIDRBlocks = []string{"10.245.0.0/16"} }, "",
-			`the cluster-wide documents change Cluster/default spec.podCIDRs.ipv4 from "10.244.0.0/16" to "10.245.0.0/16": every node of the cluster holds these fields alike, and a running cluster keeps them; revert the change`},
+			`The cluster-wide documents change Cluster/default spec.podCIDRs.ipv4 from "10.244.0.0/16" to "10.245.0.0/16": every node of the cluster holds these fields alike, and a running cluster keeps them; revert it in spec.files or in the Cluster's clusterNetwork or controlPlaneEndpoint`},
+		"the domain and a service range": {before, `{"domain": "example.org", "images": {"coredns": "a"}}`, func(cl *clusterv1.Cluster) { cl.Spec.ClusterNetwork.Services.CIDRBlocks = []string{"10.97.0.0/16"} }, "",
+			`The cluster-wide documents change Cluster/default spec.domain from "lab.local" to "example.org", Cluster/default spec.serviceCIDRs.ipv4 from "10.96.0.0/12" to "10.97.0.0/16": every node of the cluster holds these fields alike, and a running cluster keeps them; revert it in spec.files or in the Cluster's clusterNetwork or controlPlaneEndpoint`},
 	} {
 		old, err := documents.ClusterWide(capiCluster(), "v1.37.1", []runtime.RawExtension{clusterOf(tc.old), file(systemDisk)})
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		observed, err := config.Encode(old)
+		observed, err := documents.Observed(c, old)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -118,7 +124,7 @@ func TestFixedChanges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		changes, err := documents.FixedChanges(c, observed.Text, cur)
+		changes, err := documents.FixedChanges(c, observed, cur)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -139,5 +145,45 @@ func TestFixedChanges(t *testing.T) {
 	}
 	if _, err := documents.FixedChanges(c, "{", cur); err == nil || !strings.Contains(err.Error(), "status.observedFiles") {
 		t.Errorf("unparsable observed documents: %v", err)
+	}
+}
+
+// Observed writes out the defaults of the image the Machines were made from, so an image that
+// defaults a fixed field differently changes it though the user leaves the field out; the
+// documents recorded without the defaults would hide that change.
+func TestObservedDefaults(t *testing.T) {
+	recording := builtinContract(t)
+	comparing := contractOf(t, func(schemas map[string][]byte) {
+		const name = "kubernetes.chalkos.dev_v1alpha1_Cluster.json"
+		edited := bytes.Replace(schemas[name], []byte(`"default": "cluster.local"`), []byte(`"default": "example.org"`), 1)
+		if bytes.Equal(edited, schemas[name]) {
+			t.Fatal("the Cluster schema has no default of cluster.local to change")
+		}
+		schemas[name] = edited
+	})
+	docs, err := documents.ClusterWide(capiCluster(), "v1.37.1", []runtime.RawExtension{clusterOf(`{"images": {"coredns": "a"}}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := documents.Observed(recording, docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(observed, `"domain":"cluster.local"`) {
+		t.Errorf("observed %s, want the default domain written out", observed)
+	}
+	changes, err := documents.FixedChanges(comparing, observed, docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Path != "spec.domain" || changes[0].Old != "cluster.local" || changes[0].New != "example.org" {
+		t.Errorf("changes %+v, want spec.domain from cluster.local to example.org", changes)
+	}
+	raw, err := config.Encode(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := documents.FixedChanges(comparing, raw.Text, docs); err != nil || len(changes) != 0 {
+		t.Errorf("without the defaults recorded: %+v, %v, want no change found", changes, err)
 	}
 }

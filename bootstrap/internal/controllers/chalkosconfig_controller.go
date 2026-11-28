@@ -578,16 +578,9 @@ func machineOf(m *clusterv1.Machine, cluster *clusterv1.Cluster) documents.Machi
 	if util.IsControlPlaneMachine(m) {
 		typ = documents.ControlPlane
 	}
-	network := cluster.Spec.ClusterNetwork
-	return documents.Machine{
-		Name:         m.Name,
-		Type:         typ,
-		ProviderID:   m.Spec.ProviderID,
-		Endpoint:     documents.Endpoint(cluster.Spec.ControlPlaneEndpoint.Host, cluster.Spec.ControlPlaneEndpoint.Port),
-		PodCIDRs:     network.Pods.CIDRBlocks,
-		ServiceCIDRs: network.Services.CIDRBlocks,
-		Version:      m.Spec.Version,
-	}
+	machine := documents.ClusterMachine(cluster, m.Name, typ, m.Spec.Version)
+	machine.ProviderID = m.Spec.ProviderID
+	return machine
 }
 
 // recordFingerprint appends the fingerprint seen at now unless it is the last one recorded,

@@ -18,6 +18,7 @@ package documents
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -33,27 +34,75 @@ import (
 // observedSource names the documents FixedChanges compares with in errors.
 const observedSource = "the ChalkosControlPlane's status.observedFiles"
 
-// ClusterWide returns the documents every control-plane Machine of cluster installs alike at the
-// Kubernetes version: files, a ChalkosControlPlane's spec.files, with the fields For fills from
-// the Cluster and the version, but without the Node document, which is each Machine's own, and
-// without Secret documents: they hold no fixed fields, and leaving them out keeps a second copy
-// of their values out of status.observedFiles.
-func ClusterWide(cluster *clusterv1.Cluster, version string, files []runtime.RawExtension) ([]config.Document, error) {
+// ClusterMachine is the Machine of the name, node type and Kubernetes version in cluster, with the
+// endpoint and the pod and service ranges of the Cluster API Cluster; it has no provider ID.
+func ClusterMachine(cluster *clusterv1.Cluster, name, typ, version string) Machine {
 	network := cluster.Spec.ClusterNetwork
-	docs, err := For(Machine{
-		Name:         cluster.Name,
-		Type:         ControlPlane,
+	return Machine{
+		Name:         name,
+		Type:         typ,
 		Endpoint:     Endpoint(cluster.Spec.ControlPlaneEndpoint.Host, cluster.Spec.ControlPlaneEndpoint.Port),
 		PodCIDRs:     network.Pods.CIDRBlocks,
 		ServiceCIDRs: network.Services.CIDRBlocks,
 		Version:      version,
-	}, files, nil)
+	}
+}
+
+// ClusterWide returns the documents every control-plane Machine of cluster installs alike at the
+// Kubernetes version: files, a ChalkosControlPlane's spec.files, with the fields For fills from
+// the Cluster and the version, but without the Node document, which is each Machine's own, and
+// without Secret documents: they hold no fixed fields, and leaving them out keeps a second copy
+// of their values out of status.observedFiles. A Cluster without a control-plane endpoint has
+// no such documents yet.
+func ClusterWide(cluster *clusterv1.Cluster, version string, files []runtime.RawExtension) ([]config.Document, error) {
+	if !cluster.Spec.ControlPlaneEndpoint.IsValid() {
+		return nil, errors.New("the Cluster has no control-plane endpoint yet")
+	}
+	docs, err := For(ClusterMachine(cluster, cluster.Name, ControlPlane, version), files, nil)
 	if err != nil {
 		return nil, err
 	}
 	return slices.DeleteFunc(docs, func(d config.Document) bool {
 		return d.IsSecret() || d.APIVersion == kubernetesAPI && d.Kind == "Node"
 	}), nil
+}
+
+// Defaulted returns docs with the defaults of the image's contract c filled in, for each document
+// of a kind c declares; a document of another kind stays as it is.
+func Defaulted(c sdk.Contract, docs []config.Document) ([]config.Document, error) {
+	if c.Image == nil || c.Image.Schemas == nil {
+		return nil, errors.New("the contract holds no schemas to take defaults from")
+	}
+	s := c.Image.Schemas
+	out := make([]config.Document, len(docs))
+	for i, d := range docs {
+		out[i] = d
+		if _, ok := s.Kind(d.APIVersion, d.Kind); !ok {
+			continue
+		}
+		filled, err := s.Default(d.Object)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", d, err)
+		}
+		out[i].Object = filled
+	}
+	return out, nil
+}
+
+// Observed is the text status.observedFiles records for docs, the documents ClusterWide returns,
+// with the defaults of the image's contract c written out. A field the user leaves out is then
+// recorded with the value the Machines got, so FixedChanges finds a change when a later image
+// defaults a fixed field differently.
+func Observed(c sdk.Contract, docs []config.Document) (string, error) {
+	filled, err := Defaulted(c, docs)
+	if err != nil {
+		return "", err
+	}
+	enc, err := config.Encode(filled)
+	if err != nil {
+		return "", err
+	}
+	return enc.Text, nil
 }
 
 // FixedChanges are the changes from observed, the text of a ChalkosControlPlane's
@@ -78,7 +127,7 @@ func DescribeFixed(changes []sdk.FixedChange) string {
 	for i, ch := range changes {
 		parts[i] = fmt.Sprintf("%s/%s %s from %s to %s", ch.Kind, ch.Name, ch.Path, jsonText(ch.Old), jsonText(ch.New))
 	}
-	return "the cluster-wide documents change " + strings.Join(parts, ", ") + ": every node of the cluster holds these fields alike, and a running cluster keeps them; revert the change"
+	return "The cluster-wide documents change " + strings.Join(parts, ", ") + ": every node of the cluster holds these fields alike, and a running cluster keeps them; revert it in spec.files or in the Cluster's clusterNetwork or controlPlaneEndpoint"
 }
 
 // jsonText is a document's value as JSON; null for one the document leaves out.
