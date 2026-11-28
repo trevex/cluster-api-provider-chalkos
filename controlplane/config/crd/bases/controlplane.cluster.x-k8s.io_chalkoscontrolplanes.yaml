@@ -451,8 +451,9 @@ spec:
                 minLength: 1
                 type: string
               versions:
-                description: Versions is the aggregated Kubernetes versions of the
-                  control plane's Machines.
+                description: |-
+                  Versions is the aggregated Kubernetes versions of the control plane's Machines, those being
+                  deleted included, oldest first.
                 items:
                   description: StatusVersion groups version-related status information.
                   properties:

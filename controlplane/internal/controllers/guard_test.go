@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -343,4 +344,21 @@ func TestUnreadableImageInSteadyState(t *testing.T) {
 	wantConditionReason(t, e.cp(), controlplanev1.ScalingUpCondition, metav1.ConditionFalse, controlplanev1.NotScalingUpReason, "cannot be read, so status.observedFiles is not recorded yet")
 	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionFalse, controlplanev1.NotRollingOutReason, "")
 	e.wantNoWrite()
+}
+
+// status.versions counts the Machines being deleted, as status.replicas does: they run until
+// they are gone, so a worker must not be newer than them either.
+func TestVersionsCountDeletingMachines(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, _ := e.controlPlanes(3)
+	e.deleteHeld(ms[2].Name)
+	e.mustReconcile()
+	cp := e.cp()
+	var sum int32
+	for _, v := range cp.Status.Versions {
+		sum += v.Replicas
+	}
+	if want := ptr.Deref(cp.Status.Replicas, 0); sum != want || len(e.deleted()) != 1 {
+		t.Errorf("versions %+v count %d Machines, want the %d replicas, the one being deleted included", cp.Status.Versions, sum, want)
+	}
 }

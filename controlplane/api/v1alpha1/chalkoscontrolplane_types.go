@@ -210,7 +210,8 @@ type ChalkosControlPlaneStatus struct {
 	// +optional
 	UpToDateReplicas *int32 `json:"upToDateReplicas,omitempty"`
 
-	// Versions is the aggregated Kubernetes versions of the control plane's Machines.
+	// Versions is the aggregated Kubernetes versions of the control plane's Machines, those being
+	// deleted included, oldest first.
 	// +optional
 	// +listType=map
 	// +listMapKey=version

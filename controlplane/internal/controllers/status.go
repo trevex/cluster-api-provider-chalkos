@@ -70,6 +70,11 @@ func setStatus(s *scope) {
 		}
 		counts[m.Spec.Version]++
 	}
+	// The Machines being deleted run until they are gone, so their versions count, as their
+	// replicas do: a worker newer than one of them waits.
+	for i := range s.deleting {
+		counts[s.deleting[i].Spec.Version]++
+	}
 	st.Selector = labels.SelectorFromSet(selectorLabels(s.cp, s.cluster.Name)).String()
 	// As with Cluster API's own control plane, the Machines being deleted count as replicas.
 	st.Replicas = ptr.To(n + int32(len(s.deleting)))
