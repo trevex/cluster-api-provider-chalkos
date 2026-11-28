@@ -233,7 +233,8 @@ on the Machines.
   step, so the infrastructure needs room for it.
 - `0` deletes the old Machine first and creates the replacement once the old one is gone. It
   needs three replicas or more, which the API enforces, because etcd keeps its quorum with one
-  member fewer only from three members on.
+  member fewer only from three members on. To scale below three, set `maxSurge` back to `1` in
+  the same change.
 
 Before either step, the control plane checks the replacement's documents against the target image.
 A refusal holds the roll with the reason `InvalidFiles`, so a change that cannot install creates no

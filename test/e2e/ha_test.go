@@ -312,7 +312,8 @@ func (l *lab) rollingOut(ctx context.Context) (*metav1.Condition, error) {
 	return meta.FindStatusCondition(cp.Status.Conditions, controlplanev1.RollingOutCondition), nil
 }
 
-// scaleControlPlane sets the replicas of the ChalkosControlPlane lab.
+// scaleControlPlane sets the replicas of the ChalkosControlPlane lab. Below three replicas it also
+// sets maxSurge back to its default of 1, since the API refuses maxSurge 0 with fewer than three.
 func (l *lab) scaleControlPlane(ctx context.Context, n int32) {
 	l.t.Helper()
 	cp := &controlplanev1.ChalkosControlPlane{}
@@ -321,6 +322,9 @@ func (l *lab) scaleControlPlane(ctx context.Context, n int32) {
 	}
 	original := cp.DeepCopy()
 	cp.Spec.Replicas = ptr.To(n)
+	if n < 3 {
+		cp.Spec.Rollout.Strategy.RollingUpdate.MaxSurge = nil
+	}
 	if err := l.c.Patch(ctx, cp, client.MergeFrom(original)); err != nil {
 		l.t.Fatal(err)
 	}
