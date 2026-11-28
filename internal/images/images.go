@@ -35,8 +35,8 @@ import (
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 )
 
-// Timeout bounds the read of an image's header and contract from its registry.
-const Timeout = 2 * time.Minute
+// timeout bounds the read of an image's header and contract from its registry.
+const timeout = 2 * time.Minute
 
 // maxArtifacts is how many image artifacts, and how many contracts, a Cache holds.
 const maxArtifacts = 64
@@ -51,7 +51,7 @@ func Keychain(ctx context.Context, r client.Reader, namespace string, ref *corev
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, &s); err != nil {
 		return nil, fmt.Errorf("the image pull Secret: %w", err)
 	}
-	return KeychainOf(&s)
+	return keychainOf(&s)
 }
 
 // Cache holds the artifacts of images read before, by reference and pull Secret, and the contracts
@@ -73,7 +73,7 @@ func (c *Cache) Image(ctx context.Context, n node.Client, ref, namespace string,
 	if a, ok := c.get(key); ok {
 		return a, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	a, err := n.Image(ctx, ref, kc)
 	if err != nil {

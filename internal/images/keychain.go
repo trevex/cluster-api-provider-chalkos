@@ -33,10 +33,10 @@ import (
 // longest key it falls under; one under no key is read anonymously.
 type keychain map[string]authn.AuthConfig
 
-// KeychainOf reads the credentials of a kubernetes.io/dockerconfigjson Secret. Of two keys that
+// keychainOf reads the credentials of a kubernetes.io/dockerconfigjson Secret. Of two keys that
 // name the same registry, such as docker.io and https://index.docker.io/v1/, the first in
 // lexical order counts.
-func KeychainOf(s *corev1.Secret) (keychain, error) {
+func keychainOf(s *corev1.Secret) (keychain, error) {
 	if s.Type != corev1.SecretTypeDockerConfigJson {
 		return nil, fmt.Errorf("the Secret %s/%s is of type %s, not %s", s.Namespace, s.Name, s.Type, corev1.SecretTypeDockerConfigJson)
 	}
