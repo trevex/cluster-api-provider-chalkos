@@ -361,7 +361,10 @@ an infrastructure provider:
 
 <!-- x-release-please-start-version -->
 ```sh
-clusterctl init --bootstrap chalkos:v0.3.0 --control-plane chalkos:v0.1.0 --infrastructure <provider>
+clusterctl init \
+  --bootstrap chalkos:v0.3.0 \
+  --control-plane chalkos:v0.3.0 \
+  --infrastructure <provider>
 ```
 <!-- x-release-please-end -->
 
