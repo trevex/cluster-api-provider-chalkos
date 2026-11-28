@@ -643,3 +643,57 @@ func TestRevokedPrunedDaily(t *testing.T) {
 		t.Errorf("%d prunes right after a failed one, want 2", got)
 	}
 }
+
+// A node whose own etcd member does not answer refuses to leave; the hook waits and says how to
+// remove the member through another control plane, after which the leave is done.
+func TestControlPlaneWithADeadEtcdMemberWaits(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[2].Name
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) {
+		n.EtcdLeave = func() error {
+			return connect.NewError(connect.CodeFailedPrecondition, "this node's etcd member "+gone+" does not answer at https://127.0.0.1:2379; pass --through-others to remove it through the other members").WithRemote()
+		}
+	})
+	e.atHook(gone)
+	e.mustReconcile()
+	if !e.hooked(gone) {
+		t.Fatal("a refused leave removed the hook")
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "chalkctl etcd remove-member "+gone)
+
+	// The operator removed the member through another control plane.
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.EtcdLeave = func() error { return nodetest.NotEtcdMember() } })
+	e.clock.Step(machineutil.HookRetry)
+	e.mustReconcile()
+	if e.hooked(gone) {
+		t.Error("the hook is kept once the member is gone")
+	}
+}
+
+// The text of the client's own errors for an unreachable node varies with how the dial failed;
+// the condition does not, so a waiting pass writes nothing.
+func TestWaitingHookIgnoresVaryingDialErrors(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[0].Name
+	dial := func(why string) error { return connect.NewError(connect.CodeUnavailable, "dial tcp "+addrs[gone]+":50000: "+why) }
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.Err = dial("connect: connection refused") })
+	for _, m := range ms[1:] {
+		e.fake.Update(addrs[m.Name], func(n *nodetest.Node) {
+			n.EtcdRemoveMember = func(member string) error { return nodetest.QuorumRefused(member) }
+		})
+	}
+	e.atHook(gone)
+	e.mustReconcile()
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "cannot be reached (unreachable)")
+	cpVersion, mVersion := e.cp().ResourceVersion, e.machine(gone).ResourceVersion
+	for _, why := range []string{"i/o timeout", "connect: no route to host"} {
+		e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.Err = dial(why) })
+		e.clock.Step(machineutil.HookRetry)
+		e.mustReconcile()
+	}
+	if e.cp().ResourceVersion != cpVersion || e.machine(gone).ResourceVersion != mVersion {
+		t.Error("a waiting pass wrote the ChalkosControlPlane or the Machine")
+	}
+}

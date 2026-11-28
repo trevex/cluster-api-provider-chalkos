@@ -198,3 +198,20 @@ func TestErrors(t *testing.T) {
 		t.Errorf("Unreachable = %v", err)
 	}
 }
+
+// etcd's last voter does not leave, as chalkd's quorum guard refuses it; a learner beside it is no
+// voter.
+func TestFakeLastVoterDoesNotLeave(t *testing.T) {
+	ctx := context.Background()
+	var s clustersecrets.Secrets
+	f := New()
+	members := []*kubernetesv1.EtcdMember{{Id: 0x1a, Name: "cp1"}, {Id: 0x2b, Name: "cp2", Learner: true}}
+	f.Set("10.0.0.1", Node{Name: "cp1", Members: members})
+	err := f.EtcdLeave(ctx, "10.0.0.1", s, "cp1")
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !client.FromNode(err) || sdkkubernetes.NotEtcdMember(err) {
+		t.Errorf("EtcdLeave of the last voter = %v, want the node's refusal", err)
+	}
+	if n, _ := f.Node("10.0.0.1"); n.Left || len(n.Members) != 2 {
+		t.Errorf("left %v, members %v after a refused leave", n.Left, n.Members)
+	}
+}

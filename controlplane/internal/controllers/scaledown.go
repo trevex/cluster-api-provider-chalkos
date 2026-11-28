@@ -91,13 +91,16 @@ func (r *ChalkosControlPlaneReconciler) etcdProblem(ctx context.Context, s *scop
 			callCtx, cancel := context.WithTimeout(passCtx, machineutil.HookCallTimeout)
 			members, err := r.Node.EtcdMembers(callCtx, addr, sec, m.Name)
 			cancel()
+			if err != nil {
+				ctrl.LoggerFrom(ctx).Info("Listing etcd's members failed", "through", m.Name, "error", err.Error())
+			}
 			switch {
 			case err == nil:
 				return membersProblem(members, s.machines, s.deleting)
 			case node.TryNextControlPlane(err):
-				tried = append(tried, fmt.Sprintf("%s: %v", m.Name, err))
+				tried = append(tried, fmt.Sprintf("%s: %s", m.Name, conditionError(err)))
 			default:
-				return fmt.Sprintf("listing etcd's members through %s: %v", m.Name, err)
+				return fmt.Sprintf("listing etcd's members through %s: %s", m.Name, conditionError(err))
 			}
 		}
 	}
@@ -135,7 +138,8 @@ func membersProblem(members []*kubernetesv1.EtcdMember, machines, deleting []clu
 		case mem.GetLearner():
 			return fmt.Sprintf("the member %s is a learner", name)
 		case mem.GetUnhealthy() != "":
-			return fmt.Sprintf("the member %s is unhealthy: %s", name, mem.GetUnhealthy())
+			// Without etcd's error, whose text varies from one health check to the next.
+			return fmt.Sprintf("the member %s is unhealthy", name)
 		case !names[mem.GetName()]:
 			return fmt.Sprintf("the member %q is no Machine's", name)
 		}

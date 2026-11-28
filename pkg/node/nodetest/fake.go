@@ -72,7 +72,8 @@ type Node struct {
 	// in hex, as etcd does, refuses the node's own, drops it from every node's Members, and fails
 	// with connect.CodeNotFound when there is none; a learner that has not started has no name. A
 	// leave drops the node's member from every node's Members, sets Left, and clears the node's
-	// own Members.
+	// own Members; it is refused while the node's member is etcd's only voter, as chalkd's quorum
+	// guard refuses it.
 	Members []*kubernetesv1.EtcdMember
 	// Left is set once the node left etcd; a later EtcdLeave is refused with NotEtcdMember, as
 	// chalkd refuses it.
@@ -265,6 +266,9 @@ func (f *Fake) EtcdLeave(_ context.Context, addr string, _ clustersecrets.Secret
 		if n.Left {
 			return NotEtcdMember()
 		}
+		if lastVoter(n.Members, name) {
+			return refusal(connect.CodeFailedPrecondition, "%s is etcd's last voter", name)
+		}
 		f.dropMembers(func(m *kubernetesv1.EtcdMember) bool { return m.GetName() == name })
 		n.Left, n.Members = true, nil
 		return nil
@@ -311,6 +315,21 @@ func (f *Fake) EtcdRemoveMember(_ context.Context, addr string, _ clustersecrets
 	}
 	f.Update(addr, func(n *Node) { n.Removed = append(n.Removed, member) })
 	return nil
+}
+
+// lastVoter tells whether the member name is the only voter among members.
+func lastVoter(members []*kubernetesv1.EtcdMember, name string) bool {
+	self := false
+	for _, m := range members {
+		switch {
+		case m.GetLearner():
+		case m.GetName() == name:
+			self = true
+		default:
+			return false
+		}
+	}
+	return self
 }
 
 // dropMembers drops the members gone from etcd from every node's Members. The caller holds f.mu.

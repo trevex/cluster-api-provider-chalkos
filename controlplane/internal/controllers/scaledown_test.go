@@ -21,7 +21,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -179,23 +181,68 @@ func TestScaleUpWaitsForEtcdWhileAMachineIsDeleted(t *testing.T) {
 	e.wantMachines(4)
 }
 
-// A single control plane being deleted gets its replacement, which joins its etcd, and only then
-// leaves etcd and is revoked through it, also when Cluster API waits for the hook at once.
+// wantNoWarning fails the test when rec recorded a Warning event, and drains it.
+func wantNoWarning(t *testing.T, rec *events.FakeRecorder) {
+	t.Helper()
+	for ev := nextEvent(rec); ev != ""; ev = nextEvent(rec) {
+		if strings.HasPrefix(ev, corev1.EventTypeWarning) {
+			t.Errorf("event %q while the hook waits for its replacement", ev)
+		}
+	}
+}
+
+// wantReplacementWait fails the test unless the Machine name keeps its hook without a leave, and
+// the ScalingDown condition says it waits for its replacement and names the break-glass.
+func (e *env) wantReplacementWait(name, addr string) {
+	e.t.Helper()
+	if n, _ := e.fake.Node(addr); n.Leaves != 0 || !e.hooked(name) {
+		e.t.Fatalf("the only voter: %d leaves, hook %v, before its replacement joined", n.Leaves, e.hooked(name))
+	}
+	wantConditionReason(e.t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason,
+		"waits for its replacement control plane to join etcd")
+	wantConditionReason(e.t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason,
+		machineutil.HookAnnotation)
+}
+
+// A single control plane being deleted gets its replacement, and only once the replacement joined
+// its etcd as a voter does it leave etcd and is revoked through it, also when Cluster API waits
+// for the hook at once. While it waits, it records no warnings and its passes write nothing.
 func TestSingleControlPlaneIsReplaced(t *testing.T) {
 	e := newEnv(t, 1, true)
+	rec := events.NewFakeRecorder(100)
+	e.r.Recorder = rec
 	ms, addrs := e.controlPlanes(1)
 	old := ms[0].Name
 	e.atHook(old)
 	e.mustReconcile()
-	if n, _ := e.fake.Node(addrs[old]); n.Leaves != 0 || !e.hooked(old) {
-		t.Fatalf("the only control plane: %d leaves, hook %v, before its replacement exists", n.Leaves, e.hooked(old))
-	}
-	ms2 := e.wantMachines(2)
-	repl := other(ms2, old)
-	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "replacement")
+	e.wantReplacementWait(old, addrs[old])
+	repl := other(e.wantMachines(2), old)
 
-	e.provision(repl, "10.0.0.2", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+	// The replacement exists, has no address yet, and then joins etcd as a learner.
+	e.mustReconcile()
+	e.wantReplacementWait(old, addrs[old])
+	e.provision(repl, "10.0.0.2", kubernetesv1.Phase_PHASE_JOINING)
 	addrs[repl.Name] = "10.0.0.2"
+	learning := []*kubernetesv1.EtcdMember{
+		{Id: 1, Name: old, PeerUrls: []string{"https://" + addrs[old] + ":2380"}},
+		{Id: 2, Name: repl.Name, Learner: true, PeerUrls: []string{"https://10.0.0.2:2380"}},
+	}
+	for _, addr := range []string{addrs[old], "10.0.0.2"} {
+		e.fake.Update(addr, func(n *nodetest.Node) { n.Members = learning })
+	}
+	if res := e.mustReconcile(); res.RequeueAfter == 0 || res.RequeueAfter > machineutil.HookRetry {
+		t.Errorf("reconcile = %+v, want a retry while the replacement joins", res)
+	}
+	e.wantReplacementWait(old, addrs[old])
+	wantNoWarning(t, rec)
+	cpVersion, mVersion := e.cp().ResourceVersion, e.machine(old).ResourceVersion
+	e.clock.Step(machineutil.HookRetry)
+	e.mustReconcile()
+	if e.cp().ResourceVersion != cpVersion || e.machine(old).ResourceVersion != mVersion {
+		t.Error("a waiting pass wrote the ChalkosControlPlane or the Machine")
+	}
+
+	e.setStatus("10.0.0.2", kubernetesv1.Phase_PHASE_BOOTSTRAPPED, true)
 	e.setMembers([]clusterv1.Machine{ms[0], repl}, addrs)
 	e.mustReconcile()
 	if n, _ := e.fake.Node(addrs[old]); n.Leaves != 1 {
@@ -208,6 +255,58 @@ func TestSingleControlPlaneIsReplaced(t *testing.T) {
 		t.Error("the hook is kept")
 	}
 }
+
+// The only voter, waiting for its replacement, does not keep the hook of a replacement that never
+// joined: the replacement's learner is removed by its ID through the only voter and revoked, the
+// next replacement joins, and only then does the first Machine leave etcd.
+func TestStuckReplacementIsRemovedWhileTheOnlyVoterWaits(t *testing.T) {
+	e := newEnv(t, 1, true)
+	ms, addrs := e.controlPlanes(1)
+	old := ms[0].Name
+	e.atHook(old)
+	e.mustReconcile()
+	stuck := other(e.wantMachines(2), old)
+	e.provision(stuck, "10.0.0.2", kubernetesv1.Phase_PHASE_JOINING)
+	e.fake.Update(addrs[old], func(n *nodetest.Node) {
+		n.Members = []*kubernetesv1.EtcdMember{
+			{Id: 1, Name: old, PeerUrls: []string{"https://" + addrs[old] + ":2380"}},
+			{Id: 0xbeef, Learner: true, PeerUrls: []string{"https://10.0.0.2:2380"}},
+		}
+	})
+	e.fake.Update("10.0.0.2", func(n *nodetest.Node) { n.Err = nodetest.Unreachable("10.0.0.2") })
+	e.mustReconcile()
+	e.wantReplacementWait(old, addrs[old])
+
+	e.atHook(stuck.Name)
+	e.mustReconcile()
+	if n, _ := e.fake.Node(addrs[old]); !slices.Equal(n.Removed, []string{"beef"}) || !slices.Equal(n.Revoked, []string{stuck.Name}) {
+		t.Fatalf("through %s: removed %v, revoked %v, want the stuck learner removed by its ID and revoked", old, n.Removed, n.Revoked)
+	}
+	if e.hooked(stuck.Name) {
+		t.Fatal("the stuck replacement keeps its hook")
+	}
+	e.release(stuck.Name)
+
+	e.mustReconcile()
+	e.wantReplacementWait(old, addrs[old])
+	var next clusterv1.Machine
+	for _, m := range e.wantMachines(2) {
+		if m.Name != old {
+			next = m
+		}
+	}
+	e.provision(next, "10.0.0.3", kubernetesv1.Phase_PHASE_BOOTSTRAPPED)
+	addrs[next.Name] = "10.0.0.3"
+	e.setMembers([]clusterv1.Machine{ms[0], next}, addrs)
+	e.mustReconcile()
+	if n, _ := e.fake.Node(addrs[old]); n.Leaves != 1 || e.hooked(old) {
+		t.Errorf("the first Machine once the next replacement joined: %d leaves, hook %v", n.Leaves, e.hooked(old))
+	}
+	if n, _ := e.fake.Node("10.0.0.3"); !slices.Equal(n.Revoked, []string{old}) {
+		t.Errorf("revoked %v through the replacement", n.Revoked)
+	}
+}
+
 
 func TestMembersProblem(t *testing.T) {
 	machines := func(names ...string) []clusterv1.Machine {

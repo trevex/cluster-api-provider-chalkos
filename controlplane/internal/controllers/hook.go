@@ -91,34 +91,65 @@ var errNoAddress = errors.New("the Machine has no InternalIP")
 // at a time, oldest deletion first. A Machine whose machine was never reached to be installed
 // loses its hook at once. Once Cluster API waits for the hook, a Machine leaves etcd and is
 // revoked through another control plane, and loses its hook. The last Machine of a control plane
-// being deleted, or not initialized, leaves no etcd and is not revoked; that of an initialized
-// control plane that stays waits for its replacement. Every step can be repeated; one that cannot finish keeps the hook and is tried
-// again after machineutil.HookRetry.
+// being deleted, or not initialized, leaves no etcd and is not revoked. A Machine of an
+// initialized control plane whose peers hold no voting etcd member is etcd's last voter: it holds
+// until a peer joined etcd as a voter, such as its replacement, which scaleUp creates. A held hook
+// changes nothing, so the next Machine's hook runs meanwhile: a replacement that never joins and is
+// deleted in turn must not wait for the Machine it was to replace. Every step can be repeated; one
+// that cannot finish keeps the hook and is tried again after machineutil.HookRetry.
 func (r *ChalkosControlPlaneReconciler) reconcileHooks(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
 	pending := slices.DeleteFunc(slices.Clone(s.deleting), func(m clusterv1.Machine) bool { return !machineutil.HasHook(&m) })
-	if len(pending) == 0 {
-		return ctrl.Result{}, nil
-	}
 	slices.SortFunc(pending, func(a, b clusterv1.Machine) int {
 		if c := a.DeletionTimestamp.Compare(b.DeletionTimestamp.Time); c != 0 {
 			return c
 		}
 		return cmp.Compare(a.Name, b.Name)
 	})
-	m := &pending[0]
+	var held, heldReason string
+	for i := range pending {
+		res, hold, err := r.reconcileHook(ctx, s, &pending[i], sec)
+		if err != nil {
+			return res, err
+		}
+		if !hold {
+			if s.removing == "" {
+				// The hook finished: the conditions report the Machine that holds, if one does.
+				s.removing, s.removingReason = held, heldReason
+			}
+			if held != "" {
+				res = earliest(res, ctrl.Result{RequeueAfter: machineutil.HookRetry})
+			}
+			return res, nil
+		}
+		if held == "" {
+			held, heldReason = s.removing, s.removingReason
+		}
+	}
+	if held == "" {
+		return ctrl.Result{}, nil
+	}
+	// No watch reports a peer that joined etcd as a voter; the requeue does.
+	s.removing, s.removingReason = held, heldReason
+	return ctrl.Result{RequeueAfter: machineutil.HookRetry}, nil
+}
+
+// reconcileHook runs one step of the pre-terminate hook of the Machine m, as reconcileHooks
+// describes. hold is set when the Machine is etcd's last voter and waits for a peer to join etcd
+// as one, having changed nothing.
+func (r *ChalkosControlPlaneReconciler) reconcileHook(ctx context.Context, s *scope, m *clusterv1.Machine, sec clustersecrets.Secrets) (_ ctrl.Result, hold bool, _ error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("machine", m.Name)
 	reached, err := r.everReached(ctx, m)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, false, err
 	}
 	if !reached {
 		log.Info("Removed the pre-terminate hook of a Machine whose machine was never reached")
-		return ctrl.Result{}, machineutil.RemoveHook(ctx, r.Client, m)
+		return ctrl.Result{}, false, machineutil.RemoveHook(ctx, r.Client, m)
 	}
 	if !machineutil.WaitingForHook(m) {
 		// The Machines' watch reconciles again once Cluster API waits for the hook.
 		s.removing = fmt.Sprintf("the Machine %s is drained before it leaves etcd", m.Name)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, false, nil
 	}
 	var peers []clusterv1.Machine
 	for _, ms := range [][]clusterv1.Machine{s.machines, s.deleting} {
@@ -128,23 +159,24 @@ func (r *ChalkosControlPlaneReconciler) reconcileHooks(ctx context.Context, s *s
 			}
 		}
 	}
-	if len(peers) == 0 && s.initialized() && s.cp.DeletionTimestamp.IsZero() {
-		// The control plane's only Machine goes while the control plane stays: it keeps the
-		// cluster's etcd until its replacement, which scaleUp creates, joined it. The replacement's
-		// creation reconciles again.
-		s.removing = fmt.Sprintf("the Machine %s waits for its replacement control plane to join etcd", m.Name)
-		return ctrl.Result{}, nil
-	}
-	if len(peers) > 0 {
-		// The calls to the nodes share one deadline; the writes to the management cluster do not.
-		passCtx, cancel := context.WithTimeout(ctx, machineutil.HookPassTimeout)
-		defer cancel()
-		if !r.leaveEtcd(passCtx, s, m, peers, sec) || !r.revokeControlPlane(passCtx, s, m, peers, sec) {
-			return ctrl.Result{RequeueAfter: machineutil.HookRetry}, nil
+	// The calls to the nodes share one deadline; the writes to the management cluster do not.
+	passCtx, cancel := context.WithTimeout(ctx, machineutil.HookPassTimeout)
+	defer cancel()
+	if s.initialized() && (len(peers) > 0 || s.cp.DeletionTimestamp.IsZero()) {
+		voter, why, err := r.votingPeer(passCtx, s, m, peers, sec)
+		if err != nil {
+			return ctrl.Result{}, false, err
+		}
+		if !voter {
+			s.removing, s.removingReason = lastVoterMessage(s, m, why), controlplanev1.ScalingDownReason
+			return ctrl.Result{}, true, nil
 		}
 	}
+	if len(peers) > 0 && (!r.leaveEtcd(passCtx, s, m, peers, sec) || !r.revokeControlPlane(passCtx, s, m, peers, sec)) {
+		return ctrl.Result{RequeueAfter: machineutil.HookRetry}, false, nil
+	}
 	if err := machineutil.RemoveHook(ctx, r.Client, m); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, false, err
 	}
 	if len(peers) == 0 {
 		machineutil.Event(r.Recorder, s.cp, m, corev1.EventTypeNormal, "ControlPlaneRemoved", "RemoveHook",
@@ -156,7 +188,82 @@ func (r *ChalkosControlPlaneReconciler) reconcileHooks(ctx context.Context, s *s
 	log.Info("Removed the pre-terminate hook", "last", len(peers) == 0)
 	s.removing, s.removingReason = "", ""
 	// The next Machine's hook, if any, runs at the next reconcile, which the Machine's patch starts.
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, false, nil
+}
+
+// votingPeer tells whether one of the peers of the Machine m holds a voting etcd member: a peer
+// that is not being deleted joined the cluster, or a member that a peer's name names is started,
+// healthy and no learner, as the first of m and its peers that lists etcd's members answers. why
+// says, when none answers, what each answered; empty otherwise.
+func (r *ChalkosControlPlaneReconciler) votingPeer(ctx context.Context, s *scope, m *clusterv1.Machine, peers []clusterv1.Machine, sec clustersecrets.Secrets) (voter bool, why string, _ error) {
+	if len(peers) == 0 {
+		return false, "", nil
+	}
+	names := map[string]bool{}
+	for i := range peers {
+		p := &peers[i]
+		names[p.Name] = true
+		if !s.isDeleting(p.Name) {
+			ok, err := r.joined(ctx, s, p, sec)
+			if err != nil || ok {
+				return ok, "", err
+			}
+		}
+	}
+	var tried []string
+	for _, c := range append([]clusterv1.Machine{*m}, peers...) {
+		addr := machineutil.InternalIP(&c)
+		if addr == "" {
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, machineutil.HookCallTimeout)
+		members, err := r.Node.EtcdMembers(callCtx, addr, sec, c.Name)
+		cancel()
+		if err != nil {
+			ctrl.LoggerFrom(ctx).Info("Listing etcd's members failed", "machine", m.Name, "through", c.Name, "error", err.Error())
+			tried = append(tried, fmt.Sprintf("%s: %s", c.Name, conditionError(err)))
+			continue
+		}
+		return slices.ContainsFunc(members, func(mem *kubernetesv1.EtcdMember) bool {
+			return names[mem.GetName()] && !mem.GetLearner() && mem.GetUnhealthy() == ""
+		}), "", nil
+	}
+	if len(tried) == 0 {
+		tried = append(tried, "no control-plane Machine has an InternalIP")
+	}
+	return false, strings.Join(tried, "; "), nil
+}
+
+// lastVoterMessage is what the hook of the Machine m, etcd's last voter, holds for: its
+// replacement, or the other Machines of a control plane being deleted. why is what the control
+// planes answered when none listed etcd's members. A hold that may last for good names the
+// break-glass.
+func lastVoterMessage(s *scope, m *clusterv1.Machine, why string) string {
+	breakGlass := fmt.Sprintf("removing the annotation %s deletes the Machine without taking it out of etcd and revoking it, which loses the cluster's etcd unless another member votes",
+		machineutil.HookAnnotation)
+	switch {
+	case why != "":
+		return fmt.Sprintf("the Machine %s waits for a control plane to list etcd's members, to tell whether another one votes in etcd: %s; %s", m.Name, why, breakGlass)
+	case s.cp.DeletionTimestamp.IsZero():
+		return fmt.Sprintf("the Machine %s waits for its replacement control plane to join etcd; %s", m.Name, breakGlass)
+	}
+	return fmt.Sprintf("the Machine %s is etcd's last voter and leaves after the other Machines", m.Name)
+}
+
+// conditionError is err as a condition's message tells it. A message that changes from one pass
+// to the next writes the status, which reconciles again at once; the text of the client's own
+// error for a node it cannot reach, and of a node's own Unavailable or DeadlineExceeded, varies
+// with how the call failed, so these read only as what they mean. The log has them in full.
+func conditionError(err error) string {
+	switch code := connect.CodeOf(err); {
+	case errors.Is(err, errNoAddress):
+		return err.Error()
+	case node.Unreachable(err):
+		return "unreachable"
+	case code == connect.CodeUnavailable || code == connect.CodeDeadlineExceeded:
+		return "the node answers " + code.String()
+	}
+	return err.Error()
 }
 
 // everReached tells whether the bootstrap provider ever reached the Machine's machine to install
@@ -191,8 +298,15 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 	case err == nil, sdkkubernetes.NotEtcdMember(err):
 		return true
 	case !errors.Is(err, errNoAddress) && !node.Unreachable(err):
-		// Only the node itself may answer for its leave: another control plane is not asked.
-		return r.hookWaits(s, m, "EtcdLeave", controlplanev1.ScalingDownReason, fmt.Sprintf("the Machine %s does not leave etcd: %v", m.Name, err))
+		// Only the node itself may answer for its leave: another control plane is not asked. A node
+		// whose own etcd member does not answer refuses to leave through the other members alone;
+		// once someone removed that member through them, the node is no member and the leave done.
+		ctrl.LoggerFrom(ctx).Info("The node does not leave etcd", "machine", m.Name, "error", err.Error())
+		msg := fmt.Sprintf("the Machine %s does not leave etcd: %s", m.Name, conditionError(err))
+		if connect.CodeOf(err) == connect.CodeFailedPrecondition {
+			msg += fmt.Sprintf("; when its own etcd member does not answer, remove the member through another control plane with chalkctl etcd remove-member %s, and the hook goes on", m.Name)
+		}
+		return r.hookWaits(s, m, "EtcdLeave", controlplanev1.ScalingDownReason, msg)
 	}
 	var tried []string
 	for i := range peers {
@@ -206,7 +320,8 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 			ctrl.LoggerFrom(ctx).Info("Removed the etcd member of an unreachable Machine", "machine", m.Name, "through", p.Name, "error", err.Error())
 			return true
 		}
-		tried = append(tried, fmt.Sprintf("%s: %v", p.Name, perr))
+		ctrl.LoggerFrom(ctx).Info("A control plane did not remove the etcd member", "machine", m.Name, "through", p.Name, "error", perr.Error())
+		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, conditionError(perr)))
 		if connect.CodeOf(perr) == connect.CodeFailedPrecondition && !sdkkubernetes.NotEtcdMember(perr) {
 			// An etcd member refused the removal, as for etcd's quorum: every other member guards
 			// it the same way.
@@ -217,7 +332,7 @@ func (r *ChalkosControlPlaneReconciler) leaveEtcd(ctx context.Context, s *scope,
 		tried = append(tried, "no other control-plane Machine has an InternalIP")
 	}
 	return r.hookWaits(s, m, "EtcdRemoveMember", controlplanev1.ScalingDownReason, fmt.Sprintf(
-		"the Machine %s cannot be reached (%v), and no other control plane removes its etcd member: %s", m.Name, err, strings.Join(tried, "; ")))
+		"the Machine %s cannot be reached (%s), and no other control plane removes its etcd member: %s", m.Name, conditionError(err), strings.Join(tried, "; ")))
 }
 
 // removeMember removes the etcd member of the Machine's node through the control plane via at
@@ -296,7 +411,8 @@ func (r *ChalkosControlPlaneReconciler) revokeControlPlane(ctx context.Context, 
 					"after which PruneRevoked drops the nodes revoked before them, or remove the annotation %s to delete the Machine without revoking its node",
 				m.Name, err, machineutil.HookAnnotation))
 		}
-		tried = append(tried, fmt.Sprintf("%s: %v", p.Name, err))
+		ctrl.LoggerFrom(ctx).Info("A control plane did not revoke the node", "machine", m.Name, "through", p.Name, "error", err.Error())
+		tried = append(tried, fmt.Sprintf("%s: %s", p.Name, conditionError(err)))
 	}
 	if len(tried) == 0 {
 		tried = append(tried, "no other control-plane Machine has an InternalIP")
