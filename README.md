@@ -97,14 +97,23 @@ Some Machines skip the steps:
   once: it never received certificates.
 - The last Machine of a ChalkosControlPlane that is being deleted, or that is not initialized,
   neither leaves etcd nor is revoked.
-- The only Machine of an initialized one-replica control plane keeps its hook until its
-  replacement has joined etcd. The control plane creates the replacement as soon as the Machine
-  is deleted, so deleting that Machine, or a MachineHealthCheck remediating it, replaces it.
+- A control-plane Machine that is etcd's last voter, such as the only Machine of an initialized
+  one-replica control plane, keeps its hook until another Machine has joined etcd as a healthy
+  voting member. The control plane creates the replacement as soon as the Machine is deleted, so
+  deleting that Machine, or a MachineHealthCheck remediating it, replaces it. The waiting Machine
+  holds back no other hook: a replacement that never joins can be deleted, its etcd learner is
+  removed through the waiting Machine, and the control plane creates the next replacement.
 - Deleting the Cluster removes every hook at once: nothing leaves etcd and nothing is revoked.
 
 A step that cannot finish, such as a leave that etcd refuses for its quorum or a revocation that
 no control plane answers, keeps the hook, records a Warning event and runs again 30 seconds later.
-Every step can be repeated safely.
+Every step can be repeated safely. A Machine that waits as etcd's last voter records no Warning
+event; it checks again every 30 seconds.
+
+A node whose own etcd member does not answer, for example after it lost its pinned address,
+refuses to leave etcd, and its hook waits. Remove the member through another control plane with
+`chalkctl etcd remove-member <node>`, or with `chalkctl etcd leave <node> --through-others`. The
+node is then no etcd member, and the hook goes on with the revocation.
 
 ### What the conditions say
 
@@ -121,7 +130,7 @@ The ChalkosControlPlane reports control-plane removals in the condition `Scaling
 
 | Status | Reason | Meaning |
 | --- | --- | --- |
-| True | `ScalingDown` | A Machine is being removed. The message names the Machine and the step it waits on: its drain ("is drained before it leaves etcd"), a leave that its node refuses, an etcd member that no other control plane removes, a revocation that no control plane answers, or the replacement of a one-replica control plane ("waits for its replacement control plane to join etcd"). |
+| True | `ScalingDown` | A Machine is being removed. The message names the Machine and the step it waits on: its drain ("is drained before it leaves etcd"), a leave that its node refuses, an etcd member that no other control plane removes, a revocation that no control plane answers, or a Machine that is etcd's last voter: it "waits for its replacement control plane to join etcd", or "waits for a control plane to list etcd's members" when none answers. The messages of a leave refused as a node's own etcd member does not answer, and of a wait that may last for good, name what to run or the annotation to remove. A node that cannot be reached reads as "unreachable"; the manager's log has the full error. |
 | True | `RevokedListFull` | The Machine's node is not revoked because the list of revoked nodes has no room, even after the provider pruned it. |
 | False | `WaitingToScaleDown` | The control plane has more Machines than `replicas`, but may not delete one yet: a Machine has not joined the cluster, or etcd does not list one healthy voting member per Machine. The message says which. |
 | False | `NotScalingDown` | No Machine is being removed. |
@@ -163,8 +172,9 @@ kubectl annotate machine <machine> pre-terminate.delete.hook.machine.cluster.x-k
 Cluster API then deletes the Machine's infrastructure without either step. A control plane
 removed this way stays an etcd member until `chalkctl etcd remove-member <node>` removes it, and
 its node is not revoked: its certificates stay valid until they expire, unless
-`chalkctl node revoke <node>` revokes it. The provider adds no hook to a Machine that is being
-deleted, so the annotation stays removed.
+`chalkctl node revoke <node>` revokes it. Removing the hook of a Machine that waits as etcd's
+last voter deletes the cluster's last voting etcd member, and the cluster's state with it. The
+provider adds no hook to a Machine that is being deleted, so the annotation stays removed.
 
 ## Install
 
