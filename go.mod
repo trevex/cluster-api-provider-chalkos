@@ -6,7 +6,7 @@ require (
 	connectrpc.com/connect/v2 v2.0.2
 	github.com/go-logr/logr v1.4.4
 	github.com/google/go-containerregistry v0.22.1
-	github.com/trevex/chalkos v0.10.0
+	github.com/trevex/chalkos v0.11.0
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.2
 	k8s.io/apiextensions-apiserver v0.37.2

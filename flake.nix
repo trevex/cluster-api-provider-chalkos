@@ -5,7 +5,7 @@
   # chalkos builds for itself, and both repositories move together when chalkos's pin is bumped.
   # The input names the chalkos release that go.mod requires, and Renovate bumps both together.
   inputs = {
-    chalkos.url = "github:trevex/chalkos/v0.10.0";
+    chalkos.url = "github:trevex/chalkos/v0.11.0";
     nixpkgs.follows = "chalkos/nixpkgs";
     go-overlay.follows = "chalkos/go-overlay";
   };
