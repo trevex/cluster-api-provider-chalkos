@@ -24,8 +24,8 @@ What works:
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
 - Scaling the control plane down, one Machine at a time, oldest first, once every Machine joined
   and etcd lists one healthy member per Machine.
-- Replacing the only Machine of a one-replica control plane, as a MachineHealthCheck does: the
-  replacement joins etcd before the old Machine leaves it.
+- Replacing the only Machine of a one-replica control plane by deleting it: the replacement
+  joins etcd before the old Machine leaves it.
 - Deleting a cluster: the control plane waits until the cluster's worker Machines and
   MachinePools are deleted, then deletes its own Machines. Deleting the Cluster deletes them in
   this order, and no node leaves etcd or is revoked. A ChalkosControlPlane deleted on its own
@@ -36,15 +36,21 @@ What does not work yet:
 - Rollouts and upgrades of the control plane. A changed `spec.version` marks the Machines as not
   up to date, and a changed `spec.image` does not affect Machines that exist; neither replaces a
   Machine.
+- Remediation of control-plane Machines by a MachineHealthCheck. Cluster API leaves an unhealthy
+  Machine to its owner, and marks it with `OwnerRemediated` set to `False`; the
+  ChalkosControlPlane does not act on that, so the Machine stays. Delete the Machine to replace it.
+  A MachineHealthCheck remediates the workers of a MachineDeployment as usual: their MachineSet
+  deletes the unhealthy Machine, whose hook revokes its node, and creates a new one.
 - Rotation of the cluster's CAs and keys. The kubeconfig Secret's client certificate is the only
   credential the providers renew.
 
 The end-to-end test covers one control plane and one worker on KubeVirt through
 [CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt), with the workers scaled
-to two and back to one. Scaling the control plane down is covered by unit tests only. Other
-infrastructure providers, ClusterClass topologies and worker rollouts are untested. An infrastructure provider
-must report each Machine's `providerID` and an `InternalIP` address that the managers can reach:
-the providers talk to chalkd on that address.
+to two and back to one; `make e2e-ha` scales the control plane to three and back to one, as
+[End-to-end test](#end-to-end-test) describes. Other infrastructure providers, ClusterClass
+topologies and worker rollouts are untested. An infrastructure provider must report each
+Machine's `providerID` and an `InternalIP` address that the managers can reach: the providers
+talk to chalkd on that address.
 
 ## How the providers fit together
 
@@ -100,9 +106,9 @@ Some Machines skip the steps:
 - A control-plane Machine that is etcd's last voter, such as the only Machine of an initialized
   one-replica control plane, keeps its hook until another Machine has joined etcd as a healthy
   voting member. The control plane creates the replacement as soon as the Machine is deleted, so
-  deleting that Machine, or a MachineHealthCheck remediating it, replaces it. The waiting Machine
-  holds back no other hook: a replacement that never joins can be deleted, its etcd learner is
-  removed through the waiting Machine, and the control plane creates the next replacement.
+  deleting that Machine replaces it. The waiting Machine holds back no other hook: a replacement
+  that never joins can be deleted, its etcd learner is removed through the waiting Machine, and
+  the control plane creates the next replacement.
 - Deleting the Cluster removes every hook at once: nothing leaves etcd and nothing is revoked.
 
 A step that cannot finish, such as a leave that etcd refuses for its quorum or a revocation that
@@ -121,7 +127,7 @@ A worker's ChalkosConfig reports its hook in the condition `NodeRemoved`:
 
 | Status | Reason | Meaning |
 | --- | --- | --- |
-| False | `Revoking` | A control plane refused the revocation, or it failed. The message names each control plane tried and its answer. |
+| False | `Revoking` | A control plane refused the revocation, or it failed. The message names each control plane tried and its answer; one that cannot be reached reads as "unreachable", and the manager's log has the full error. |
 | False | `WaitingForControlPlane` | No control plane could be reached, none has an address, or the cluster's secrets are gone. |
 | False | `RevokedListFull` | The list of revoked nodes has no room, even after the provider pruned it. See [The list of revoked nodes](#the-list-of-revoked-nodes). |
 | True | `Done` | The node was revoked, and the message names the control plane and the list's fill level. Or the node needs no revocation, because its machine was never reached or the Cluster is being deleted. |
@@ -152,7 +158,9 @@ control-plane provider calls `PruneRevoked` through a control plane:
 - once a day otherwise, which covers the workers' revocations; `status.lastRevokedPruneTime` on
   the ChalkosControlPlane records the last attempt,
 - before a hook that finds the list full tries the revocation again, at most every five minutes.
-  The bootstrap provider does the same for a worker, once per pass of its hook.
+  The bootstrap provider does the same for a worker's hook, at most every five minutes for the
+  workers of a Cluster; it keeps the time of the last prune in memory, so a restarted manager
+  prunes once more.
 
 `PruneRevoked` drops the expired entries and those revoked before both the cluster's OS CA and its
 Kubernetes CA were made. A prune that fails is logged and recorded as a Warning event
@@ -399,9 +407,9 @@ the revoked nodes. Last, it checks that etcd has one member and that the remaini
 and one worker of 2 GiB, about 11 GiB for the VMs, so pull requests do not run it; the nightly
 run does.
 
-CI runs the same steps for a pull request with the label `e2e` and every night on `main`. A
-failed run uploads the test's output, the cluster's state and the kind node's logs as the
-artifact `e2e-logs`.
+CI runs `make e2e` for a pull request with the label `e2e`, and `make e2e` and `make e2e-ha`
+every night on `main`, each on a runner of its own. A failed run uploads the test's output, the
+cluster's state and the kind node's logs as the artifact `e2e-logs` or `e2e-ha-logs`.
 
 ## Contributing and security
 
