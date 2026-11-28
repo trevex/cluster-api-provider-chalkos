@@ -302,14 +302,26 @@ func TestStuckReplacementGoesOnRevertWithoutSurge(t *testing.T) {
 	}
 }
 
-// With maxSurge 0, no Machine goes while etcd has an unhealthy member or a learner.
+// With maxSurge 0, no Machine goes while etcd has an unhealthy member of a Machine that is not the
+// one to delete, or a learner of no Machine. A Machine whose member is a learner holds no vote,
+// so it goes first.
 func TestRollWithoutSurgeWaitsForHealthyEtcd(t *testing.T) {
 	for name, tc := range map[string]struct {
-		member func(*kubernetesv1.EtcdMember)
-		want   string
+		members func([]*kubernetesv1.EtcdMember) []*kubernetesv1.EtcdMember
+		want    string
+		deleted int
 	}{
-		"unhealthy": {func(m *kubernetesv1.EtcdMember) { m.Unhealthy = "context deadline exceeded" }, "unhealthy"},
-		"a learner": {func(m *kubernetesv1.EtcdMember) { m.Learner = true }, "learner"},
+		"unhealthy": {func(ms []*kubernetesv1.EtcdMember) []*kubernetesv1.EtcdMember {
+			ms[1].Unhealthy = "context deadline exceeded"
+			return ms
+		}, "unhealthy", -1},
+		"a learner of no Machine": {func(ms []*kubernetesv1.EtcdMember) []*kubernetesv1.EtcdMember {
+			return append(ms, &kubernetesv1.EtcdMember{Id: 0xbeef, Learner: true, PeerUrls: []string{"https://10.0.9.9:2380"}})
+		}, "4 members for 3 Machines", -1},
+		"a Machine's learner": {func(ms []*kubernetesv1.EtcdMember) []*kubernetesv1.EtcdMember {
+			ms[1].Learner = true
+			return ms
+		}, "", 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, 3, true)
@@ -318,14 +330,21 @@ func TestRollWithoutSurgeWaitsForHealthyEtcd(t *testing.T) {
 			for i, m := range ms {
 				members = append(members, &kubernetesv1.EtcdMember{Id: uint64(i + 1), Name: m.Name, PeerUrls: []string{"https://" + addrs[m.Name] + ":2380"}})
 			}
-			tc.member(members[1])
+			members = tc.members(members)
 			for _, m := range ms {
 				e.fake.Update(addrs[m.Name], func(n *nodetest.Node) { n.Members = members })
 			}
 			e.setMaxSurge(0)
 			e.setVersion("v1.37.2")
 			e.mustReconcile()
-			if got := e.deleted(); len(got) != 0 {
+			got := e.deleted()
+			if tc.deleted >= 0 {
+				if !slices.Equal(got, []string{ms[tc.deleted].Name}) {
+					t.Fatalf("deleted %v, want %s, whose member is a learner", got, ms[tc.deleted].Name)
+				}
+				return
+			}
+			if len(got) != 0 {
 				t.Fatalf("deleted %v while etcd is not healthy", got)
 			}
 			wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, tc.want)
@@ -502,6 +521,38 @@ func TestOneReplicaUnhealthyReplacementStays(t *testing.T) {
 		t.Fatalf("deleted %v without a quorum to remove the member", got)
 	}
 	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionFalse, controlplanev1.ScalingDownWaitingReason, "1 healthy of 2 members")
+}
+
+// With maxSurge 1, an old Machine whose node does not answer for its status while etcd lists it
+// as a healthy voter holds a vote: the roll creates its replacement first and deletes nothing.
+func TestRollCreatesFirstWhileAVoterDoesNotAnswer(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.rollingControlPlane(3)
+	e.fake.Update(addrs[ms[1].Name], func(n *nodetest.Node) { n.StatusErr = nodetest.Unreachable(addrs[ms[1].Name]) })
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v, a voter, before its replacement exists", got)
+	}
+	repl := e.newcomer(e.wantMachines(4), addrs)
+	if repl.Spec.Version != "v1.37.2" {
+		t.Errorf("the replacement is of %s", repl.Spec.Version)
+	}
+}
+
+// The only Machine of a one-replica control plane, whose node does not answer for its status, is
+// not deleted by a roll: no other Machine tells that it holds no vote, so the roll waits.
+func TestOneReplicaRollKeepsAMachineThatDoesNotAnswer(t *testing.T) {
+	e := newEnv(t, 1, true)
+	ms, addrs := e.rollingControlPlane(1)
+	e.fake.Update(addrs[ms[0].Name], func(n *nodetest.Node) { n.StatusErr = nodetest.Unreachable(addrs[ms[0].Name]) })
+	e.setVersion("v1.37.2")
+	e.mustReconcile()
+	if got := e.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v, the only Machine", got)
+	}
+	e.wantMachines(1)
+	wantConditionReason(t, e.cp(), controlplanev1.RollingOutCondition, metav1.ConditionTrue, controlplanev1.RollingOutWaitingReason, "to join")
 }
 
 // withoutLearnerOf drops the Machine's learner, by name or by peer URL, and nothing else.

@@ -692,6 +692,32 @@ func TestUnhealthyEtcdMemberIsRemovedThroughAPeer(t *testing.T) {
 	}
 }
 
+// A node that refuses to leave for etcd's quorum while its member is unhealthy is not removed
+// through a peer that refuses for the quorum too: the hook waits.
+func TestUnhealthyEtcdMemberRefusedForQuorumWaits(t *testing.T) {
+	e := newEnv(t, 3, true)
+	ms, addrs := e.controlPlanes(3)
+	gone := ms[2].Name
+	e.setUnhealthy(ms, addrs, gone)
+	e.fake.Update(addrs[gone], func(n *nodetest.Node) { n.EtcdLeave = func() error { return nodetest.QuorumRefused(gone) } })
+	for _, m := range ms[:2] {
+		e.fake.Update(addrs[m.Name], func(n *nodetest.Node) {
+			n.EtcdRemoveMember = func(member string) error { return nodetest.QuorumRefused(member) }
+		})
+	}
+	e.atHook(gone)
+	e.mustReconcile()
+	if !e.hooked(gone) {
+		t.Error("the hook is gone")
+	}
+	for _, m := range ms[:2] {
+		if n, _ := e.fake.Node(addrs[m.Name]); len(n.Removed) != 0 || len(n.Revoked) != 0 {
+			t.Errorf("through %s: removed %v, revoked %v", m.Name, n.Removed, n.Revoked)
+		}
+	}
+	wantConditionReason(t, e.cp(), controlplanev1.ScalingDownCondition, metav1.ConditionTrue, controlplanev1.ScalingDownReason, "its member is unhealthy, and no other control plane removes its etcd member")
+}
+
 // The text of the client's own errors for an unreachable node varies with how the dial failed;
 // the condition does not, so a waiting pass writes nothing.
 func TestWaitingHookIgnoresVaryingDialErrors(t *testing.T) {

@@ -405,6 +405,10 @@ func TestMembersProblem(t *testing.T) {
 			unhealthy(members("a", "b", "c"), "a"), machines("b", "c"), machines("a"), "a", ""},
 		"another Machine's unhealthy member": {unhealthy(members("a", "b", "c"), "b"), machines("a", "b", "c"), nil, "a", "b is unhealthy"},
 		"two unhealthy members":              {unhealthy(members("a", "b", "c"), "a", "b"), machines("a", "b", "c"), nil, "a", "b is unhealthy"},
+		"four members, the leaving one unhealthy": {
+			unhealthy(members("a", "b", "c", "d"), "d"), machines("a", "b", "c", "d"), nil, "d", ""},
+		"the leaving Machine's unhealthy member while another is deleted": {
+			unhealthy(members("a", "b", "c", "d"), "a"), machines("a", "b", "c"), machines("d"), "a", "the Machine d is being deleted"},
 		"two members, the leaving one unhealthy": {
 			unhealthy(members("a", "b"), "a"), machines("a", "b"), nil, "a", "1 healthy of 2 members"},
 		"the leaving Machine's unhealthy member and a learner": {

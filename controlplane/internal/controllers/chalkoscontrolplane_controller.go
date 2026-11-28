@@ -213,6 +213,9 @@ type scope struct {
 	// statuses are the Kubernetes statuses of the Machines' nodes read in this reconcile, by
 	// Machine name, so that each node is asked once.
 	statuses map[string]nodeStatus
+	// memberLists are etcd's members as the Machines' nodes listed them in this reconcile, by
+	// Machine name, so that each node is asked once.
+	memberLists map[string]memberList
 	// scaleUpWaiting is what the next Machine's creation waits for, such as a Machine's join;
 	// empty when it waits for nothing.
 	scaleUpWaiting string

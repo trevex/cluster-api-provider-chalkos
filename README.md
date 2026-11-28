@@ -24,9 +24,10 @@ What works:
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
 - Scaling the control plane down, one Machine at a time, once every Machine joined and etcd lists
   one healthy member per Machine. Machines that are not up to date go first: among them, one that
-  never joined, else the oldest. A Machine that never joined goes without that wait, as
+  etcd lists no voting member of, else the oldest. Such a Machine goes without that wait, as
   [How to recover from a replacement that never joins](#how-to-recover-from-a-replacement-that-never-joins)
-  describes.
+  describes. The Machine being deleted may hold the one unhealthy member when etcd has three
+  members or more.
 - Rolling out a changed version, image, files or infrastructure template of the control plane,
   one Machine at a time, oldest first, as [Rolling out changes](#rolling-out-changes) describes.
   A change of a field that every node of the cluster holds alike, such as the Cluster's domain,
@@ -246,9 +247,11 @@ Machine and, with `maxSurge: 0`, costs no etcd member.
 A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
 Machine, no Machine is being deleted, and no guard holds. The Machine that a step deletes is the
 exception, as for a replacement that never joins or went unhealthy: it need not have joined, and
-its voting member may be unhealthy while every other member is a healthy voter. Scaling down takes
-the Machines that are not up to date first, and among them one that never joined, so lowering
-`replicas` during a roll removes old Machines before new ones.
+its voting member may be unhealthy while every other member is a healthy voter and etcd has three
+members or more. Scaling down takes the Machines that are not up to date first, and among them one
+that etcd lists no voting member of, so lowering `replicas` during a roll removes old Machines
+before new ones. A Machine whose node does not answer for its status counts as joined while etcd
+lists it as a voter.
 
 ### Which changes does the control plane refuse?
 
@@ -305,15 +308,17 @@ Cluster API Cluster, reports on `ScalingUp` with the same reason instead.
 A replacement that never joins, such as one whose image does not boot, holds the roll: the next
 step waits for its join. Change `spec.version`, `spec.image` or `spec.files` again, either back to
 what the other Machines were made from or forward to a fixed spec. The stuck Machine is then out
-of date, and among the Machines that are not up to date the control plane deletes one that never
-joined first, without waiting for its join: it holds no vote in etcd, so its removal costs no
-quorum. After a revert, that ends the roll. After a fix forward, the roll goes on over the other
-Machines. With `maxSurge: 0`, the control plane then creates the Machine it is short of from the
-current spec.
+of date, and among the Machines that are not up to date the control plane first deletes one that
+etcd's member list, taken through the other Machines, shows no voting member of: no member under
+its name or at its peer URL, or only a learner. Its removal takes no voter from etcd, and the
+check of etcd's members guards the quorum as for any step. A Machine that does not answer but
+that etcd lists as a voter is no such Machine: the roll treats it as any other. After a revert,
+that ends the roll. After a fix forward, the roll goes on over the other Machines. With
+`maxSurge: 0`, the control plane then creates the Machine it is short of from the current spec.
 
-The same holds for a change made while a surge Machine is still joining: that Machine is then out
-of date too, and it goes first instead of joining. An up-to-date Machine that is joining is never
-deleted this way, so a roll without a further change still waits for its join.
+The same holds for a change made while a surge Machine is still joining and not yet a voter: that
+Machine is then out of date too, and it goes first instead of joining. An up-to-date Machine that
+is joining is never deleted this way, so a roll without a further change still waits for its join.
 
 A replacement that joined etcd and then went unhealthy holds the roll as well: a step waits for
 one healthy voting member per Machine. Revert the change, and the replacement is again the only

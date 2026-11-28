@@ -59,6 +59,9 @@ type Node struct {
 	// Status is the node's Kubernetes status, which KubernetesStatus answers a copy of; nil answers
 	// an empty one.
 	Status *kubernetesv1.StatusResponse
+	// StatusErr, when set, fails KubernetesStatus alone, as for a node that does not answer for
+	// its status while its etcd member still does.
+	StatusErr error
 	// EtcdLeave, when set, answers an EtcdLeave of the node in place of the Fake's model of etcd.
 	// The Fake calls it without holding its lock.
 	EtcdLeave func() error
@@ -244,6 +247,9 @@ func (f *Fake) KubernetesStatus(_ context.Context, addr string, _ clustersecrets
 	n, err := f.installed(addr, name)
 	if err != nil {
 		return nil, err
+	}
+	if n.StatusErr != nil {
+		return nil, n.StatusErr
 	}
 	if n.Status == nil {
 		return &kubernetesv1.StatusResponse{}, nil
