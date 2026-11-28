@@ -89,7 +89,9 @@ spec:
                   the controllers derive the API server's, controller-manager's, scheduler's and kube-proxy's
                   from the version where it names none. Fields the controllers own are refused: the Node's type
                   and providerID, the Cluster's endpoint, and its ipFamilies, podCIDRs and serviceCIDRs when the
-                  Cluster's clusterNetwork gives ranges.
+                  Cluster's clusterNetwork gives ranges. The cluster-wide documents other than Secrets are also
+                  recorded in status.observedFiles, so very large files count about twice against the
+                  object's size limit.
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -245,6 +247,39 @@ spec:
                 x-kubernetes-validations:
                 - message: replicas must be odd
                   rule: self % 2 == 1
+              rollout:
+                description: |-
+                  Rollout says when the control planes' Machines are replaced and how. A Machine is replaced
+                  when the version, image, files or infrastructure template it was made from changed, or it
+                  was created before rollout.after.
+                properties:
+                  after:
+                    description: |-
+                      After replaces every control-plane Machine created before it, once it has passed, even when
+                      nothing else changed. Written in RFC 3339, such as 2026-11-28T09:00:00Z.
+                    format: date-time
+                    type: string
+                  strategy:
+                    description: Strategy says how a Machine that is not up to date
+                      is replaced.
+                    properties:
+                      rollingUpdate:
+                        description: RollingUpdate replaces the Machines one at a
+                          time, the oldest first.
+                        properties:
+                          maxSurge:
+                            description: |-
+                              MaxSurge is how many Machines above replicas the control plane runs while it replaces one.
+                              1, the default, creates the replacement first and deletes the old Machine once the new one
+                              has joined etcd. 0 deletes the old Machine first and creates the replacement once it is
+                              gone, which needs at least three replicas.
+                            format: int32
+                            maximum: 1
+                            minimum: 0
+                            type: integer
+                        type: object
+                    type: object
+                type: object
               version:
                 description: |-
                   Version is the Kubernetes version the control planes run. The chalkos image they install
@@ -260,6 +295,12 @@ spec:
             - machineTemplate
             - version
             type: object
+            x-kubernetes-validations:
+            - message: 'rollout.strategy.rollingUpdate.maxSurge 0 needs at least 3
+                replicas: with fewer, removing a control plane first loses etcd''s
+                quorum'
+              rule: self.?rollout.?strategy.?rollingUpdate.?maxSurge.orValue(1) ==
+                1 || self.?replicas.orValue(1) >= 3
           status:
             description: Status is the observed state of ChalkosControlPlane.
             properties:
@@ -276,7 +317,8 @@ spec:
               conditions:
                 description: |-
                   Conditions are the ChalkosControlPlane's current observations. Known condition types are
-                  Available, Initialized, MachinesReady, ScalingUp, ScalingDown, Deleting and Paused.
+                  Available, Initialized, MachinesReady, ScalingUp, ScalingDown, RollingOut, Deleting and
+                  Paused.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -361,6 +403,18 @@ spec:
                   revocations.
                 format: date-time
                 type: string
+              observedFiles:
+                description: |-
+                  ObservedFiles are the cluster-wide documents the control plane's Machines were made from,
+                  as a control-plane Machine installs them: spec.files with the fields the controllers fill
+                  from the Cluster, the Cluster document's endpoint, ipFamilies, podCIDRs and serviceCIDRs,
+                  but without a Machine's own Node document and without Secret documents, and with the
+                  image's defaults written out, so that an image defaulting a field every node holds alike
+                  differently shows as a change. They are one YAML stream of JSON documents separated by ---,
+                  recorded once a Machine exists and none is out of date or being deleted. While the
+                  documents a new Machine would get differ from them, the controllers compare the two for
+                  changes to fields every node of the cluster holds alike, which hold every new Machine.
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the generation the status describes.
                 format: int64
@@ -397,8 +451,9 @@ spec:
                 minLength: 1
                 type: string
               versions:
-                description: Versions is the aggregated Kubernetes versions of the
-                  control plane's Machines.
+                description: |-
+                  Versions is the aggregated Kubernetes versions of the control plane's Machines, those being
+                  deleted included, oldest first.
                 items:
                   description: StatusVersion groups version-related status information.
                   properties:

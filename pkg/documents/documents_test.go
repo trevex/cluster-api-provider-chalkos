@@ -297,20 +297,7 @@ func TestInvalidInput(t *testing.T) {
 // The documents For generates pass the check of chalkos's built-in kinds on an image with
 // Kubernetes, as the machine's image checks them before it installs.
 func TestGeneratedDocumentsPassChalkosCheck(t *testing.T) {
-	chalkostest.Chdir(t)
-	facts, err := sdk.ContractFacts(layers.All(), func(name string) ([]byte, error) {
-		if name == k8s.ContractFactsFile {
-			return []byte(kubernetestest.Image), nil
-		}
-		return nil, fs.ErrNotExist
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := sdk.SchemaContract(layers.All(), schematest.Files(t, schematest.Builtin, schematest.Networkd), facts)
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := builtinContract(t)
 	pool := `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Node", "metadata": {"name": "default"}, "spec": {"labels": {"pool": "gpu"}}}`
 	for _, typ := range []string{documents.Worker, documents.ControlPlane} {
 		m := worker()
@@ -323,4 +310,34 @@ func TestGeneratedDocumentsPassChalkosCheck(t *testing.T) {
 			t.Fatalf("%s: chalkos refuses the documents: %v", typ, err)
 		}
 	}
+}
+
+// builtinContract is the contract of an image with chalkos's built-in kinds and Kubernetes.
+func builtinContract(t *testing.T) sdk.Contract {
+	t.Helper()
+	return contractOf(t, nil)
+}
+
+// contractOf is the contract of builtinContract with its schema files changed by edit, if any.
+func contractOf(t *testing.T, edit func(schemas map[string][]byte)) sdk.Contract {
+	t.Helper()
+	chalkostest.Chdir(t)
+	facts, err := sdk.ContractFacts(layers.All(), func(name string) ([]byte, error) {
+		if name == k8s.ContractFactsFile {
+			return []byte(kubernetestest.Image), nil
+		}
+		return nil, fs.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemas := schematest.Files(t, schematest.Builtin, schematest.Networkd)
+	if edit != nil {
+		edit(schemas)
+	}
+	c, err := sdk.SchemaContract(layers.All(), schemas, facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

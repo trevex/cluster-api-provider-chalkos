@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"maps"
@@ -28,6 +29,7 @@ import (
 
 	"connectrpc.com/connect/v2"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -57,14 +59,14 @@ import (
 )
 
 const (
-	clusterName = "c1"
-	image       = "registry.example/chalkos@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	addr        = "10.0.0.1"
-	fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	rootHash    = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	images      = `{"etcd": "registry.k8s.io/etcd:3.7.0-0", "coredns": "registry.k8s.io/coredns/coredns:v1.14.6", "pause": "registry.k8s.io/pause:3.10.2", "flannel": "ghcr.io/flannel-io/flannel:v0.28.9"}`
-	clusterFile = `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Cluster", "metadata": {"name": "default"}, "spec": {"domain": "lab.local", "images": ` + images + `}}`
-	kubeAPI     = "kubernetes.chalkos.dev/v1alpha1"
+	clusterName   = "c1"
+	image         = "registry.example/chalkos@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	addr          = "10.0.0.1"
+	fingerprint   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	rootHash      = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	clusterImages = `{"etcd": "registry.k8s.io/etcd:3.7.0-0", "coredns": "registry.k8s.io/coredns/coredns:v1.14.6", "pause": "registry.k8s.io/pause:3.10.2", "flannel": "ghcr.io/flannel-io/flannel:v0.28.9"}`
+	clusterFile   = `{"apiVersion": "kubernetes.chalkos.dev/v1alpha1", "kind": "Cluster", "metadata": {"name": "default"}, "spec": {"domain": "lab.local", "images": ` + clusterImages + `}}`
+	kubeAPI       = "kubernetes.chalkos.dev/v1alpha1"
 )
 
 // env is one test's namespace with a Cluster, the fake machines and images, and the reconciler.
@@ -707,6 +709,30 @@ func (k *keychains) Image(ctx context.Context, ref string, kc authn.Keychain) (*
 	k.got = kc
 	k.mu.Unlock()
 	return k.Fake.Image(ctx, ref, kc)
+}
+
+// auth is a docker config's entry for the user, whose password is the same.
+func auth(user string) string {
+	return `{"auth": "` + base64.StdEncoding.EncodeToString([]byte(user+":"+user)) + `"}`
+}
+
+// username is the user the keychain resolves the repository's credentials to; empty for
+// anonymous ones.
+func username(t *testing.T, k authn.Keychain, repository string) string {
+	t.Helper()
+	repo, err := name.NewRepository(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := k.Resolve(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := authn.Authorization(t.Context(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg.Username
 }
 
 // The image is read and installed with the credentials of the ChalkosConfig's image pull Secret.

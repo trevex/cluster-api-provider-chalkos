@@ -22,8 +22,16 @@ What works:
 - Removing a Machine: a pre-terminate hook takes its node out of etcd and revokes it before
   Cluster API deletes the Machine's infrastructure, as [Removing Machines](#removing-machines)
   describes. This covers scaling a MachineDeployment down and deleting a Machine by hand.
-- Scaling the control plane down, one Machine at a time, oldest first, once every Machine joined
-  and etcd lists one healthy member per Machine.
+- Scaling the control plane down, one Machine at a time, once every Machine joined and etcd lists
+  one healthy member per Machine. Machines that are not up to date go first, then the oldest. A
+  Machine that never joined may go without that wait, as
+  [How to recover from a replacement that never joins](#how-to-recover-from-a-replacement-that-never-joins)
+  describes.
+- Rolling out a changed version, image, files or infrastructure template of the control plane,
+  one Machine at a time, oldest first, as [Rolling out changes](#rolling-out-changes) describes.
+  A change of a field that every node of the cluster holds alike, such as the Cluster's domain,
+  or a version change of more than one Kubernetes minor is refused before any Machine is created.
+- Workers that wait for the control plane's upgrade when their version is of a newer minor.
 - Replacing the only Machine of a one-replica control plane by deleting it: the replacement
   joins etcd before the old Machine leaves it.
 - Deleting a cluster: the control plane waits until the cluster's worker Machines and
@@ -33,9 +41,9 @@ What works:
 
 What does not work yet:
 
-- Rollouts and upgrades of the control plane. A changed `spec.version` marks the Machines as not
-  up to date, and a changed `spec.image` does not affect Machines that exist; neither replaces a
-  Machine.
+- Rolling the workers when the ChalkosControlPlane's files change. Workers keep the cluster-wide
+  documents they were installed with; change the MachineDeployment's template, or set its
+  `spec.rollout.after`, to replace them.
 - Remediation of control-plane Machines by a MachineHealthCheck. Cluster API leaves an unhealthy
   Machine to its owner, and marks it with `OwnerRemediated` set to `False`; the
   ChalkosControlPlane does not act on that, so the Machine stays. Delete the Machine to replace it.
@@ -46,7 +54,8 @@ What does not work yet:
 
 The end-to-end test covers one control plane and one worker on KubeVirt through
 [CAPK](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt), with the workers scaled
-to two and back to one; `make e2e-ha` scales the control plane to three and back to one, as
+to two and back to one; `make e2e-ha` scales the control plane to three, rolls it twice and
+scales it back to one, as
 [End-to-end test](#end-to-end-test) describes. Other infrastructure providers, ClusterClass
 topologies and worker rollouts are untested. An infrastructure provider must report each
 Machine's `providerID` and an `InternalIP` address that the managers can reach: the providers
@@ -63,7 +72,7 @@ The API has four kinds:
 
 | Kind | Provider | What it holds |
 | --- | --- | --- |
-| `ChalkosControlPlane` | control plane | `replicas` (odd, default 1), `version`, `image`, `imagePullSecretRef`, `machineTemplate` with the infrastructure template, `files` with the cluster-wide chalkos documents, and `kubeconfig.ttlSeconds`. |
+| `ChalkosControlPlane` | control plane | `replicas` (odd, default 1), `version`, `image`, `imagePullSecretRef`, `machineTemplate` with the infrastructure template, `rollout` with `after` and `strategy.rollingUpdate.maxSurge`, `files` with the cluster-wide chalkos documents, and `kubeconfig.ttlSeconds`. |
 | `ChalkosControlPlaneTemplate` | control plane | The same without `replicas`, `version` and the infrastructure reference, for a ClusterClass. |
 | `ChalkosConfig` | bootstrap | One Machine's `image`, `imagePullSecretRef` and the `files` of its pool, such as a Node's labels and taints. |
 | `ChalkosConfigTemplate` | bootstrap | The ChalkosConfig that a MachineDeployment or MachineSet clones for each Machine. |
@@ -183,6 +192,147 @@ its node is not revoked: its certificates stay valid until they expire, unless
 `chalkctl node revoke <node>` revokes it. Removing the hook of a Machine that waits as etcd's
 last voter deletes the cluster's last voting etcd member, and the cluster's state with it. The
 provider adds no hook to a Machine that is being deleted, so the annotation stays removed.
+
+## Rolling out changes
+
+The control plane replaces each of its Machines that is not up to date, one Machine at a time,
+oldest first. The replacement is made from the ChalkosControlPlane's spec as it is now, and the old
+Machine leaves through its pre-terminate hook, as [Removing Machines](#removing-machines)
+describes.
+
+### When is a control-plane Machine out of date?
+
+A Machine is out of date in three cases:
+
+- Its spec hash differs from the ChalkosControlPlane's. The annotation
+  `controlplane.cluster.x-k8s.io/chalkos-spec-hash` on each Machine and its ChalkosConfig holds a
+  hash of `spec.version`, `spec.image`, `spec.files` and the infrastructure template's API group,
+  kind and name. The files count by their content, so a reordering of keys or a change of spacing
+  replaces nothing. Cluster API's infrastructure templates are immutable, so a changed template
+  is a template of another name.
+- It was created before `spec.rollout.after`, once that time has passed. Setting it to the current
+  time replaces every Machine without any other change.
+- It carries no hash. Machines made by v0.2.0 of the providers carry none. The control plane
+  adopts such a Machine, and stamps the current hash on it, when the Machine's version is
+  `spec.version` and its ChalkosConfig's image is `spec.image`; it replaces the others. A change of
+  `spec.files` or of the infrastructure template made while v0.2.0 ran cannot be told from the
+  Machine, so adoption does not replace it.
+
+Each Machine's `UpToDate` condition says why it is out of date, and `status.upToDateReplicas`
+counts the Machines that are up to date. The labels and annotations of `machineTemplate.metadata`
+reach the Machines in place, without replacing them. The spec hash annotation and the
+pre-terminate hook annotation are left out of that copy, and a key removed from the template stays
+on the Machines.
+
+### How does a roll replace a Machine?
+
+`spec.rollout.strategy.rollingUpdate.maxSurge` sets the order of each step:
+
+- `1`, the default, creates the replacement first and deletes the old Machine once the
+  replacement joined etcd. The control plane runs one Machine more than `replicas` during the
+  step, so the infrastructure needs room for it.
+- `0` deletes the old Machine first and creates the replacement once the old one is gone. It
+  needs three replicas or more, which the API enforces, because etcd keeps its quorum with one
+  member fewer only from three members on. To scale below three, set `maxSurge` back to `1` in
+  the same change.
+
+Before either step, the control plane checks the replacement's documents against the target image.
+A refusal holds the roll with the reason `InvalidFiles`, so a change that cannot install creates no
+Machine and, with `maxSurge: 0`, costs no etcd member.
+
+A step starts only when every Machine joined the cluster, etcd lists one healthy voting member per
+Machine, no Machine is being deleted, and no guard holds. Scaling down takes the Machines that are
+not up to date first, so lowering `replicas` during a roll removes old Machines before new ones.
+
+### Which changes does the control plane refuse?
+
+Guards check the spec before the control plane creates any Machine, for a roll or a scale-up. A
+guard that refuses holds every new Machine until the change is reverted:
+
+- `VersionSkew`: `spec.version` is more than one minor newer than one of the Machines, being
+  deleted included, of an older minor or of another major, or no Kubernetes version. Upgrade one
+  minor at a time.
+- `FixedFieldChanged`: the documents a new Machine would get change a field that every node of
+  the cluster holds alike, such as the Cluster's domain, as the target image's schema marks it. A
+  running cluster keeps these fields. The change can come through `spec.files`, or through the
+  Cluster API Cluster's `clusterNetwork` or `controlPlaneEndpoint`, which fill the Cluster
+  document's endpoint and ranges. The message names each document, field and value; revert the
+  change where it was made.
+- `InvalidFiles`: the files, with the fields filled from the Cluster, cannot be made into a
+  control-plane Machine's documents, as when they set a field that Cluster API owns; the target
+  image refuses a replacement's documents; or `status.observedFiles` cannot be compared with
+  them. When the record is unreadable, clear it:
+
+  ```sh
+  kubectl patch chalkoscontrolplane <name> -n <namespace> --subresource=status --type=merge \
+    -p '{"status":{"observedFiles":null}}'
+  ```
+
+  Without a record, the next Machine is created without the fixed-field comparison, and the
+  control plane records the documents again once every Machine is up to date.
+
+`status.observedFiles` is what the fixed-field guard compares with: the cluster-wide documents
+that the Machines were made from, without Node and Secret documents, with the image's defaults
+written out. The control plane records it once a Machine exists and none is out of date or being
+deleted. Once it is set, each new Machine, control plane or worker, needs the ChalkosControlPlane's
+`spec.image` to be readable, because the image's schema marks the fixed fields. A registry outage
+or a control-plane digest pruned from the registry therefore holds scale-ups and rolls until the
+image can be read again. A waiting worker reports `Installing` with a message that names the image,
+and tries again every 15 seconds.
+
+### What does the RollingOut condition say?
+
+The ChalkosControlPlane reports rolls in the condition `RollingOut`:
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| True | `RollingOut` | The control plane steps through its Machines that are not up to date; the message counts them. |
+| True | `WaitingToRollOut` | The next step waits: for a Machine to join, for etcd's health, for a Machine's removal, or to read the image that a change of the files is checked against. The message says which. |
+| True | `FixedFieldChanged`, `VersionSkew`, `InvalidFiles` | A guard refuses the change, as [Which changes does the control plane refuse?](#which-changes-does-the-control-plane-refuse) describes. |
+| False | `NotRollingOut` | Every Machine is up to date. |
+
+A guard that refuses while every Machine is up to date, as for a change made only through the
+Cluster API Cluster, reports on `ScalingUp` with the same reason instead.
+
+### How to recover from a replacement that never joins
+
+A replacement that never joins, such as one whose image does not boot, holds the roll: the next
+step waits for its join. Revert `spec.version`, `spec.image` or `spec.files` to what the other
+Machines were made from. The stuck Machine is then the only one out of date, and the control plane
+deletes it without waiting for its join, which ends the roll. With `maxSurge: 0`, the control
+plane then creates the Machine it is short of from the reverted spec.
+
+A fix forward does not unstick the roll. The next step replaces the oldest Machine that is not up
+to date, which is one of the old Machines, and it waits for the stuck Machine to join. Revert to
+the spec the other Machines were made from first, then roll forward.
+
+A replacement that joined etcd but is unhealthy holds the roll as well, because a step waits for
+one healthy member per Machine. Delete that Machine by hand. Its pre-terminate hook takes its
+member out of etcd while the other members keep quorum.
+
+### What happens to the workers?
+
+The bootstrap provider holds a worker that is not installed yet, and reports why in its
+ChalkosConfig's `Ready` and `Installed` conditions:
+
+- `WaitingForControlPlaneUpgrade`: the worker's version is of a newer minor than the control
+  plane's oldest Machine, because a kubelet never runs a newer minor than its API server. The
+  ChalkosControlPlane's `status.versions` includes the Machines being deleted, so a worker scaled
+  up during a minor upgrade waits until the last old control plane is gone.
+- `FixedFieldChanged`: the documents the worker would get change a fixed field against
+  `status.observedFiles`. The worker installs once the change is reverted.
+- `ObservedFilesInvalid`: `status.observedFiles` cannot be compared with the cluster-wide
+  documents, for which the control plane holds its own Machines with `InvalidFiles`. Clear the
+  record as above.
+- `ConfigRefused`: the cluster-wide documents cannot be made, as when the files set a field that
+  Cluster API owns.
+
+A worker more than three minors older than the control plane installs, and its ChalkosConfig's
+`VersionSkew` condition turns `True` as a warning: Kubernetes does not support that skew.
+
+Installed workers keep the documents they were installed with, and the providers never change
+them. A change of the ChalkosControlPlane's files does not roll the workers; change the
+MachineDeployment's template, or set its `spec.rollout.after`, to replace them.
 
 ## Install
 
@@ -397,15 +547,20 @@ just -f lab/justfile destroy
 A run that stops early still deletes the cluster, after it logged the cluster's state on failure.
 `E2E_KEEP=1 make e2e` keeps the cluster of such a run to look at.
 
-`make e2e-ha` tests control-plane scaling on the same lab. It creates the cluster `lab`, scales the
-ChalkosControlPlane to three replicas and waits until all four nodes are Ready and etcd lists
-three healthy voting members. It then scales the control plane back to one and checks that the
+`make e2e-ha` tests control-plane scaling and rolls on the same lab. It creates the cluster `lab`,
+scales the ChalkosControlPlane to three replicas and waits until all four nodes are Ready and etcd
+lists three healthy voting members. It changes the Cluster document's domain and checks that the
+control plane refuses the change with `FixedFieldChanged` against the released image's schema and
+creates no Machine, then reverts it. It scales the workers to zero and sets `spec.rollout.after`
+twice, first with `maxSurge: 1` and then with `maxSurge: 0`. Each roll must replace the three
+control planes oldest first, with never more than four Machines, or three with `maxSurge: 0`, and
+at least two healthy etcd voters. It then scales the control plane back to one and checks that the
 provider removes the oldest control plane first and then the next one. For each removed control
-plane, the test checks that its Node is gone and that the remaining control plane lists it among
-the revoked nodes. Last, it checks that etcd has one member and that the remaining Node carries
-`node-role.kubernetes.io/control-plane`. At its peak the test runs three control planes of 3 GiB
-and one worker of 2 GiB, about 11 GiB for the VMs, so pull requests do not run it; the nightly
-run does.
+plane, the test checks that its Node is gone and that a remaining control plane lists it among the
+revoked nodes. Last, it checks that etcd has one member and that the remaining Node carries
+`node-role.kubernetes.io/control-plane`. At its peak, while a roll surges, the test runs four
+control planes of 3 GiB, about 12 GiB for the VMs and 14 GiB with the lab, so pull requests do not
+run it; the nightly run does.
 
 CI runs `make e2e` for a pull request with the label `e2e`, and `make e2e` and `make e2e-ha`
 every night on `main`, each on a runner of its own. A failed run uploads the test's output, the

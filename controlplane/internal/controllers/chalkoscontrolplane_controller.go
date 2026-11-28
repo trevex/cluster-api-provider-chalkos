@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect/v2"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -58,6 +59,7 @@ import (
 	bootstrapv1 "github.com/trevex/cluster-api-provider-chalkos/bootstrap/api/v1alpha1"
 	controlplanev1 "github.com/trevex/cluster-api-provider-chalkos/controlplane/api/v1alpha1"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/conditionlog"
+	"github.com/trevex/cluster-api-provider-chalkos/internal/images"
 	"github.com/trevex/cluster-api-provider-chalkos/internal/machineutil"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/node"
 	"github.com/trevex/cluster-api-provider-chalkos/pkg/secrets"
@@ -100,12 +102,16 @@ type ChalkosControlPlaneReconciler struct {
 	// Recorder records the events of the control planes' pre-terminate hooks and of the pruning of
 	// the revoked nodes; nil records none.
 	Recorder events.EventRecorder
+
+	// artifacts holds the images read before and their contracts, which default
+	// status.observedFiles and mark the fields the guard compares.
+	artifacts images.Cache
 }
 
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=chalkoscontrolplanes/finalizers,verbs=update
-// +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=chalkosconfigs,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines/status,verbs=patch
@@ -128,7 +134,7 @@ func (r *ChalkosControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(clusterToControlPlane),
 			builder.WithPredicates(predicates.Any(scheme, log,
 				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(scheme, log),
-				clusterEndpointOrControlPlaneChanged(),
+				clusterInputsChanged(),
 				machineutil.ClusterDeletionStarted(),
 			))).
 		Complete(r)
@@ -165,13 +171,19 @@ func (r *ChalkosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err := s.track(); err != nil {
 		return ctrl.Result{}, err
 	}
+	if s.hash, err = specHash(cp); err != nil {
+		return ctrl.Result{}, err
+	}
+	if after := cp.Spec.Rollout.After.Time; !after.IsZero() && !r.clock().Now().Before(after) {
+		s.rolloutAfter = after
+	}
 	before := slices.Clone(cp.Status.Conditions)
 	defer func() {
 		setStatus(s)
 		conditionlog.Changes(ctrl.LoggerFrom(ctx), before, cp.Status.Conditions,
 			controlplanev1.InitializedCondition, controlplanev1.AvailableCondition,
 			controlplanev1.ScalingUpCondition, controlplanev1.MachinesReadyCondition,
-			controlplanev1.ScalingDownCondition, controlplanev1.DeletingCondition)
+			controlplanev1.ScalingDownCondition, controlplanev1.RollingOutCondition, controlplanev1.DeletingCondition)
 		if err := s.patch(ctx); err != nil {
 			rerr = kerrors.NewAggregate([]error{rerr, err})
 		}
@@ -194,6 +206,10 @@ type scope struct {
 	deleting []clusterv1.Machine
 	// listed is set once the Machines were listed.
 	listed bool
+	// hash is the ChalkosControlPlane's specHash.
+	hash string
+	// rolloutAfter is spec.rollout.after once it has passed; zero before and without one.
+	rolloutAfter time.Time
 	// statuses are the Kubernetes statuses of the Machines' nodes read in this reconcile, by
 	// Machine name, so that each node is asked once.
 	statuses map[string]nodeStatus
@@ -209,6 +225,19 @@ type scope struct {
 	// deletingReason and deletingMessage are the Deleting condition's reason and message while
 	// the ChalkosControlPlane is being deleted; empty before its Machines were listed.
 	deletingReason, deletingMessage string
+	// held is why no Machine may be created, as the guard found; empty when nothing holds.
+	// heldReason is the reason of a refused change, VersionSkewReason or FixedFieldChangedReason;
+	// empty for a check that could not be made, which the conditions report as a wait.
+	held, heldReason string
+	// rollWaiting is what the roll's next step waits for, for the RollingOut condition; empty
+	// when nothing.
+	rollWaiting string
+	// stepped is set once this reconcile created or deleted a Machine; no other Machine is
+	// created or deleted until the next.
+	stepped bool
+	// imageWaiting is why status.observedFiles is not recorded yet, as while the image cannot be
+	// read; empty when nothing.
+	imageWaiting string
 }
 
 // nodeStatus is a node's answer to KubernetesStatus.
@@ -230,7 +259,7 @@ func (s *scope) patch(ctx context.Context) error {
 		patch.WithOwnedConditions{Conditions: []string{
 			controlplanev1.AvailableCondition, controlplanev1.InitializedCondition,
 			controlplanev1.MachinesReadyCondition, controlplanev1.ScalingUpCondition,
-			controlplanev1.ScalingDownCondition, controlplanev1.DeletingCondition,
+			controlplanev1.ScalingDownCondition, controlplanev1.RollingOutCondition, controlplanev1.DeletingCondition,
 		}},
 		patch.WithStatusObservedGeneration{})
 }
@@ -283,7 +312,7 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err := r.listMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.markUpToDate(ctx, s); err != nil {
+	if err := r.syncMachines(ctx, s); err != nil {
 		return ctrl.Result{}, err
 	}
 	if !s.cluster.DeletionTimestamp.IsZero() {
@@ -316,6 +345,7 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	guarded := r.guard(ctx, s)
 	res, err := r.initialize(ctx, s, sec)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -329,7 +359,11 @@ func (r *ChalkosControlPlaneReconciler) reconcile(ctx context.Context, s *scope)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	res = earliest(res, down)
+	roll, err := r.rollOut(ctx, s, sec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	res = earliest(earliest(earliest(res, down), roll), earliest(guarded, earliest(r.untilRolloutAfter(s), r.observeFiles(ctx, s))))
 	if !s.initialized() {
 		return res, nil
 	}
@@ -636,14 +670,15 @@ func clusterToControlPlane(_ context.Context, o client.Object) []ctrl.Request {
 	return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: c.Namespace, Name: ref.Name}}}
 }
 
-// clusterEndpointOrControlPlaneChanged passes the updates of a Cluster whose controlPlaneEndpoint
-// or controlPlaneRef changed.
-func clusterEndpointOrControlPlaneChanged() predicate.Funcs {
+// clusterInputsChanged passes the updates of a Cluster whose controlPlaneEndpoint,
+// controlPlaneRef or clusterNetwork changed: the control plane's Machines are made from them.
+func clusterInputsChanged() predicate.Funcs {
 	return predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			old, ok := e.ObjectOld.(*clusterv1.Cluster)
 			cur, ok2 := e.ObjectNew.(*clusterv1.Cluster)
-			return ok && ok2 && (old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint || old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef)
+			return ok && ok2 && (old.Spec.ControlPlaneEndpoint != cur.Spec.ControlPlaneEndpoint || old.Spec.ControlPlaneRef != cur.Spec.ControlPlaneRef ||
+				!equality.Semantic.DeepEqual(old.Spec.ClusterNetwork, cur.Spec.ClusterNetwork))
 		},
 		CreateFunc:  func(event.CreateEvent) bool { return false },
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },

@@ -31,8 +31,15 @@ import (
 // Cluster.
 const ChalkosControlPlaneFinalizer = "controlplane.cluster.x-k8s.io/chalkoscontrolplane"
 
+// SpecHashAnnotation holds, on each control-plane Machine and its ChalkosConfig, the SHA-256 of
+// what the Machine was made from: the ChalkosControlPlane's version, image, files and
+// infrastructure template. A Machine whose hash differs from the ChalkosControlPlane's is not up
+// to date and is replaced.
+const SpecHashAnnotation = "controlplane.cluster.x-k8s.io/chalkos-spec-hash"
+
 // ChalkosControlPlaneSpec is the chalkos part of a cluster's control plane: the image its
 // Machines install, how many there are, and the documents of the cluster's node pool.
+// +kubebuilder:validation:XValidation:rule="self.?rollout.?strategy.?rollingUpdate.?maxSurge.orValue(1) == 1 || self.?replicas.orValue(1) >= 3",message="rollout.strategy.rollingUpdate.maxSurge 0 needs at least 3 replicas: with fewer, removing a control plane first loses etcd's quorum"
 type ChalkosControlPlaneSpec struct {
 	// Replicas is the number of control planes to run. It must be odd, so the control plane's
 	// etcd can form a quorum: an even count tolerates no more failures than the odd count below
@@ -65,13 +72,21 @@ type ChalkosControlPlaneSpec struct {
 	// +required
 	MachineTemplate ChalkosControlPlaneMachineTemplate `json:"machineTemplate,omitempty,omitzero"`
 
+	// Rollout says when the control planes' Machines are replaced and how. A Machine is replaced
+	// when the version, image, files or infrastructure template it was made from changed, or it
+	// was created before rollout.after.
+	// +optional
+	Rollout ChalkosControlPlaneRolloutSpec `json:"rollout,omitempty,omitzero"`
+
 	// Files are the cluster-wide chalkos config documents every node of the cluster gets (such as
 	// Flannel, Addon and Registry documents), together with the control planes' own Node fields.
 	// They must hold the Cluster document, which names the etcd, coredns, pause and flannel images;
 	// the controllers derive the API server's, controller-manager's, scheduler's and kube-proxy's
 	// from the version where it names none. Fields the controllers own are refused: the Node's type
 	// and providerID, the Cluster's endpoint, and its ipFamilies, podCIDRs and serviceCIDRs when the
-	// Cluster's clusterNetwork gives ranges.
+	// Cluster's clusterNetwork gives ranges. The cluster-wide documents other than Secrets are also
+	// recorded in status.observedFiles, so very large files count about twice against the
+	// object's size limit.
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:MaxItems=256
@@ -140,6 +155,37 @@ type KubeconfigSpec struct {
 	TTLSeconds *int32 `json:"ttlSeconds,omitempty"`
 }
 
+// ChalkosControlPlaneRolloutSpec says when the control planes' Machines are replaced and how.
+type ChalkosControlPlaneRolloutSpec struct {
+	// After replaces every control-plane Machine created before it, once it has passed, even when
+	// nothing else changed. Written in RFC 3339, such as 2026-11-28T09:00:00Z.
+	// +optional
+	After metav1.Time `json:"after,omitempty,omitzero"`
+
+	// Strategy says how a Machine that is not up to date is replaced.
+	// +optional
+	Strategy ChalkosControlPlaneRolloutStrategy `json:"strategy,omitempty,omitzero"`
+}
+
+// ChalkosControlPlaneRolloutStrategy says how the control planes' Machines are replaced.
+type ChalkosControlPlaneRolloutStrategy struct {
+	// RollingUpdate replaces the Machines one at a time, the oldest first.
+	// +optional
+	RollingUpdate ChalkosControlPlaneRollingUpdate `json:"rollingUpdate,omitempty,omitzero"`
+}
+
+// ChalkosControlPlaneRollingUpdate replaces the control planes' Machines one at a time.
+type ChalkosControlPlaneRollingUpdate struct {
+	// MaxSurge is how many Machines above replicas the control plane runs while it replaces one.
+	// 1, the default, creates the replacement first and deletes the old Machine once the new one
+	// has joined etcd. 0 deletes the old Machine first and creates the replacement once it is
+	// gone, which needs at least three replicas.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MaxSurge *int32 `json:"maxSurge,omitempty"`
+}
+
 // ChalkosControlPlaneStatus is how far the cluster's control plane got.
 type ChalkosControlPlaneStatus struct {
 	// Selector is the label selector, in string format, that the scale subresource and tools
@@ -164,7 +210,8 @@ type ChalkosControlPlaneStatus struct {
 	// +optional
 	UpToDateReplicas *int32 `json:"upToDateReplicas,omitempty"`
 
-	// Versions is the aggregated Kubernetes versions of the control plane's Machines.
+	// Versions is the aggregated Kubernetes versions of the control plane's Machines, those being
+	// deleted included, oldest first.
 	// +optional
 	// +listType=map
 	// +listMapKey=version
@@ -203,8 +250,21 @@ type ChalkosControlPlaneStatus struct {
 	// +optional
 	LastRevokedPruneTime *metav1.Time `json:"lastRevokedPruneTime,omitempty"`
 
+	// ObservedFiles are the cluster-wide documents the control plane's Machines were made from,
+	// as a control-plane Machine installs them: spec.files with the fields the controllers fill
+	// from the Cluster, the Cluster document's endpoint, ipFamilies, podCIDRs and serviceCIDRs,
+	// but without a Machine's own Node document and without Secret documents, and with the
+	// image's defaults written out, so that an image defaulting a field every node holds alike
+	// differently shows as a change. They are one YAML stream of JSON documents separated by ---,
+	// recorded once a Machine exists and none is out of date or being deleted. While the
+	// documents a new Machine would get differ from them, the controllers compare the two for
+	// changes to fields every node of the cluster holds alike, which hold every new Machine.
+	// +optional
+	ObservedFiles string `json:"observedFiles,omitempty"`
+
 	// Conditions are the ChalkosControlPlane's current observations. Known condition types are
-	// Available, Initialized, MachinesReady, ScalingUp, ScalingDown, Deleting and Paused.
+	// Available, Initialized, MachinesReady, ScalingUp, ScalingDown, RollingOut, Deleting and
+	// Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

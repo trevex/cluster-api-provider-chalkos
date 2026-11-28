@@ -103,3 +103,36 @@ const (
 	// never installed or the whole Cluster is being deleted.
 	DoneReason = "Done"
 )
+
+// More reasons for the Ready and Installed conditions.
+const (
+	// WaitingForControlPlaneUpgradeReason documents a worker whose Kubernetes version is of a newer
+	// minor than the control plane's oldest: a kubelet never runs a newer minor than its API
+	// server. The worker installs once the control plane is upgraded.
+	WaitingForControlPlaneUpgradeReason = "WaitingForControlPlaneUpgrade"
+
+	// FixedFieldChangedReason documents a Machine that waits to install because the documents it
+	// would get change a field every node of the cluster holds alike against the
+	// ChalkosControlPlane's status.observedFiles. It installs once the change is reverted.
+	FixedFieldChangedReason = "FixedFieldChanged"
+
+	// ObservedFilesInvalidReason documents a Machine that waits to install because the
+	// ChalkosControlPlane's status.observedFiles cannot be compared with the cluster-wide documents,
+	// for which the control plane holds its own new Machines with InvalidFiles too. It installs once
+	// the record is cleared or the files change.
+	ObservedFilesInvalidReason = "ObservedFilesInvalid"
+)
+
+// VersionSkewCondition reports, on a worker's ChalkosConfig, whether the worker's Kubernetes
+// version was more than three minors older than the control plane's oldest when it installed,
+// which Kubernetes does not support. It holds nothing: the worker is installed.
+const VersionSkewCondition = "VersionSkew"
+
+// Reasons for the VersionSkew condition.
+const (
+	// VersionSkewReason documents a worker more than three minors older than the control plane.
+	VersionSkewReason = "VersionSkew"
+
+	// WithinVersionSkewReason documents a worker within the kubelet's supported skew.
+	WithinVersionSkewReason = "WithinVersionSkew"
+)

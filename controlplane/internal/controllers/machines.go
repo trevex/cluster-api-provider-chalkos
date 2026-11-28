@@ -37,9 +37,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/labels/format"
-	"sigs.k8s.io/cluster-api/util/patch"
 
 	"github.com/trevex/chalkos/pkg/clustersecrets"
 
@@ -73,6 +71,15 @@ func machineLabels(cp *controlplanev1.ChalkosControlPlane, cluster string) map[s
 	return labels
 }
 
+// templateAnnotations are the machine template's annotations without those the controller sets
+// itself, the spec hash and the pre-terminate hook, which the template cannot override.
+func templateAnnotations(cp *controlplanev1.ChalkosControlPlane) map[string]string {
+	annotations := maps.Clone(cp.Spec.MachineTemplate.ObjectMeta.Annotations)
+	delete(annotations, controlplanev1.SpecHashAnnotation)
+	delete(annotations, machineutil.HookAnnotation)
+	return annotations
+}
+
 // listMachines lists the control plane's Machines uncached, so that a Machine created by the last
 // reconcile is never created again, and splits them into those being deleted and the others.
 func (r *ChalkosControlPlaneReconciler) listMachines(ctx context.Context, s *scope) error {
@@ -98,45 +105,34 @@ func (r *ChalkosControlPlaneReconciler) listMachines(ctx context.Context, s *sco
 	return nil
 }
 
-// upToDate tells whether the Machine is of the control plane's spec: of its Kubernetes version,
-// the one field a Machine is not created with again yet.
-func upToDate(cp *controlplanev1.ChalkosControlPlane, m *clusterv1.Machine) bool {
-	return m.Spec.Version == cp.Spec.Version
-}
-
-// markUpToDate sets the UpToDate condition of each Machine that is not being deleted, through the
-// Machine's status.
-func (r *ChalkosControlPlaneReconciler) markUpToDate(ctx context.Context, s *scope) error {
-	for i := range s.machines {
-		m := &s.machines[i]
-		want := metav1.Condition{Type: clusterv1.MachineUpToDateCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineUpToDateReason}
-		if !upToDate(s.cp, m) {
-			want.Status, want.Reason = metav1.ConditionFalse, clusterv1.MachineNotUpToDateReason
-			want.Message = fmt.Sprintf("The Machine is of version %s, the control plane of %s", m.Spec.Version, s.cp.Spec.Version)
-		}
-		if got := conditions.Get(m, want.Type); got != nil && got.Status == want.Status && got.Reason == want.Reason && got.Message == want.Message {
-			continue
-		}
-		h, err := patch.NewHelper(m, r.Client)
-		if err != nil {
-			return err
-		}
-		conditions.Set(m, want)
-		if err := h.Patch(ctx, m, patch.WithOwnedConditions{Conditions: []string{clusterv1.MachineUpToDateCondition}}); err != nil {
-			return fmt.Errorf("set the UpToDate condition of the Machine %s: %w", m.Name, err)
-		}
-	}
-	return nil
-}
-
 // scaleUp creates the control plane's next Machine while it has fewer than it asks for: the first
 // at once, every other only once the control plane is initialized and each Machine it has joined
-// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted,
-// so that it is replaced, but while one is, etcd must list only healthy voting members of the
-// Machines: the replacement of a single control plane joins its etcd, while one of several that
-// is down and still a member keeps etcd from growing by a member it may lose quorum with.
+// the cluster, so that etcd grows one member at a time. A Machine being deleted is not counted
+// towards replicas, so that it is replaced, but replicas and maxSurge bound the Machines, being
+// deleted included: with maxSurge 0 the replacement waits until the Machine is gone. While one is
+// deleted, etcd must list only healthy voting members of the Machines: the replacement of a
+// single control plane joins its etcd, while one of several that is down and still a member keeps
+// etcd from growing by a member it may lose quorum with. While a guard holds, no Machine is
+// created.
 func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, sec clustersecrets.Secrets) (ctrl.Result, error) {
-	if len(s.machines) >= int(ptr.Deref(s.cp.Spec.Replicas, 1)) {
+	want := int(ptr.Deref(s.cp.Spec.Replicas, 1))
+	if len(s.machines) >= want {
+		return ctrl.Result{}, nil
+	}
+	switch {
+	case s.held != "" && s.heldReason != "":
+		// A change of the ChalkosControlPlane, of the Cluster's endpoint or network, or of its
+		// Machines, as one being deleted going, reconciles again.
+		s.scaleUpWaiting = "no Machine is created while the control plane refuses the change: " + s.heldReason
+		return ctrl.Result{}, nil
+	case s.held != "":
+		// The guard's result retries.
+		s.scaleUpWaiting = "no Machine is created: " + s.held
+		return ctrl.Result{}, nil
+	case len(s.machines)+len(s.deleting) >= want+surge(s.cp):
+		// The Machine's deletion reconciles again.
+		s.scaleUpWaiting = fmt.Sprintf("waiting for the Machine %s, being deleted, to go: with maxSurge %d the control plane keeps %s at most",
+			s.deleting[0].Name, surge(s.cp), plural(want+surge(s.cp), "Machine"))
 		return ctrl.Result{}, nil
 	}
 	switch {
@@ -154,7 +150,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 			}
 		}
 		if len(s.deleting) > 0 {
-			if why := r.etcdProblem(ctx, s, sec); why != "" {
+			if why := r.etcdProblem(ctx, s, sec, nil); why != "" {
 				s.scaleUpWaiting = "waiting while a Machine is deleted: " + why
 				return ctrl.Result{RequeueAfter: machineutil.RetryAfter}, nil
 			}
@@ -167,6 +163,7 @@ func (r *ChalkosControlPlaneReconciler) scaleUp(ctx context.Context, s *scope, s
 	ctrl.LoggerFrom(ctx).Info("Created a control-plane Machine", "machine", m.Name,
 		"infrastructure", m.Spec.InfrastructureRef.Kind+"/"+m.Spec.InfrastructureRef.Name, "config", m.Spec.Bootstrap.ConfigRef.Name)
 	s.machines = append(s.machines, *m)
+	s.stepped = true
 	return ctrl.Result{}, nil
 }
 
@@ -177,7 +174,7 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 	cp := s.cp
 	name := fmt.Sprintf("%s-%s", cp.Name, utilrand.String(5))
 	labels := machineLabels(cp, s.cluster.Name)
-	annotations := maps.Clone(cp.Spec.MachineTemplate.ObjectMeta.Annotations)
+	annotations := templateAnnotations(cp)
 	// The Machine controller makes the Machine the controller of its bootstrap config and
 	// infrastructure; until then the ChalkosControlPlane owns them.
 	owner := metav1.OwnerReference{APIVersion: controlPlaneKind.GroupVersion().String(), Kind: controlPlaneKind.Kind, Name: cp.Name, UID: cp.UID}
@@ -205,9 +202,15 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 		return nil, fmt.Errorf("clone the machine template's infrastructure: %w", err)
 	}
 
+	// The ChalkosConfig and the Machine carry the spec hash they are made from.
+	cfgAnnotations := maps.Clone(annotations)
+	if cfgAnnotations == nil {
+		cfgAnnotations = map[string]string{}
+	}
+	cfgAnnotations[controlplanev1.SpecHashAnnotation] = s.hash
 	cfg := &bootstrapv1.ChalkosConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: annotations,
+			Namespace: cp.Namespace, Name: name, Labels: labels, Annotations: cfgAnnotations,
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Spec: bootstrapv1.ChalkosConfigSpec{Image: cp.Spec.Image, ImagePullSecretRef: cp.Spec.ImagePullSecretRef.DeepCopy()},
@@ -217,10 +220,7 @@ func (r *ChalkosControlPlaneReconciler) createMachine(ctx context.Context, s *sc
 	}
 
 	// Only the Machine carries the pre-terminate hook.
-	machineAnnotations := maps.Clone(annotations)
-	if machineAnnotations == nil {
-		machineAnnotations = map[string]string{}
-	}
+	machineAnnotations := maps.Clone(cfgAnnotations)
 	machineAnnotations[machineutil.HookAnnotation] = machineutil.ControlPlaneHookOwner
 	deletion := cp.Spec.MachineTemplate.Spec.Deletion
 	m := &clusterv1.Machine{
